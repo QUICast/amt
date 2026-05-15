@@ -141,6 +141,10 @@ impl UpstreamDatagram {
     pub fn datagram(&self) -> &[u8] {
         self.packet.datagram()
     }
+
+    pub fn normalized_datagram(&self) -> Vec<u8> {
+        normalize_forwarded_datagram(self.datagram())
+    }
 }
 
 fn packet_addresses(packet: &RawPacket) -> Option<(IpAddr, IpAddr)> {
@@ -202,6 +206,144 @@ fn matching_family(addr: Option<IpAddr>, family: IpAddr) -> Option<IpAddr> {
     }
 }
 
+fn normalize_forwarded_datagram(datagram: &[u8]) -> Vec<u8> {
+    let version = datagram.first().map(|byte| byte >> 4);
+    match version {
+        Some(4) => normalize_ipv4_forwarded_datagram(datagram),
+        Some(6) => normalize_ipv6_forwarded_datagram(datagram),
+        _ => datagram.to_vec(),
+    }
+}
+
+fn normalize_ipv4_forwarded_datagram(datagram: &[u8]) -> Vec<u8> {
+    if datagram.len() < 20 {
+        return datagram.to_vec();
+    }
+
+    let ihl = usize::from(datagram[0] & 0x0f) * 4;
+    if ihl < 20 || datagram.len() < ihl {
+        return datagram.to_vec();
+    }
+
+    let total_len = usize::from(u16::from_be_bytes([datagram[2], datagram[3]]));
+    if total_len < ihl || datagram.len() < total_len {
+        return datagram.to_vec();
+    }
+
+    let mut normalized = datagram[..total_len].to_vec();
+    normalized[10] = 0;
+    normalized[11] = 0;
+    let header_checksum = internet_checksum(&normalized[..ihl]);
+    normalized[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    if normalized[9] == 17 {
+        repair_udp_checksum_v4(&mut normalized, ihl);
+    }
+
+    normalized
+}
+
+fn normalize_ipv6_forwarded_datagram(datagram: &[u8]) -> Vec<u8> {
+    if datagram.len() < 40 {
+        return datagram.to_vec();
+    }
+
+    let payload_len = usize::from(u16::from_be_bytes([datagram[4], datagram[5]]));
+    let total_len = 40 + payload_len;
+    if datagram.len() < total_len {
+        return datagram.to_vec();
+    }
+
+    let mut normalized = datagram[..total_len].to_vec();
+    if normalized[6] == 17 {
+        repair_udp_checksum_v6(&mut normalized, 40);
+    }
+
+    normalized
+}
+
+fn repair_udp_checksum_v4(datagram: &mut [u8], udp_offset: usize) {
+    if datagram.len() < udp_offset + 8 {
+        return;
+    }
+
+    let udp_len = usize::from(u16::from_be_bytes([
+        datagram[udp_offset + 4],
+        datagram[udp_offset + 5],
+    ]));
+    if udp_len < 8 || datagram.len() < udp_offset + udp_len {
+        return;
+    }
+
+    datagram[udp_offset + 6] = 0;
+    datagram[udp_offset + 7] = 0;
+
+    let mut pseudo = Vec::with_capacity(12 + udp_len);
+    pseudo.extend_from_slice(&datagram[12..16]);
+    pseudo.extend_from_slice(&datagram[16..20]);
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&datagram[udp_offset..udp_offset + udp_len]);
+
+    let checksum = udp_checksum(&pseudo);
+    datagram[udp_offset + 6..udp_offset + 8].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn repair_udp_checksum_v6(datagram: &mut [u8], udp_offset: usize) {
+    if datagram.len() < udp_offset + 8 {
+        return;
+    }
+
+    let udp_len = usize::from(u16::from_be_bytes([
+        datagram[udp_offset + 4],
+        datagram[udp_offset + 5],
+    ]));
+    if udp_len < 8 || datagram.len() < udp_offset + udp_len {
+        return;
+    }
+
+    datagram[udp_offset + 6] = 0;
+    datagram[udp_offset + 7] = 0;
+
+    let mut pseudo = Vec::with_capacity(40 + udp_len);
+    pseudo.extend_from_slice(&datagram[8..24]);
+    pseudo.extend_from_slice(&datagram[24..40]);
+    pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 17]);
+    pseudo.extend_from_slice(&datagram[udp_offset..udp_offset + udp_len]);
+
+    let checksum = udp_checksum(&pseudo);
+    datagram[udp_offset + 6..udp_offset + 8].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn udp_checksum(bytes: &[u8]) -> u16 {
+    match internet_checksum(bytes) {
+        0 => 0xffff,
+        checksum => checksum,
+    }
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    !ones_complement_sum(bytes)
+}
+
+fn ones_complement_sum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in bytes.chunks(2) {
+        let word = if let [high, low] = chunk {
+            u16::from_be_bytes([*high, *low])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum += u32::from(word);
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+
+    sum as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +396,69 @@ mod tests {
         assert_eq!(ipv4.interface_index, None);
         assert_eq!(ipv6.interface, None);
         assert_eq!(ipv6.interface_index, Some(7));
+    }
+
+    #[test]
+    fn normalizes_ipv4_udp_checksum_for_forwarding() {
+        let mut datagram = vec![
+            0x45, 0, 0, 33, 0x12, 0x34, 0, 0, 1, 17, 0xaa, 0xbb, 192, 0, 2, 10, 239, 1, 2, 3, 12,
+            34, 0x13, 0x88, 0, 13, 0xcc, 0xdd, b'h', b'e', b'l', b'l', b'o',
+        ];
+        let checksum = internet_checksum(&datagram[..20]);
+        datagram[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        let normalized = normalize_forwarded_datagram(&datagram);
+
+        assert_eq!(normalized.len(), 33);
+        assert_eq!(ones_complement_sum(&normalized[..20]), 0xffff);
+        assert_ne!(&normalized[26..28], &[0xcc, 0xdd]);
+        assert_eq!(udp_v4_sum(&normalized), 0xffff);
+    }
+
+    #[test]
+    fn normalizes_ipv6_udp_checksum_for_forwarding() {
+        let source = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let group = Ipv6Addr::new(0xff3e, 0, 0, 0, 0, 0, 0x8000, 0x1234);
+        let mut datagram = vec![0; 40 + 8 + 5];
+        datagram[0] = 0x60;
+        datagram[4..6].copy_from_slice(&13u16.to_be_bytes());
+        datagram[6] = 17;
+        datagram[7] = 1;
+        datagram[8..24].copy_from_slice(&source.octets());
+        datagram[24..40].copy_from_slice(&group.octets());
+        datagram[40..42].copy_from_slice(&12u16.to_be_bytes());
+        datagram[42..44].copy_from_slice(&5000u16.to_be_bytes());
+        datagram[44..46].copy_from_slice(&13u16.to_be_bytes());
+        datagram[46..48].copy_from_slice(&[0xcc, 0xdd]);
+        datagram[48..].copy_from_slice(b"hello");
+
+        let normalized = normalize_forwarded_datagram(&datagram);
+
+        assert_eq!(normalized.len(), 53);
+        assert_ne!(&normalized[46..48], &[0xcc, 0xdd]);
+        assert_eq!(udp_v6_sum(&normalized), 0xffff);
+    }
+
+    fn udp_v4_sum(datagram: &[u8]) -> u16 {
+        let ihl = usize::from(datagram[0] & 0x0f) * 4;
+        let udp_len = usize::from(u16::from_be_bytes([datagram[ihl + 4], datagram[ihl + 5]]));
+        let mut pseudo = Vec::with_capacity(12 + udp_len);
+        pseudo.extend_from_slice(&datagram[12..16]);
+        pseudo.extend_from_slice(&datagram[16..20]);
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        pseudo.extend_from_slice(&datagram[ihl..ihl + udp_len]);
+        ones_complement_sum(&pseudo)
+    }
+
+    fn udp_v6_sum(datagram: &[u8]) -> u16 {
+        let udp_len = usize::from(u16::from_be_bytes([datagram[44], datagram[45]]));
+        let mut pseudo = Vec::with_capacity(40 + udp_len);
+        pseudo.extend_from_slice(&datagram[8..24]);
+        pseudo.extend_from_slice(&datagram[24..40]);
+        pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 17]);
+        pseudo.extend_from_slice(&datagram[40..40 + udp_len]);
+        ones_complement_sum(&pseudo)
     }
 }

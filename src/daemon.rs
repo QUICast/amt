@@ -324,15 +324,16 @@ fn drain_upstream(
             continue;
         }
 
+        let forwarded_datagram = datagram.normalized_datagram();
         let response = encode(&Message::MulticastData {
-            packet: datagram.datagram(),
+            packet: &forwarded_datagram,
         });
 
         for endpoint in &endpoints {
             if let Err(error) = socket.send_to(&response, endpoint) {
                 eprintln!(
                     "failed to forward {} byte multicast datagram to {endpoint}: {error}",
-                    datagram.datagram().len()
+                    forwarded_datagram.len()
                 );
             }
         }
@@ -340,7 +341,7 @@ fn drain_upstream(
         forwarded_packets += 1;
         println!(
             "forwarded {} byte multicast datagram from {} to {} gateway(s)",
-            datagram.datagram().len(),
+            forwarded_datagram.len(),
             datagram.source,
             endpoints.len()
         );
