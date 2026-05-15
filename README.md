@@ -57,7 +57,7 @@ cargo run -- --help
 
 The crate depends on crates.io releases:
 
-- `mcrx-core = 0.2.4` with `raw-packets`
+- `mcrx-core = 0.2.5` with `raw-packets`
 - `mctx-core = 0.2.3` with `raw-packets`
 
 ## CLI

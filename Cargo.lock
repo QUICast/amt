@@ -123,9 +123,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "mcrx-core"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ea086a3a9751409b1edc75e92311c5768b7fc6cc28c23fec315b8db16cbcff"
+checksum = "dc9e49ca88fa4e9b61e33f4d85321ce4a8ffc4b8c175b78f12d4375772892e4d"
 dependencies = [
  "bytes",
  "libc",
