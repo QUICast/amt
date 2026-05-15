@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "Lightweight Automatic Multicast Tunneling (AMT) implementation."
+readme = "README.md"
 keywords = ["amt", "multicast", "tunnel", "udp", "networking"]
 categories = ["network-programming"]
 
 [dependencies]
 getrandom = "0.3.4"
 hmac = "0.13.0"
-mcrx-core = { path = "../mcrx-core", version = "0.2.4", features = ["raw-packets"] }
-mctx-core = { path = "../mctx-core", version = "0.2.2" }
+mcrx-core = { version = "0.2.4", features = ["raw-packets"] }
+mctx-core = "0.2.2"
 sha2 = "0.11.0"
