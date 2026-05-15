@@ -18,6 +18,12 @@ The gateway forwards complete multicast IP datagrams downstream through
 `mctx-core` raw transmit. That preserves the original multicast source and group
 from the AMT Multicast Data packet.
 
+The current gateway is configured-join driven: `--group` and optional
+`--source` tell it which AMT Membership Update to send upstream. It does not yet
+listen for local IGMP/MLD reports from LAN receivers. Local receiver joins are
+only needed so the local host or LAN accepts the raw multicast datagrams that
+the gateway re-injects downstream.
+
 For the first test, ASM is the easiest receiver mode. Once that works, use SSM
 with the Linode source IP as the source filter.
 
@@ -128,7 +134,19 @@ For the Linode default interface:
 
 ```bash
 LINODE_UPSTREAM_IF=$(ip route get 1.1.1.1 | awk '{for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+LINODE_DEV=$(ip route get 1.1.1.1 | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
 echo "$LINODE_UPSTREAM_IF"
+echo "$LINODE_DEV"
+```
+
+Make sure the selected Linode device has multicast enabled and an IPv4
+multicast route. This is especially useful on VPS setups where the default route
+is unicast-only:
+
+```bash
+ip link show dev "$LINODE_DEV"
+sudo ip route replace 224.0.0.0/4 dev "$LINODE_DEV"
+ip route show 224.0.0.0/4
 ```
 
 On macOS locally, pick the LAN interface:
@@ -203,12 +221,17 @@ target/release/amt gateway \
   --downstream-interface "$LOCAL_LAN_IP"
 ```
 
-Expected relay output includes:
+Expected gateway and relay logs include these lines:
 
 ```text
+sent Membership Query; sending configured joins
 accepted Igmpv3 membership update
 upstream subscriptions changed: +1 -0 active=1
 ```
+
+If the relay and gateway connect but these membership lines do not appear, debug
+the AMT Membership Update path first. The local receiver's IGMP report is not
+what drives the current AMT subscription.
 
 ## Start The Linode Source
 
@@ -243,6 +266,8 @@ On the Linode:
 ```bash
 sudo tcpdump -ni any udp port 2268
 sudo tcpdump -ni any host 239.1.2.3 or udp port 5000
+ip maddr show dev "$LINODE_DEV"
+cat /proc/net/igmp
 ```
 
 On the local machine:
@@ -269,7 +294,52 @@ The relay may be advertising the wrong address. Set --relay-address to the Linod
 Relay accepts membership but forwards nothing:
 
 ```text
-Raw receive permission or upstream interface selection is wrong on the Linode.
+Raw receive permission, upstream interface selection, or the Linode multicast
+route is wrong. Confirm --upstream-interface matches LINODE_UPSTREAM_IF, the
+source uses the same --interface value, and 224.0.0.0/4 routes to LINODE_DEV.
+```
+
+Split the Linode data path with tcpdump:
+
+```bash
+ip route get 239.1.2.3
+sudo tcpdump -vv -ni "$LINODE_DEV" 'udp and dst host 239.1.2.3 and dst port 5000'
+```
+
+If tcpdump sees nothing while `mctx_send` is running, the sender is not emitting
+on the selected interface. Check that `mctx_send` prints the expected source
+address and use both `--source "$LINODE_UPSTREAM_IF"` and
+`--interface "$LINODE_UPSTREAM_IF"`.
+
+If tcpdump sees packets but the relay logs nothing, try the raw receiver from
+`mcrx-core` on the same Linode:
+
+```bash
+sudo mcrx_raw_recv 239.1.2.3 --interface "$LINODE_UPSTREAM_IF"
+```
+
+If `mcrx_raw_recv` also sees nothing, the issue is below `amt` in raw packet
+receive or local outbound multicast capture. If it sees packets, restart the
+relay with the newest build and check the active upstream subscription log.
+
+Relay and gateway connect, but no native IGMP report is visible on the Linode:
+
+```text
+For the current simple gateway, this is not necessarily a failure. The local
+Mac's IGMP report is link-local LAN control traffic and will not cross the
+internet to the Linode. The gateway sends an AMT Membership Update over UDP
+2268 instead, and the relay converts that into mcrx-core raw upstream
+subscriptions. Look for "accepted Igmpv3 membership update" and "upstream
+subscriptions changed" in the relay log.
+```
+
+Local receiver joins do not cause the gateway to subscribe:
+
+```text
+Expected for now. A transparent gateway mode would need a local IGMP/MLD
+listener, local querier, TUN interface, or multicast-router/proxy integration.
+Until that exists, pass the wanted group and source directly to amt gateway with
+--group and --source.
 ```
 
 Gateway forwards downstream but local receiver sees nothing:

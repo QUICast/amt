@@ -2,7 +2,8 @@ use crate::downstream::{DownstreamConfig, DownstreamPublisher};
 use crate::gateway::{Gateway, GatewayAction, GatewayConfig};
 use crate::protocol::{Message, encode};
 use crate::relay::{Relay, RelayAction, RelayConfig};
-use crate::upstream::{UpstreamConfig, UpstreamManager};
+use crate::state::UpstreamSubscription;
+use crate::upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
@@ -287,6 +288,9 @@ fn sync_upstream(relay: &Relay, upstream: &mut UpstreamManager) -> io::Result<()
             "upstream subscriptions changed: +{} -{} active={}",
             changes.added, changes.removed, changes.active
         );
+        for subscription in upstream.active_subscriptions() {
+            println!("  active upstream {}", format_subscription(subscription));
+        }
     }
 
     Ok(())
@@ -311,6 +315,12 @@ fn drain_upstream(
             .state()
             .endpoints_for_packet(datagram.source, datagram.group);
         if endpoints.is_empty() {
+            println!(
+                "received upstream {} multicast datagram from {} to {}, but no gateway interest matched",
+                protocol_name(&datagram),
+                datagram.source,
+                datagram.group
+            );
             continue;
         }
 
@@ -337,4 +347,20 @@ fn drain_upstream(
     }
 
     Ok(forwarded_packets)
+}
+
+fn format_subscription(subscription: &UpstreamSubscription) -> String {
+    match subscription.source {
+        Some(source) => format!("({source}, {})", subscription.group),
+        None => format!("(*, {})", subscription.group),
+    }
+}
+
+fn protocol_name(datagram: &UpstreamDatagram) -> &'static str {
+    match datagram.packet.ip_protocol {
+        Some(17) => "UDP",
+        Some(2) => "IGMP",
+        Some(58) => "ICMPv6",
+        Some(_) | None => "IP",
+    }
 }
