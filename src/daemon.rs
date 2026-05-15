@@ -167,15 +167,23 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                             println!("{peer} sent {} byte AMT multicast packet", packet.len());
                             if let Some(downstream) = downstream.as_mut() {
                                 match downstream.forward_ip_datagram(&packet) {
-                                    Ok(Some(report)) => println!(
-                                        "forwarded downstream UDP multicast {} -> {}:{} ({} payload bytes)",
-                                        report.source,
-                                        report.group,
-                                        report.dst_port,
-                                        report.payload_len
-                                    ),
+                                    Ok(Some(report)) => {
+                                        let udp_port = report
+                                            .udp_dst_port
+                                            .map(|port| format!(":{port}"))
+                                            .unwrap_or_default();
+                                        println!(
+                                            "forwarded downstream raw multicast {} -> {}{} (protocol {}, {} datagram bytes, {} sent)",
+                                            report.source,
+                                            report.group,
+                                            udp_port,
+                                            report.ip_protocol,
+                                            report.datagram_len,
+                                            report.bytes_sent
+                                        );
+                                    }
                                     Ok(None) => println!(
-                                        "received AMT multicast packet is not a UDP multicast datagram"
+                                        "received AMT multicast packet is not a multicast IP datagram"
                                     ),
                                     Err(error) => eprintln!(
                                         "failed to forward downstream multicast packet: {error}"

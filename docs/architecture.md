@@ -48,8 +48,8 @@ The gateway code is organized as follows:
 - `gateway::Gateway` handles Relay Advertisement, Membership Query, Multicast
   Data, and Teardown state.
 - `membership` builds IGMPv3 or MLDv2 membership reports for configured joins.
-- `downstream::DownstreamPublisher` republishes UDP multicast payloads through
-  `mctx_core::Context`.
+- `downstream::DownstreamPublisher` forwards complete multicast IP datagrams
+  through `mctx_core::RawContext`.
 - `daemon::run_gateway` connects the UDP AMT socket to the gateway state
   machine.
 
@@ -61,29 +61,21 @@ The gateway supports both ASM and SSM membership requests toward the relay:
 ## Packet Handling
 
 AMT Multicast Data carries a complete IP multicast datagram. The relay preserves
-that datagram when forwarding from native multicast into AMT.
-
-Current gateway downstream behavior is intentionally narrower:
-
-- It parses the AMT Multicast Data IP datagram.
-- If it is UDP multicast, it extracts the UDP payload and destination port.
-- It republishes that payload through a normal UDP multicast socket.
-
-This lets ordinary UDP receivers test the tunnel today. It does not preserve the
-original source IP or source port on the local downstream side.
+that datagram when forwarding from native multicast into AMT, and the gateway
+preserves it when forwarding from AMT onto the local downstream side.
 
 ## SSM Fidelity
 
-For full SSM behavior on the local receiver side, the gateway must inject the
-complete IP datagram it received from AMT. That requires raw transmit support in
-`mctx-core`.
-
-Until then:
+The gateway uses `mctx-core` raw transmit to inject complete IP datagrams. This
+preserves the original source/group tuple carried by AMT Multicast Data, so
+local downstream receivers can use SSM.
 
 - The relay can receive SSM upstream through `mcrx-core`.
 - The gateway can request SSM from the relay.
-- Local downstream receivers should use ASM because the UDP republisher creates
-  a new local source.
+- The gateway can forward the original `(S,G)` downstream through `mctx-core`.
+
+Raw downstream transmit may require elevated privileges and explicit interface
+selection. `mctx-core` currently does not support raw IPv6 transmit on Windows.
 
 ## Runtime Model
 

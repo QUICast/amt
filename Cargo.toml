@@ -12,5 +12,5 @@ categories = ["network-programming"]
 getrandom = "0.3.4"
 hmac = "0.13.0"
 mcrx-core = { version = "0.2.4", features = ["raw-packets"] }
-mctx-core = "0.2.2"
+mctx-core = { version = "0.2.3", features = ["raw-packets"] }
 sha2 = "0.11.0"

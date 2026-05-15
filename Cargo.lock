@@ -136,9 +136,9 @@ dependencies = [
 
 [[package]]
 name = "mctx-core"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "137cd05c80468ba6a936fb952235e7b606b73776ab003d4f0dd3a247167c4ffa"
+checksum = "0ef3aa36f949409256f2de30ded75f5a0e3b7532442e389f88d5c42a4907418c"
 dependencies = [
  "libc",
  "socket2",

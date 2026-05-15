@@ -3,7 +3,7 @@
 This guide sets up a first real AMT path:
 
 ```text
-Linode multicast source -> Linode AMT relay -> Internet -> local AMT gateway -> local UDP multicast receiver
+Linode multicast source -> Linode AMT relay -> Internet -> local AMT gateway -> local multicast receiver
 ```
 
 The goal is to verify that AMT can carry multicast traffic from a Linode to a
@@ -14,12 +14,12 @@ native multicast.
 
 The relay receives native multicast as raw IP datagrams through `mcrx-core`.
 
-The gateway currently republishes UDP multicast payloads through `mctx-core`.
-That is enough for a practical payload test. It is not yet full SSM fidelity on
-the local downstream side because the local UDP packet is newly created by the
-gateway.
+The gateway forwards complete multicast IP datagrams downstream through
+`mctx-core` raw transmit. That preserves the original multicast source and group
+from the AMT Multicast Data packet.
 
-For the first test, use an ASM local receiver.
+For the first test, ASM is the easiest receiver mode. Once that works, use SSM
+with the Linode source IP as the source filter.
 
 ## Topology
 
@@ -32,7 +32,7 @@ Internet:
   UDP AMT tunnel         -> Linode public IP:2268
 
 Local network:
-  amt gateway            -> receives AMT, republishes UDP multicast
+  amt gateway            -> receives AMT, forwards raw IP multicast
   mcrx_recv receiver     -> joins 239.1.2.3:5000
 ```
 
@@ -74,7 +74,7 @@ cd ~/multicast/mctx-core
 cargo build --release --bin mctx_send
 ```
 
-Raw receive usually needs `CAP_NET_RAW` or root:
+Raw receive on the relay usually needs `CAP_NET_RAW` or root:
 
 ```bash
 sudo setcap cap_net_raw+ep ~/.cargo/bin/amt
@@ -89,6 +89,17 @@ getcap ~/multicast/amt/target/release/amt
 ```
 
 If capabilities are not available, run the relay with `sudo`.
+
+Raw downstream transmit on the local gateway also usually needs `CAP_NET_RAW`
+or root. For a repository build on the local machine:
+
+```bash
+cargo build --release
+sudo setcap cap_net_raw+ep target/release/amt
+getcap target/release/amt
+```
+
+If capabilities are not available, run the gateway binary with `sudo`.
 
 ## Open Firewall
 
@@ -171,12 +182,22 @@ cargo build --release --manifest-path ../mcrx-core/Cargo.toml --bin mcrx_recv
 
 Use ASM for this first local receiver test.
 
+After ASM works, test SSM by joining the Linode sender source address:
+
+```bash
+mcrx_recv 239.1.2.3 5000 --interface "$LOCAL_LAN_IP" --source "$LINODE_UPSTREAM_IF"
+```
+
+Use the source IP that appears in the multicast IP datagram. For loopback-only
+Linode tests that may be `127.0.0.1`, which is not a realistic SSM source for a
+LAN receiver; prefer the Linode default interface for SSM tests.
+
 ## Start The Local Gateway
 
 On the local machine:
 
 ```bash
-cargo run --release -- gateway \
+target/release/amt gateway \
   --relay "$LINODE_PUBLIC_IP:2268" \
   --group 239.1.2.3 \
   --downstream-interface "$LOCAL_LAN_IP"
@@ -254,11 +275,14 @@ Raw receive permission or upstream interface selection is wrong on the Linode.
 Gateway forwards downstream but local receiver sees nothing:
 
 ```text
-The local receiver likely joined the wrong interface, or local Wi-Fi/LAN multicast filtering is in the way.
+The local receiver likely joined the wrong interface, the gateway lacks raw
+send privileges, or local Wi-Fi/LAN multicast filtering is in the way.
 ```
 
-Local SSM receiver does not work yet:
+Local SSM receiver sees nothing:
 
 ```text
-Expected for now. The gateway currently republishes UDP payloads with a local source. Use ASM locally until mctx-core raw transmit lands.
+Confirm the receiver joined the source IP inside the tunneled multicast
+datagram, not the AMT relay or gateway address. Also note that mctx-core raw
+IPv6 transmit is not supported on Windows yet.
 ```

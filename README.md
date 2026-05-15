@@ -15,7 +15,8 @@ The crate currently includes:
 - A simple blocking gateway daemon.
 - Raw relay upstream receive through `mcrx-core` with its `raw-packets`
   feature.
-- UDP downstream multicast republishing through `mctx-core`.
+- Raw gateway downstream transmit through `mctx-core` with its `raw-packets`
+  feature.
 
 [rfc7450]: https://datatracker.ietf.org/doc/html/rfc7450
 
@@ -38,15 +39,13 @@ Implemented:
 
 Current limitations:
 
-- The gateway currently republishes AMT Multicast Data as UDP multicast payloads
-  via `mctx-core`.
-- Proper gateway-side SSM fidelity needs raw multicast transmit support in
-  `mctx-core`, so the gateway can inject the complete IP datagram instead of
-  creating a new UDP packet.
 - The simple daemons use blocking loops and polling. They are intentionally
   small and easy to inspect, not yet optimized.
 - Relay raw upstream receive may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform.
+- Gateway raw downstream transmit may require root, `CAP_NET_RAW`, or explicit
+  interface selection depending on platform. `mctx-core` raw IPv6 transmit is
+  not supported on Windows yet.
 
 ## Build
 
@@ -59,7 +58,7 @@ cargo run -- --help
 The crate depends on crates.io releases:
 
 - `mcrx-core = 0.2.4` with `raw-packets`
-- `mctx-core = 0.2.2`
+- `mctx-core = 0.2.3` with `raw-packets`
 
 ## CLI
 
@@ -90,8 +89,8 @@ when binding to `0.0.0.0`; otherwise the default advertised address is loopback.
 
 ### Gateway
 
-Run a gateway that joins an ASM group through a remote relay and republishes
-received UDP multicast locally:
+Run a gateway that joins an ASM group through a remote relay and forwards
+received multicast IP datagrams locally:
 
 ```bash
 cargo run --release -- gateway \
@@ -110,9 +109,9 @@ cargo run --release -- gateway \
   --downstream-interface 192.168.1.20
 ```
 
-Note that until raw transmit lands in `mctx-core`, local downstream receivers
-should use ASM for the final hop because the UDP republisher creates a new local
-UDP source.
+The gateway uses raw downstream transmit, so local SSM receivers can join the
+original `(S,G)` carried inside AMT Multicast Data. Raw transmit may require
+elevated privileges.
 
 ## Tests
 
@@ -141,7 +140,7 @@ test must be run with appropriate socket permissions.
 
 - [Architecture](docs/architecture.md)
 - [Linode to local network test](docs/linode-local-test.md)
-- [Raw `mctx-core` transmit plan](docs/mctx-raw-packets.md)
+- [Raw `mctx-core` transmit integration](docs/mctx-raw-packets.md)
 
 ## Library Layout
 
@@ -152,7 +151,7 @@ test must be run with appropriate socket permissions.
 - `relay`: runtime-agnostic relay state machine.
 - `upstream`: relay upstream raw multicast receive manager using `mcrx-core`.
 - `gateway`: runtime-agnostic gateway state machine.
-- `downstream`: gateway downstream UDP multicast republisher using `mctx-core`.
+- `downstream`: gateway downstream raw multicast transmitter using `mctx-core`.
 - `daemon`: simple blocking relay and gateway loops.
 
 ## License
