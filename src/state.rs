@@ -89,6 +89,14 @@ impl RelayState {
         self.endpoints.remove(&endpoint).is_some()
     }
 
+    pub fn contains_endpoint(&self, endpoint: SocketAddr) -> bool {
+        self.endpoints.contains_key(&endpoint)
+    }
+
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
     pub fn endpoint_interest(&self, endpoint: SocketAddr, group: IpAddr) -> Option<&GroupInterest> {
         self.endpoints
             .get(&endpoint)
@@ -109,32 +117,40 @@ impl RelayState {
     }
 
     pub fn upstream_subscriptions(&self) -> Vec<UpstreamSubscription> {
-        let mut groups = BTreeMap::<IpAddr, GroupSummary>::new();
-        for state in self.endpoints.values() {
-            for (group, interest) in &state.groups {
-                let summary = groups.entry(*group).or_default();
-                match interest.mode {
-                    FilterMode::Exclude => summary.requires_asm = true,
-                    FilterMode::Include => summary.sources.extend(interest.sources.iter().copied()),
+        let mut subscriptions = BTreeSet::new();
+        for (group, interest) in self.aggregate_interests() {
+            match interest.mode {
+                FilterMode::Exclude => {
+                    subscriptions.insert(UpstreamSubscription::asm(group));
+                }
+                FilterMode::Include => {
+                    subscriptions.extend(
+                        interest
+                            .sources
+                            .into_iter()
+                            .map(|source| UpstreamSubscription::ssm(group, source)),
+                    );
                 }
             }
         }
 
-        let mut subscriptions = BTreeSet::new();
-        for (group, summary) in groups {
-            if summary.requires_asm {
-                subscriptions.insert(UpstreamSubscription::asm(group));
-            } else {
-                subscriptions.extend(
-                    summary
-                        .sources
-                        .into_iter()
-                        .map(|source| UpstreamSubscription::ssm(group, source)),
-                );
+        subscriptions.into_iter().collect()
+    }
+
+    pub fn aggregate_interests(&self) -> BTreeMap<IpAddr, GroupInterest> {
+        let mut groups = BTreeMap::<IpAddr, GroupSummary>::new();
+        for state in self.endpoints.values() {
+            for (group, interest) in &state.groups {
+                groups.entry(*group).or_default().apply(interest);
             }
         }
 
-        subscriptions.into_iter().collect()
+        groups
+            .into_iter()
+            .filter_map(|(group, summary)| {
+                summary.into_interest().map(|interest| (group, interest))
+            })
+            .collect()
     }
 }
 
@@ -208,8 +224,37 @@ impl EndpointState {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct GroupSummary {
-    requires_asm: bool,
-    sources: BTreeSet<IpAddr>,
+    include_sources: BTreeSet<IpAddr>,
+    exclude_sources: Option<BTreeSet<IpAddr>>,
+}
+
+impl GroupSummary {
+    fn apply(&mut self, interest: &GroupInterest) {
+        match interest.mode {
+            FilterMode::Include => {
+                self.include_sources
+                    .extend(interest.sources.iter().copied());
+            }
+            FilterMode::Exclude => {
+                if let Some(exclude_sources) = self.exclude_sources.as_mut() {
+                    exclude_sources.retain(|source| interest.sources.contains(source));
+                } else {
+                    self.exclude_sources = Some(interest.sources.clone());
+                }
+            }
+        }
+    }
+
+    fn into_interest(self) -> Option<GroupInterest> {
+        if let Some(mut exclude_sources) = self.exclude_sources {
+            for source in self.include_sources {
+                exclude_sources.remove(&source);
+            }
+            return Some(GroupInterest::exclude(exclude_sources));
+        }
+
+        (!self.include_sources.is_empty()).then_some(GroupInterest::include(self.include_sources))
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +328,39 @@ mod tests {
             Vec::<SocketAddr>::new()
         );
         assert_eq!(state.endpoints_for_packet(allowed, group), vec![endpoint]);
+    }
+
+    #[test]
+    fn aggregate_interests_preserve_shared_exclude_filters() {
+        let first_endpoint = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let second_endpoint = SocketAddr::from(([198, 51, 100, 9], 40_001));
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let first_blocked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let second_blocked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let shared_blocked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+        let mut state = RelayState::default();
+
+        state.apply_report(
+            first_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::ChangeToExclude,
+                group,
+                vec![first_blocked, shared_blocked],
+            )]),
+        );
+        state.apply_report(
+            second_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::ChangeToExclude,
+                group,
+                vec![second_blocked, shared_blocked],
+            )]),
+        );
+
+        assert_eq!(
+            state.aggregate_interests(),
+            BTreeMap::from([(group, GroupInterest::exclude([shared_blocked]))])
+        );
     }
 
     #[test]

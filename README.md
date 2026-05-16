@@ -17,6 +17,8 @@ The crate currently includes:
   feature.
 - Raw gateway downstream transmit through `mctx-core` with its `raw-packets`
   feature.
+- Transparent gateway mode that listens for local IGMPv3/MLDv2 receiver reports
+  and turns them into AMT Membership Updates.
 
 [rfc7450]: https://datatracker.ietf.org/doc/html/rfc7450
 
@@ -35,6 +37,8 @@ Implemented:
 - AMT Teardown.
 - Relay upstream subscription reconciliation for ASM/SSM interests.
 - Gateway joins for a configured group and optional source.
+- Gateway local membership learning for transparent IGMPv3/MLDv2 operation.
+- Relay idle gateway pruning and gateway membership refreshes.
 - Localhost socket-level relay/gateway roundtrip test.
 
 Current limitations:
@@ -46,6 +50,12 @@ Current limitations:
 - Gateway raw downstream transmit may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform. `mctx-core` raw IPv6 transmit is
   not supported on Windows yet.
+- Transparent mode currently listens for IGMPv3 reports to `224.0.0.22` or
+  MLDv2 reports to `ff02::16`. It is not yet a full multicast router/TUN mode,
+  and legacy IGMPv1/v2 reports sent directly to a multicast group are not the
+  primary path.
+- Transparent mode does not yet age out silent local receivers with full
+  IGMP/MLD listener timers; leave/state-change reports update the learned state.
 
 ## Build
 
@@ -63,9 +73,9 @@ The crate depends on crates.io releases:
 ## CLI
 
 ```text
-amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX]
-amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX]
-amt gateway --relay ADDRESS:PORT --group GROUP [--source SOURCE] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--no-downstream]
+amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]
+amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]
+amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream]
 ```
 
 `amt daemon` is currently an alias for `amt relay`.
@@ -86,6 +96,11 @@ when binding to `0.0.0.0`; otherwise the default advertised address is loopback.
 
 `--upstream-interface` selects the native multicast receive interface for
 `mcrx-core` raw receive.
+
+The relay daemon prunes idle gateways after 260 seconds by default and checks
+for expired gateways every 5 seconds. Use `--gateway-idle-timeout 0` to disable
+pruning, or tune `--gateway-idle-timeout` and `--gateway-prune-interval` for
+test setups.
 
 ### Gateway
 
@@ -112,6 +127,27 @@ cargo run --release -- gateway \
 The gateway uses raw downstream transmit, so local SSM receivers can join the
 original `(S,G)` carried inside AMT Multicast Data. Raw transmit may require
 elevated privileges.
+
+The gateway daemon refreshes its current Membership Update state every 60
+seconds by default, which keeps relay-side idle pruning from removing healthy
+gateways. Use `--membership-refresh-interval 0` to disable refreshes.
+
+Run a transparent IPv4 gateway that learns local receiver interest from IGMPv3
+reports instead of using a fixed `--group`:
+
+```bash
+cargo run --release -- gateway \
+  --relay 203.0.113.10:2268 \
+  --transparent \
+  --protocol igmpv3 \
+  --downstream-interface 192.168.1.20
+```
+
+The transparent gateway sends periodic local General Queries by default and
+listens for receiver reports on the same interface. Use
+`--local-query-interval 0` to disable those local queries, or
+`--local-membership-interface` if the report listener must use a different
+interface address than downstream raw transmit.
 
 ## Tests
 
@@ -151,6 +187,8 @@ test must be run with appropriate socket permissions.
 - `relay`: runtime-agnostic relay state machine.
 - `upstream`: relay upstream raw multicast receive manager using `mcrx-core`.
 - `gateway`: runtime-agnostic gateway state machine.
+- `local_membership`: local IGMPv3/MLDv2 report listener and membership delta
+  tracker for transparent gateway mode.
 - `downstream`: gateway downstream raw multicast transmitter using `mctx-core`.
 - `daemon`: simple blocking relay and gateway loops.
 

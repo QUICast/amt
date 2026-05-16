@@ -6,6 +6,7 @@
 pub mod daemon;
 pub mod downstream;
 pub mod gateway;
+pub mod local_membership;
 pub mod membership;
 pub mod protocol;
 pub mod query;
@@ -15,6 +16,9 @@ pub mod upstream;
 
 pub use downstream::{DownstreamConfig, DownstreamForward, DownstreamPublisher};
 pub use gateway::{Gateway, GatewayAction, GatewayConfig, GatewayError};
+pub use local_membership::{
+    LocalMembershipConfig, LocalMembershipError, LocalMembershipEvent, LocalMembershipManager,
+};
 pub use membership::{
     MembershipBuildError, MembershipParseError, MembershipRecord, MembershipRecordKind,
     MembershipReport,

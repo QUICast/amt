@@ -18,11 +18,11 @@ The gateway forwards complete multicast IP datagrams downstream through
 `mctx-core` raw transmit. That preserves the original multicast source and group
 from the AMT Multicast Data packet.
 
-The current gateway is configured-join driven: `--group` and optional
-`--source` tell it which AMT Membership Update to send upstream. It does not yet
-listen for local IGMP/MLD reports from LAN receivers. Local receiver joins are
-only needed so the local host or LAN accepts the raw multicast datagrams that
-the gateway re-injects downstream.
+The gateway can run in transparent mode. In that mode it listens for local
+IGMPv3/MLDv2 receiver reports, aggregates the receiver interest, and sends AMT
+Membership Updates upstream only for groups that local receivers requested.
+Local receiver joins therefore drive both the LAN receive path and the AMT
+upstream subscription.
 
 For the first test, ASM is the easiest receiver mode. Once that works, use SSM
 with the Linode source IP as the source filter.
@@ -38,8 +38,8 @@ Internet:
   UDP AMT tunnel         -> Linode public IP:2268
 
 Local network:
-  amt gateway            -> receives AMT, forwards raw IP multicast
-  mcrx_recv receiver     -> joins 239.1.2.3:5000
+  mcrx_recv receiver     -> joins 239.1.2.3:5000 and emits IGMPv3
+  amt gateway            -> learns join, receives AMT, forwards raw IP multicast
 ```
 
 Example values:
@@ -181,9 +181,36 @@ For a repository build:
 `--relay-address` must be the public address reachable by the gateway. When
 binding to `0.0.0.0`, omitting it would advertise loopback by default.
 
-## Start The Local Receiver
+## Start The Transparent Local Gateway
 
 On the local machine:
+
+```bash
+target/release/amt gateway \
+  --relay "$LINODE_PUBLIC_IP:2268" \
+  --transparent \
+  --protocol igmpv3 \
+  --downstream-interface "$LOCAL_LAN_IP"
+```
+
+The gateway logs an initial local IGMPv3 General Query and then listens for
+local reports to `224.0.0.22`.
+
+Expected startup lines include:
+
+```text
+transparent local membership listening for Igmpv3 reports
+sent local Igmpv3 General Query
+```
+
+If you need to separate the raw transmit interface from the report listener,
+add `--local-membership-interface "$LOCAL_LAN_IP"`. Use
+`--local-query-interval 0` if another querier is already present and you only
+want to passively learn reports.
+
+## Start The Local Receiver
+
+On the local machine, in another terminal:
 
 ```bash
 cargo install mcrx-core --bin mcrx_recv
@@ -191,7 +218,7 @@ cargo install mcrx-core --bin mcrx_recv
 mcrx_recv 239.1.2.3 5000 --interface "$LOCAL_LAN_IP"
 ```
 
-For a local repository build:
+For a local `mcrx-core` repository build:
 
 ```bash
 cargo build --release --manifest-path ../mcrx-core/Cargo.toml --bin mcrx_recv
@@ -210,9 +237,27 @@ Use the source IP that appears in the multicast IP datagram. For loopback-only
 Linode tests that may be `127.0.0.1`, which is not a realistic SSM source for a
 LAN receiver; prefer the Linode default interface for SSM tests.
 
-## Start The Local Gateway
+Expected gateway and relay logs include these lines:
 
-On the local machine:
+```text
+local membership report from ...
+advertised 1 local membership record(s) to relay
+accepted Igmpv3 membership update (... active gateways)
+upstream subscriptions changed: +1 -0 active=1
+```
+
+The gateway refreshes its membership state every 60 seconds by default, and the
+relay expires idle gateways after 260 seconds by default. That means a crashed
+gateway should eventually disappear from the relay's active gateway count and
+upstream subscription set.
+
+If the relay and gateway connect but these membership lines do not appear, debug
+the local report path first. On the local machine, `tcpdump` should see IGMPv3
+reports to `224.0.0.22` after the gateway sends a query or after the receiver
+joins.
+
+For comparison, you can still bypass transparent learning and force a configured
+join:
 
 ```bash
 target/release/amt gateway \
@@ -220,18 +265,6 @@ target/release/amt gateway \
   --group 239.1.2.3 \
   --downstream-interface "$LOCAL_LAN_IP"
 ```
-
-Expected gateway and relay logs include these lines:
-
-```text
-sent Membership Query; sending configured joins
-accepted Igmpv3 membership update
-upstream subscriptions changed: +1 -0 active=1
-```
-
-If the relay and gateway connect but these membership lines do not appear, debug
-the AMT Membership Update path first. The local receiver's IGMP report is not
-what drives the current AMT subscription.
 
 ## Start The Linode Source
 
@@ -275,6 +308,7 @@ On the local machine:
 ```bash
 sudo tcpdump -ni any udp port 2268
 sudo tcpdump -ni any host 239.1.2.3 and udp port 5000
+sudo tcpdump -ni any igmp
 ```
 
 ## Common Failures
@@ -311,6 +345,24 @@ on the selected interface. Check that `mctx_send` prints the expected source
 address and use both `--source "$LINODE_UPSTREAM_IF"` and
 `--interface "$LINODE_UPSTREAM_IF"`.
 
+Transparent gateway sees no local membership reports:
+
+```text
+The local receiver may not have emitted a fresh IGMPv3 report, the listener may
+be on the wrong interface, or another local querier/report version interaction
+may be hiding the report from the gateway.
+```
+
+Confirm the gateway sends a local query and receivers answer:
+
+```bash
+sudo tcpdump -vv -ni any 'igmp or host 224.0.0.22'
+```
+
+If tcpdump sees reports but the gateway logs nothing, run with
+`--local-membership-interface "$LOCAL_LAN_IP"` and make sure the gateway has raw
+receive permission.
+
 If tcpdump sees packets but the relay logs nothing, try the raw receiver from
 `mcrx-core` on the same Linode:
 
@@ -333,13 +385,12 @@ subscriptions. Look for "accepted Igmpv3 membership update" and "upstream
 subscriptions changed" in the relay log.
 ```
 
-Local receiver joins do not cause the gateway to subscribe:
+Local receiver joins do not cause the transparent gateway to subscribe:
 
 ```text
-Expected for now. A transparent gateway mode would need a local IGMP/MLD
-listener, local querier, TUN interface, or multicast-router/proxy integration.
-Until that exists, pass the wanted group and source directly to amt gateway with
---group and --source.
+Confirm the gateway was started with --transparent, that tcpdump sees IGMPv3
+reports to 224.0.0.22, and that --local-membership-interface points at the LAN
+interface when automatic interface selection is not enough.
 ```
 
 Gateway forwards downstream but local receiver sees nothing:

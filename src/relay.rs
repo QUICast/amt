@@ -128,6 +128,10 @@ impl Relay {
         &self.state
     }
 
+    pub fn remove_gateway(&mut self, endpoint: SocketAddr) -> bool {
+        self.state.remove_endpoint(endpoint)
+    }
+
     pub fn handle_datagram(
         &mut self,
         peer: SocketAddr,

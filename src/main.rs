@@ -1,10 +1,11 @@
 use amt::AMT_PORT;
 use amt::daemon::{self, DaemonConfig, GatewayDaemonConfig, GatewayJoin};
 use amt::relay::RelayConfig;
-use amt::{DownstreamConfig, GatewayConfig, MembershipProtocol};
+use amt::{DownstreamConfig, GatewayConfig, LocalMembershipConfig, MembershipProtocol};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -48,6 +49,8 @@ fn parse_relay_config(
     let mut relay_addresses = Vec::new();
     let mut upstream_interface = None;
     let mut upstream_interface_index = None;
+    let mut gateway_idle_timeout = Some(Duration::from_secs(260));
+    let mut gateway_prune_interval = Duration::from_secs(5);
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -91,6 +94,27 @@ fn parse_relay_config(
                 }
                 upstream_interface_index = Some(index);
             }
+            "--gateway-idle-timeout" => {
+                let value = args.next().ok_or_else(|| {
+                    "--gateway-idle-timeout requires seconds, or 0 to disable pruning".to_string()
+                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --gateway-idle-timeout '{value}'"))?;
+                gateway_idle_timeout = (seconds != 0).then_some(Duration::from_secs(seconds));
+            }
+            "--gateway-prune-interval" => {
+                let value = args.next().ok_or_else(|| {
+                    "--gateway-prune-interval requires a positive number of seconds".to_string()
+                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --gateway-prune-interval '{value}'"))?;
+                if seconds == 0 {
+                    return Err("--gateway-prune-interval must not be 0".to_string());
+                }
+                gateway_prune_interval = Duration::from_secs(seconds);
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Ok(None);
@@ -107,6 +131,8 @@ fn parse_relay_config(
     let mut daemon_config = DaemonConfig::new(config);
     daemon_config.upstream.interface = upstream_interface;
     daemon_config.upstream.interface_index = upstream_interface_index;
+    daemon_config.gateway_idle_timeout = gateway_idle_timeout;
+    daemon_config.gateway_prune_interval = gateway_prune_interval;
 
     Ok(Some(daemon_config))
 }
@@ -117,9 +143,14 @@ fn parse_gateway_config(
     let mut bind = SocketAddr::from(([0, 0, 0, 0], 0));
     let mut relay = None;
     let mut protocol = None;
-    let mut group = None;
-    let mut source = None;
+    let mut group: Option<IpAddr> = None;
+    let mut source: Option<IpAddr> = None;
     let mut downstream = Some(DownstreamConfig::default());
+    let mut transparent = false;
+    let mut local_membership_interface: Option<IpAddr> = None;
+    let mut local_membership_ifindex = None;
+    let mut local_query_interval = Some(Duration::from_secs(30));
+    let mut membership_refresh_interval = Some(Duration::from_secs(60));
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -168,6 +199,49 @@ fn parse_gateway_config(
                         .map_err(|_| format!("invalid --source address '{value}'"))?,
                 );
             }
+            "--transparent" => transparent = true,
+            "--local-membership-interface" => {
+                let value = args.next().ok_or_else(|| {
+                    "--local-membership-interface requires an IP address".to_string()
+                })?;
+                local_membership_interface = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --local-membership-interface '{value}'"))?,
+                );
+            }
+            "--local-membership-ifindex" => {
+                let value = args.next().ok_or_else(|| {
+                    "--local-membership-ifindex requires a non-zero interface index".to_string()
+                })?;
+                let index = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --local-membership-ifindex '{value}'"))?;
+                if index == 0 {
+                    return Err("--local-membership-ifindex must not be 0".to_string());
+                }
+                local_membership_ifindex = Some(index);
+            }
+            "--local-query-interval" => {
+                let value = args.next().ok_or_else(|| {
+                    "--local-query-interval requires seconds, or 0 to disable queries".to_string()
+                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --local-query-interval '{value}'"))?;
+                local_query_interval = (seconds != 0).then_some(Duration::from_secs(seconds));
+            }
+            "--membership-refresh-interval" => {
+                let value = args.next().ok_or_else(|| {
+                    "--membership-refresh-interval requires seconds, or 0 to disable refreshes"
+                        .to_string()
+                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --membership-refresh-interval '{value}'"))?;
+                membership_refresh_interval =
+                    (seconds != 0).then_some(Duration::from_secs(seconds));
+            }
             "--downstream-interface" => {
                 let value = args
                     .next()
@@ -203,29 +277,68 @@ fn parse_gateway_config(
     }
 
     let relay = relay.ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string())?;
-    let group: IpAddr = group.ok_or_else(|| "gateway requires --group IP".to_string())?;
-    if !group.is_multicast() {
-        return Err("--group must be multicast".to_string());
+    if group.is_none() && !transparent {
+        return Err("gateway requires --group IP unless --transparent is set".to_string());
     }
-    if let Some(source) = source
-        && (!same_family(group, source) || source.is_multicast())
-    {
-        return Err("--source must be a unicast address in the same family as --group".to_string());
+    if source.is_some() && group.is_none() {
+        return Err("--source requires --group".to_string());
+    }
+
+    if let Some(group) = group {
+        if !group.is_multicast() {
+            return Err("--group must be multicast".to_string());
+        }
+        if let Some(source) = source
+            && (!same_family(group, source) || source.is_multicast())
+        {
+            return Err(
+                "--source must be a unicast address in the same family as --group".to_string(),
+            );
+        }
     }
 
     let protocol = protocol.unwrap_or_else(|| match group {
-        IpAddr::V4(_) => MembershipProtocol::Igmpv3,
-        IpAddr::V6(_) => MembershipProtocol::Mldv2,
+        Some(IpAddr::V6(_)) => MembershipProtocol::Mldv2,
+        Some(IpAddr::V4(_)) | None => MembershipProtocol::Igmpv3,
     });
-    match (protocol, group) {
-        (MembershipProtocol::Igmpv3, IpAddr::V4(_))
-        | (MembershipProtocol::Mldv2, IpAddr::V6(_)) => {}
-        _ => return Err("--protocol does not match --group address family".to_string()),
+    if let Some(group) = group {
+        match (protocol, group) {
+            (MembershipProtocol::Igmpv3, IpAddr::V4(_))
+            | (MembershipProtocol::Mldv2, IpAddr::V6(_)) => {}
+            _ => return Err("--protocol does not match --group address family".to_string()),
+        }
+    }
+    if let Some(interface) = local_membership_interface
+        && !protocol_matches_address(protocol, interface)
+    {
+        return Err(
+            "--local-membership-interface address family must match --protocol".to_string(),
+        );
     }
 
     let mut config = GatewayDaemonConfig::new(bind, GatewayConfig::new(relay, protocol));
-    config.joins.push(GatewayJoin { group, source });
+    if let Some(group) = group {
+        config.joins.push(GatewayJoin { group, source });
+    }
     config.downstream = downstream;
+    config.membership_refresh_interval = membership_refresh_interval;
+    if transparent {
+        let mut local = LocalMembershipConfig::new(protocol);
+        local.interface = local_membership_interface.or_else(|| {
+            config
+                .downstream
+                .as_ref()
+                .and_then(|downstream| downstream.interface)
+        });
+        local.interface_index = local_membership_ifindex.or_else(|| {
+            config
+                .downstream
+                .as_ref()
+                .and_then(|downstream| downstream.interface_index)
+        });
+        local.query_interval = local_query_interval;
+        config.local_membership = Some(local);
+    }
     Ok(Some(config))
 }
 
@@ -244,10 +357,17 @@ fn same_family(left: IpAddr, right: IpAddr) -> bool {
     )
 }
 
+fn protocol_matches_address(protocol: MembershipProtocol, address: IpAddr) -> bool {
+    matches!(
+        (protocol, address),
+        (MembershipProtocol::Igmpv3, IpAddr::V4(_)) | (MembershipProtocol::Mldv2, IpAddr::V6(_))
+    )
+}
+
 fn print_usage() {
     println!("{}", usage());
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX]\n  amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX]\n  amt gateway --relay ADDRESS:PORT --group GROUP [--source SOURCE] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--no-downstream]\n\nRelay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\nGateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\nRaw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms."
+    "Usage:\n  amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]\n  amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]\n  amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream]\n\nRelay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\nRelay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\nGateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\nGateway refreshes memberships every 60 seconds by default; pass --membership-refresh-interval 0 to disable refreshes.\nUse --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\nRaw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms."
 }

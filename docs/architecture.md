@@ -41,6 +41,12 @@ The relay code is organized as follows:
 The relay currently uses HMAC-SHA256 for the Response MAC derivation and takes
 the first six bytes as the RFC 7450 Response MAC field.
 
+The blocking relay daemon also keeps lightweight gateway activity bookkeeping.
+Accepted Membership Updates mark a gateway as active, Teardown removes it
+immediately, and idle gateway state is pruned after a configurable timeout so
+native upstream subscriptions are reconciled back down when a gateway vanishes
+without sending Teardown.
+
 ## Gateway Flow
 
 The gateway code is organized as follows:
@@ -48,6 +54,9 @@ The gateway code is organized as follows:
 - `gateway::Gateway` handles Relay Advertisement, Membership Query, Multicast
   Data, and Teardown state.
 - `membership` builds IGMPv3 or MLDv2 membership reports for configured joins.
+- `local_membership::LocalMembershipManager` listens for local IGMPv3/MLDv2
+  receiver reports in transparent mode and converts aggregate LAN interest into
+  AMT Membership Updates.
 - `downstream::DownstreamPublisher` forwards complete multicast IP datagrams
   through `mctx_core::RawContext`.
 - `daemon::run_gateway` connects the UDP AMT socket to the gateway state
@@ -57,6 +66,21 @@ The gateway supports both ASM and SSM membership requests toward the relay:
 
 - ASM is encoded as a `ModeIsExclude` record with no blocked sources.
 - SSM is encoded as a `ModeIsInclude` record with the selected source.
+
+The blocking gateway daemon periodically refreshes its current Membership
+Update state after the initial Membership Query. This keeps healthy gateways
+alive across relay-side idle pruning while still allowing crashed or
+disconnected gateways to age out.
+
+In transparent mode, local receiver reports are tracked per reporter IP and
+collapsed into the minimum upstream AMT interest needed for the LAN. If any
+local receiver has ASM interest for a group, the gateway advertises ASM
+upstream for that group. Otherwise it advertises the exact set of SSM sources
+reported by local receivers.
+
+The current transparent gateway learns from reports and state changes, but it
+does not yet run the full IGMP/MLD listener timer machinery needed to age out
+silent receivers.
 
 ## Packet Handling
 
@@ -86,6 +110,7 @@ Future runtime integrations can reuse:
 
 - `Relay::handle_datagram`
 - `Gateway::handle_datagram`
+- `LocalMembershipManager`
 - `UpstreamManager`
 - `DownstreamPublisher`
 
