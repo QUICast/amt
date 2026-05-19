@@ -11,8 +11,7 @@ The crate currently includes:
 - Gateway-side discovery, request, membership update, multicast data, and
   teardown state.
 - IGMPv3 and MLDv2 query/report packet helpers.
-- A simple blocking relay daemon.
-- A simple blocking gateway daemon.
+- Simple blocking relay and gateway runners.
 - Raw relay upstream receive through `mcrx-core` with its `raw-packets`
   feature.
 - Raw gateway downstream transmit through `mctx-core` with its `raw-packets`
@@ -26,7 +25,7 @@ The crate currently includes:
 
 This is still an early implementation. It is useful for protocol development,
 local integration tests, and first network tests, but it is not yet a hardened
-production daemon.
+production service.
 
 Implemented:
 
@@ -39,11 +38,12 @@ Implemented:
 - Gateway joins for a configured group and optional source.
 - Gateway local membership learning for transparent IGMPv3/MLDv2 operation.
 - Relay idle gateway pruning and gateway membership refreshes.
+- Gateway signal handling that sends AMT Teardown on graceful shutdown.
 - Localhost socket-level relay/gateway roundtrip test.
 
 Current limitations:
 
-- The simple daemons use blocking loops and polling. They are intentionally
+- The simple role runners use blocking loops and polling. They are intentionally
   small and easy to inspect, not yet optimized.
 - Relay raw upstream receive may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform.
@@ -74,11 +74,8 @@ The crate depends on crates.io releases:
 
 ```text
 amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]
-amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]
 amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream]
 ```
-
-`amt daemon` is currently an alias for `amt relay`.
 
 ### Relay
 
@@ -131,6 +128,10 @@ elevated privileges.
 The gateway daemon refreshes its current Membership Update state every 60
 seconds by default, which keeps relay-side idle pruning from removing healthy
 gateways. Use `--membership-refresh-interval 0` to disable refreshes.
+
+On Ctrl-C/SIGTERM, the gateway daemon attempts to send AMT Teardown before
+exiting. If the process is killed abruptly, relay-side idle pruning is the
+fallback cleanup path.
 
 Run a transparent IPv4 gateway that learns local receiver interest from IGMPv3
 reports instead of using a fixed `--group`:
@@ -190,7 +191,7 @@ test must be run with appropriate socket permissions.
 - `local_membership`: local IGMPv3/MLDv2 report listener and membership delta
   tracker for transparent gateway mode.
 - `downstream`: gateway downstream raw multicast transmitter using `mctx-core`.
-- `daemon`: simple blocking relay and gateway loops.
+- `daemon`: simple blocking relay and gateway runners.
 
 ## License
 

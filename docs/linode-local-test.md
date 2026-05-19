@@ -251,6 +251,10 @@ relay expires idle gateways after 260 seconds by default. That means a crashed
 gateway should eventually disappear from the relay's active gateway count and
 upstream subscription set.
 
+Stop the gateway with Ctrl-C for a graceful AMT Teardown. The relay should log
+`accepted teardown` and then reconcile upstream subscriptions down if no other
+gateway still needs the group.
+
 If the relay and gateway connect but these membership lines do not appear, debug
 the local report path first. On the local machine, `tcpdump` should see IGMPv3
 reports to `224.0.0.22` after the gateway sends a query or after the receiver

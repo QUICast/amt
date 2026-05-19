@@ -1,5 +1,8 @@
 use amt::AMT_PORT;
-use amt::daemon::{self, DaemonConfig, GatewayDaemonConfig, GatewayJoin};
+use amt::daemon::{
+    self, DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
+    DEFAULT_MEMBERSHIP_REFRESH_INTERVAL, GatewayDaemonConfig, GatewayJoin, RelayDaemonConfig,
+};
 use amt::relay::RelayConfig;
 use amt::{DownstreamConfig, GatewayConfig, LocalMembershipConfig, MembershipProtocol};
 use std::env;
@@ -20,9 +23,13 @@ fn main() -> ExitCode {
 fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
-        None | Some("daemon" | "relay") => {
+        None => {
+            print_usage();
+            Ok(())
+        }
+        Some("relay") => {
             if let Some(config) = parse_relay_config(args)? {
-                daemon::run(config).map_err(|error| error.to_string())
+                daemon::run_relay(config).map_err(|error| error.to_string())
             } else {
                 Ok(())
             }
@@ -44,13 +51,13 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
 fn parse_relay_config(
     args: impl IntoIterator<Item = String>,
-) -> Result<Option<DaemonConfig>, String> {
+) -> Result<Option<RelayDaemonConfig>, String> {
     let mut bind = SocketAddr::from(([0, 0, 0, 0], AMT_PORT));
     let mut relay_addresses = Vec::new();
     let mut upstream_interface = None;
     let mut upstream_interface_index = None;
-    let mut gateway_idle_timeout = Some(Duration::from_secs(260));
-    let mut gateway_prune_interval = Duration::from_secs(5);
+    let mut gateway_idle_timeout = Some(DEFAULT_GATEWAY_IDLE_TIMEOUT);
+    let mut gateway_prune_interval = DEFAULT_GATEWAY_PRUNE_INTERVAL;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -119,7 +126,7 @@ fn parse_relay_config(
                 print_usage();
                 return Ok(None);
             }
-            other => return Err(format!("unknown daemon argument '{other}'\n\n{}", usage())),
+            other => return Err(format!("unknown relay argument '{other}'\n\n{}", usage())),
         }
     }
 
@@ -128,13 +135,13 @@ fn parse_relay_config(
         config = config.with_advertise_addr(addr);
     }
 
-    let mut daemon_config = DaemonConfig::new(config);
-    daemon_config.upstream.interface = upstream_interface;
-    daemon_config.upstream.interface_index = upstream_interface_index;
-    daemon_config.gateway_idle_timeout = gateway_idle_timeout;
-    daemon_config.gateway_prune_interval = gateway_prune_interval;
+    let mut relay_daemon = RelayDaemonConfig::new(config);
+    relay_daemon.upstream.interface = upstream_interface;
+    relay_daemon.upstream.interface_index = upstream_interface_index;
+    relay_daemon.gateway_idle_timeout = gateway_idle_timeout;
+    relay_daemon.gateway_prune_interval = gateway_prune_interval;
 
-    Ok(Some(daemon_config))
+    Ok(Some(relay_daemon))
 }
 
 fn parse_gateway_config(
@@ -150,7 +157,7 @@ fn parse_gateway_config(
     let mut local_membership_interface: Option<IpAddr> = None;
     let mut local_membership_ifindex = None;
     let mut local_query_interval = Some(Duration::from_secs(30));
-    let mut membership_refresh_interval = Some(Duration::from_secs(60));
+    let mut membership_refresh_interval = Some(DEFAULT_MEMBERSHIP_REFRESH_INTERVAL);
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -369,5 +376,22 @@ fn print_usage() {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]\n  amt daemon [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]\n  amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream]\n\nRelay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\nRelay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\nGateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\nGateway refreshes memberships every 60 seconds by default; pass --membership-refresh-interval 0 to disable refreshes.\nUse --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\nRaw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms."
+    concat!(
+        "Usage:\n",
+        "  amt relay [--bind ADDRESS:PORT] [--relay-address IP] ",
+        "[--upstream-interface IP] [--upstream-ifindex INDEX] ",
+        "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]\n",
+        "  amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] ",
+        "[--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] ",
+        "[--downstream-interface IP] [--downstream-ifindex INDEX] ",
+        "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
+        "[--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] ",
+        "[--no-downstream]\n\n",
+        "Relay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\n",
+        "Relay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\n",
+        "Gateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\n",
+        "Gateway refreshes memberships every 60 seconds by default; pass --membership-refresh-interval 0 to disable refreshes.\n",
+        "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
+        "Raw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms.",
+    )
 }

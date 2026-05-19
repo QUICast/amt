@@ -1,7 +1,8 @@
 //! Lightweight building blocks for Automatic Multicast Tunneling (AMT).
 //!
 //! The protocol codec intentionally stays runtime agnostic. Runtime-specific
-//! loops, such as the simple blocking daemon, live at the crate edge.
+//! loops, such as the simple blocking relay and gateway runners, live at the
+//! crate edge.
 
 pub mod daemon;
 pub mod downstream;

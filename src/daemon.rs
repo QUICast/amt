@@ -8,6 +8,8 @@ use crate::upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager};
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,19 +18,19 @@ const MAX_UPSTREAM_DRAIN: usize = 64;
 const MAX_LOCAL_MEMBERSHIP_DRAIN: usize = 64;
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
 const GATEWAY_REDISCOVER_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(260);
-const DEFAULT_GATEWAY_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_MEMBERSHIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(260);
+pub const DEFAULT_GATEWAY_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_MEMBERSHIP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonConfig {
+pub struct RelayDaemonConfig {
     pub relay: RelayConfig,
     pub upstream: UpstreamConfig,
     pub gateway_idle_timeout: Option<Duration>,
     pub gateway_prune_interval: Duration,
 }
 
-impl DaemonConfig {
+impl RelayDaemonConfig {
     pub fn new(relay: RelayConfig) -> Self {
         Self {
             relay,
@@ -39,13 +41,13 @@ impl DaemonConfig {
     }
 }
 
-impl Default for DaemonConfig {
+impl Default for RelayDaemonConfig {
     fn default() -> Self {
         Self::new(RelayConfig::default())
     }
 }
 
-impl From<RelayConfig> for DaemonConfig {
+impl From<RelayConfig> for RelayDaemonConfig {
     fn from(value: RelayConfig) -> Self {
         Self::new(value)
     }
@@ -81,7 +83,7 @@ impl GatewayDaemonConfig {
 }
 
 /// Runs a small blocking AMT relay daemon.
-pub fn run(config: impl Into<DaemonConfig>) -> io::Result<()> {
+pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
     let config = config.into();
     let socket = UdpSocket::bind(config.relay.bind)?;
     socket.set_nonblocking(true)?;
@@ -147,6 +149,7 @@ pub fn run(config: impl Into<DaemonConfig>) -> io::Result<()> {
 pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
     let socket = UdpSocket::bind(config.bind)?;
     socket.set_nonblocking(true)?;
+    let shutdown = ShutdownSignal::install()?;
 
     let mut gateway = Gateway::new(config.gateway);
     let mut downstream = config.downstream.map(DownstreamPublisher::new);
@@ -182,6 +185,10 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
 
     loop {
         let mut made_progress = false;
+
+        if shutdown.requested() {
+            return shutdown_gateway(&socket, &gateway);
+        }
 
         if gateway.relay_endpoint().is_none()
             && last_discovery.elapsed() >= GATEWAY_REDISCOVER_INTERVAL
@@ -315,6 +322,41 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
 
         if !made_progress {
             thread::sleep(IDLE_SLEEP);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    fn install() -> io::Result<Self> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let handler_requested = Arc::clone(&requested);
+        ctrlc::set_handler(move || {
+            handler_requested.store(true, Ordering::SeqCst);
+        })
+        .map_err(|error| io::Error::other(format!("failed to install signal handler: {error}")))?;
+
+        Ok(Self { requested })
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+fn shutdown_gateway(socket: &UdpSocket, gateway: &Gateway) -> io::Result<()> {
+    match gateway.teardown() {
+        Ok(action) => {
+            println!("shutdown requested; sending AMT Teardown");
+            send_gateway_action(socket, action)
+        }
+        Err(error) => {
+            println!("shutdown requested before AMT Teardown was available: {error}");
+            Ok(())
         }
     }
 }

@@ -9,6 +9,7 @@ keywords = ["amt", "multicast", "tunnel", "udp", "networking"]
 categories = ["network-programming"]
 
 [dependencies]
+ctrlc = { version = "3.5.2", features = ["termination"] }
 getrandom = "0.3.4"
 hmac = "0.13.0"
 mcrx-core = { version = "0.2.5", features = ["raw-packets"] }

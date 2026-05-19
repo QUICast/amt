@@ -1,7 +1,7 @@
 # Architecture
 
 This crate is split into runtime-agnostic protocol/state components and small
-blocking daemon wrappers.
+blocking role runners.
 
 ## Roles
 
@@ -35,7 +35,7 @@ The relay code is organized as follows:
   for the current gateway set.
 - `upstream::UpstreamManager` reconciles those subscriptions into
   `mcrx_core::RawContext` subscriptions.
-- `daemon::run` connects the UDP AMT socket to the relay state machine and
+- `daemon::run_relay` connects the UDP AMT socket to the relay state machine and
   forwards raw upstream datagrams as AMT Multicast Data.
 
 The relay currently uses HMAC-SHA256 for the Response MAC derivation and takes
@@ -72,6 +72,11 @@ Update state after the initial Membership Query. This keeps healthy gateways
 alive across relay-side idle pruning while still allowing crashed or
 disconnected gateways to age out.
 
+The gateway daemon also installs a small shutdown signal handler. On Ctrl-C or
+SIGTERM it sends AMT Teardown when the relay has supplied enough state to build
+one, which gives the relay an immediate cleanup signal instead of waiting for
+idle expiry.
+
 In transparent mode, local receiver reports are tracked per reporter IP and
 collapsed into the minimum upstream AMT interest needed for the LAN. If any
 local receiver has ASM interest for a group, the gateway advertises ASM
@@ -103,8 +108,9 @@ selection. `mctx-core` currently does not support raw IPv6 transmit on Windows.
 
 ## Runtime Model
 
-The protocol and state types are runtime-agnostic. The current daemon module is
-blocking and uses short polling sleeps for simplicity.
+The protocol and state types are runtime-agnostic. The current `daemon` module
+contains small blocking role runners and uses short polling sleeps for
+simplicity.
 
 Future runtime integrations can reuse:
 
@@ -114,7 +120,8 @@ Future runtime integrations can reuse:
 - `UpstreamManager`
 - `DownstreamPublisher`
 
-The daemon loops are intentionally not the architectural center of the crate.
+The blocking runners are intentionally not the architectural center of the
+crate.
 
 ## Error Boundaries
 
