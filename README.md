@@ -215,7 +215,7 @@ group = "232.1.2.3"
 source = "192.0.2.10"
 ```
 
-## Heimdall Metrics
+## Metrics
 
 Metrics are compiled only with the `metrics` Cargo feature. When that feature
 is enabled and `--metrics-dir` or `[metrics].output_dir` is set, the daemon
@@ -260,6 +260,18 @@ verifies:
 
 Some sandboxed environments block UDP socket binds. In those environments the
 test must be run with appropriate socket permissions.
+
+There is also an ignored Linux system test harness that creates relay, gateway,
+source, and receiver network namespaces, then runs real AMT ASM, SSM, teardown,
+pruning, and optional metrics checks end-to-end. It requires Linux, `iproute2`,
+and root privileges or equivalent `CAP_NET_ADMIN`/`CAP_NET_RAW` capability:
+
+```bash
+sudo -E cargo test --features metrics --test system_linux -- --ignored --test-threads=1 --nocapture
+```
+
+For a no-metrics build, omit `--features metrics`. The tests are ignored by
+default and skip themselves on non-Linux hosts or without sufficient privileges.
 
 ## Documentation
 
