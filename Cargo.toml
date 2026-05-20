@@ -1,12 +1,21 @@
 [package]
-name = "amt"
+name = "quicast-amt"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "Lightweight Automatic Multicast Tunneling (AMT) implementation."
 readme = "README.md"
+repository = "https://github.com/QUICast/amt"
 keywords = ["amt", "multicast", "tunnel", "udp", "networking"]
 categories = ["network-programming"]
+
+[lib]
+name = "amt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amt"
+path = "src/main.rs"
 
 [features]
 default = []

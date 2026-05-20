@@ -1,7 +1,8 @@
 # amt
 
 Lightweight Rust building blocks for [Automatic Multicast Tunneling][rfc7450]
-(AMT, RFC 7450).
+(AMT, RFC 7450). The crates.io package is `quicast-amt`; the library crate and
+installed CLI binary are both named `amt`.
 
 The crate currently includes:
 
@@ -71,6 +72,7 @@ cargo build
 cargo build --features metrics
 cargo test
 cargo run -- --help
+cargo install quicast-amt
 ```
 
 The crate depends on crates.io releases:

@@ -592,6 +592,21 @@ mod tests {
     }
 
     #[test]
+    fn relay_advertisement_rejects_invalid_address_lengths() {
+        let mut encoded = vec![0x02, 0, 0, 0, 0, 0, 0, 7];
+        encoded.extend_from_slice(&[192, 0, 2, 1, 99]);
+
+        assert_eq!(
+            decode(&encoded),
+            Err(DecodeError::InvalidLength {
+                message_type: MessageType::RelayAdvertisement,
+                expected: "12 bytes for IPv4 or 24 bytes for IPv6",
+                actual: 13,
+            })
+        );
+    }
+
+    #[test]
     fn request_uses_p_flag_for_mldv2() {
         let message = Message::Request {
             request_nonce: 0x1122_3344,
@@ -639,6 +654,22 @@ mod tests {
         assert_eq!(encoded[0], 0x04);
         assert_eq!(encoded[1], 0x01);
         assert_eq!(decode(&encoded), Ok(message));
+    }
+
+    #[test]
+    fn membership_query_gateway_flag_requires_gateway_endpoint() {
+        let encoded = [
+            0x04, 0x01, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04,
+        ];
+
+        assert_eq!(
+            decode(&encoded),
+            Err(DecodeError::Truncated {
+                message_type: Some(MessageType::MembershipQuery),
+                expected_at_least: 30,
+                actual: 12,
+            })
+        );
     }
 
     #[test]

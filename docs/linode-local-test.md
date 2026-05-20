@@ -66,7 +66,7 @@ curl https://sh.rustup.rs -sSf | sh
 Build the relay and sender:
 
 ```bash
-cargo install amt --features metrics
+cargo install quicast-amt --features metrics
 cargo install mctx-core --bin mctx_send
 ```
 

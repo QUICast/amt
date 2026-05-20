@@ -416,6 +416,33 @@ mod tests {
     }
 
     #[test]
+    fn normalizing_ipv4_trims_trailing_bytes_to_total_length() {
+        let mut datagram = vec![
+            0x45, 0, 0, 28, 0x12, 0x34, 0, 0, 1, 17, 0xaa, 0xbb, 192, 0, 2, 10, 239, 1, 2, 3, 12,
+            34, 0x13, 0x88, 0, 8, 0xcc, 0xdd,
+        ];
+        let checksum = internet_checksum(&datagram[..20]);
+        datagram[10..12].copy_from_slice(&checksum.to_be_bytes());
+        datagram.extend_from_slice(&[0xee, 0xff]);
+
+        let normalized = normalize_forwarded_datagram(&datagram);
+
+        assert_eq!(normalized.len(), 28);
+        assert_eq!(ones_complement_sum(&normalized[..20]), 0xffff);
+        assert_eq!(udp_v4_sum(&normalized), 0xffff);
+    }
+
+    #[test]
+    fn malformed_ipv4_total_length_is_left_unchanged() {
+        let datagram = vec![
+            0x45, 0, 0, 40, 0x12, 0x34, 0, 0, 1, 17, 0xaa, 0xbb, 192, 0, 2, 10, 239, 1, 2, 3, 12,
+            34, 0x13, 0x88, 0, 8, 0xcc, 0xdd,
+        ];
+
+        assert_eq!(normalize_forwarded_datagram(&datagram), datagram);
+    }
+
+    #[test]
     fn normalizes_ipv6_udp_checksum_for_forwarding() {
         let source = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let group = Ipv6Addr::new(0xff3e, 0, 0, 0, 0, 0, 0x8000, 0x1234);

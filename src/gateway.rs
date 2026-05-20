@@ -360,6 +360,59 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_advertisement_nonce_does_not_update_relay_endpoint() {
+        let discovery_relay = SocketAddr::from(([127, 0, 0, 1], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(discovery_relay, MembershipProtocol::Igmpv3)
+                .with_nonces(0x0102_0304, 0x0506_0708),
+        );
+        let advertisement = encode(&Message::RelayAdvertisement {
+            discovery_nonce: 0xffff_ffff,
+            relay_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)),
+        });
+
+        assert_eq!(
+            gateway.handle_datagram(discovery_relay, &advertisement),
+            Err(GatewayError::UnexpectedDiscoveryNonce {
+                expected: 0x0102_0304,
+                actual: 0xffff_ffff
+            })
+        );
+        assert_eq!(gateway.relay_endpoint(), None);
+    }
+
+    #[test]
+    fn unexpected_query_nonce_does_not_replace_cached_query_state() {
+        let relay = SocketAddr::from(([127, 0, 0, 1], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_nonces(0x0102_0304, 0x0506_0708),
+        );
+        let existing_mac = ResponseMac::new([1, 2, 3, 4, 5, 6]);
+        let existing_gateway = GatewayEndpoint::new(40_000, Ipv4Addr::new(198, 51, 100, 8));
+        gateway.relay_endpoint = Some(relay);
+        gateway.response_mac = Some(existing_mac);
+        gateway.gateway_endpoint = Some(existing_gateway);
+        let query = encode(&Message::MembershipQuery {
+            response_mac: ResponseMac::new([6, 5, 4, 3, 2, 1]),
+            request_nonce: 0xffff_ffff,
+            limit: true,
+            gateway: None,
+            general_query: &[0x45, 0, 0, 20],
+        });
+
+        assert_eq!(
+            gateway.handle_datagram(relay, &query),
+            Err(GatewayError::UnexpectedRequestNonce {
+                expected: 0x0506_0708,
+                actual: 0xffff_ffff
+            })
+        );
+        assert_eq!(gateway.response_mac(), Some(existing_mac));
+        assert_eq!(gateway.gateway_endpoint, Some(existing_gateway));
+    }
+
+    #[test]
     fn join_group_builds_membership_update_after_query() {
         let relay = SocketAddr::from(([127, 0, 0, 1], 2268));
         let mut gateway = Gateway::new(
@@ -396,5 +449,28 @@ mod tests {
         assert_eq!(actual_mac, response_mac);
         assert_eq!(request_nonce, 0x0506_0708);
         assert!(membership_update.starts_with(&[0x46]));
+    }
+
+    #[test]
+    fn teardown_requires_gateway_endpoint_from_membership_query() {
+        let relay = SocketAddr::from(([127, 0, 0, 1], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_nonces(0x0102_0304, 0x0506_0708),
+        );
+        gateway.relay_endpoint = Some(relay);
+        let query = encode(&Message::MembershipQuery {
+            response_mac: ResponseMac::new([1, 2, 3, 4, 5, 6]),
+            request_nonce: 0x0506_0708,
+            limit: false,
+            gateway: None,
+            general_query: &[0x45, 0, 0, 20],
+        });
+        gateway.handle_datagram(relay, &query).unwrap();
+
+        assert_eq!(
+            gateway.teardown(),
+            Err(GatewayError::MissingGatewayEndpoint)
+        );
     }
 }

@@ -424,6 +424,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_authenticated_membership_update_does_not_create_state() {
+        let mut relay = relay();
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 0xaabb_ccdd;
+        let response_mac = relay.response_mac(peer.ip(), peer.port(), nonce);
+        let mut packet =
+            igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
+        packet[26] ^= 0xff;
+        let update = encode(&Message::MembershipUpdate {
+            response_mac,
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+
+        assert!(matches!(
+            relay.handle_datagram(peer, &update),
+            Err(RelayError::Membership(
+                MembershipParseError::InvalidChecksum("IGMP")
+            ))
+        ));
+        assert_eq!(relay.state().endpoint_count(), 0);
+        assert!(relay.state().upstream_subscriptions().is_empty());
+    }
+
+    #[test]
     fn teardown_removes_endpoint_state() {
         let mut relay = relay();
         let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
@@ -454,6 +479,44 @@ mod tests {
             }
         );
         assert!(relay.state().upstream_subscriptions().is_empty());
+    }
+
+    #[test]
+    fn bad_teardown_mac_does_not_remove_endpoint_state() {
+        let mut relay = relay();
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 0xaabb_ccdd;
+        let response_mac = relay.response_mac(peer.ip(), peer.port(), nonce);
+        let group = Ipv4Addr::new(232, 1, 2, 3);
+        let source = Ipv4Addr::new(192, 0, 2, 1);
+        let packet = igmpv3_join_packet(group, source);
+        let update = encode(&Message::MembershipUpdate {
+            response_mac,
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+        relay.handle_datagram(peer, &update).unwrap();
+
+        let teardown = encode(&Message::Teardown {
+            response_mac: ResponseMac::ZERO,
+            request_nonce: nonce,
+            gateway: GatewayEndpoint::new(peer.port(), peer.ip()),
+        });
+
+        assert_eq!(
+            relay.handle_datagram(peer, &teardown).unwrap(),
+            RelayAction::RejectedAuth
+        );
+        assert_eq!(
+            relay
+                .state()
+                .endpoints_for_packet(source.into(), group.into()),
+            vec![peer]
+        );
+        assert_eq!(
+            relay.state().upstream_subscriptions(),
+            vec![UpstreamSubscription::ssm(group.into(), source.into())]
+        );
     }
 
     fn igmpv3_join_packet(group: Ipv4Addr, source: Ipv4Addr) -> Vec<u8> {

@@ -381,4 +381,83 @@ mod tests {
         assert!(state.upstream_subscriptions().is_empty());
         assert!(state.endpoints_for_packet(source, group).is_empty());
     }
+
+    #[test]
+    fn empty_include_leave_removes_only_reporting_endpoint() {
+        let first_endpoint = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let second_endpoint = SocketAddr::from(([198, 51, 100, 9], 40_001));
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mut state = RelayState::default();
+
+        for endpoint in [first_endpoint, second_endpoint] {
+            state.apply_report(
+                endpoint,
+                &report(vec![record(
+                    MembershipRecordKind::ChangeToExclude,
+                    group,
+                    Vec::new(),
+                )]),
+            );
+        }
+        state.apply_report(
+            first_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::ChangeToInclude,
+                group,
+                Vec::new(),
+            )]),
+        );
+
+        assert!(!state.contains_endpoint(first_endpoint));
+        assert!(state.contains_endpoint(second_endpoint));
+        assert_eq!(state.endpoint_count(), 1);
+        assert_eq!(
+            state.upstream_subscriptions(),
+            vec![UpstreamSubscription::asm(group)]
+        );
+        assert_eq!(
+            state.endpoints_for_packet(source, group),
+            vec![second_endpoint]
+        );
+    }
+
+    #[test]
+    fn blocking_shared_ssm_source_preserves_other_gateway_interest() {
+        let first_endpoint = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let second_endpoint = SocketAddr::from(([198, 51, 100, 9], 40_001));
+        let group = IpAddr::V4(Ipv4Addr::new(232, 1, 2, 3));
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mut state = RelayState::default();
+
+        for endpoint in [first_endpoint, second_endpoint] {
+            state.apply_report(
+                endpoint,
+                &report(vec![record(
+                    MembershipRecordKind::AllowNewSources,
+                    group,
+                    vec![source],
+                )]),
+            );
+        }
+        state.apply_report(
+            first_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::BlockOldSources,
+                group,
+                vec![source],
+            )]),
+        );
+
+        assert!(!state.contains_endpoint(first_endpoint));
+        assert!(state.contains_endpoint(second_endpoint));
+        assert_eq!(
+            state.upstream_subscriptions(),
+            vec![UpstreamSubscription::ssm(group, source)]
+        );
+        assert_eq!(
+            state.endpoints_for_packet(source, group),
+            vec![second_endpoint]
+        );
+    }
 }

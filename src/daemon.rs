@@ -940,4 +940,19 @@ mod tests {
             vec![stale]
         );
     }
+
+    #[test]
+    fn prune_stale_gateways_drops_activity_even_when_relay_has_no_state() {
+        let start = Instant::now();
+        let stale = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let mut relay = Relay::new(RelayConfig::default());
+        let mut activity = GatewayActivity::default();
+        activity.mark_seen_at(stale, start);
+
+        let expired = prune_stale_gateways(&mut relay, &mut activity, Duration::ZERO);
+
+        assert_eq!(expired, 0);
+        assert_eq!(activity.len(), 0);
+        assert_eq!(relay.state().endpoint_count(), 0);
+    }
 }

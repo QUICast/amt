@@ -292,6 +292,24 @@ mod tests {
     }
 
     #[test]
+    fn malformed_udp_length_keeps_datagram_but_omits_udp_port() {
+        let mut packet = ipv4_udp_packet(
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(239, 1, 2, 3),
+            5000,
+            b"hello",
+        );
+        packet[IPV4_MIN_HEADER_LEN + 4..IPV4_MIN_HEADER_LEN + 6]
+            .copy_from_slice(&100u16.to_be_bytes());
+
+        let parsed = parse_ip_multicast_datagram(&packet).unwrap();
+
+        assert_eq!(parsed.ip_protocol, UDP_PROTOCOL);
+        assert_eq!(parsed.udp_dst_port, None);
+        assert_eq!(parsed.datagram_len, packet.len());
+    }
+
+    #[test]
     fn ignores_non_multicast_destinations() {
         let packet = ipv4_packet(
             Ipv4Addr::new(192, 0, 2, 1),

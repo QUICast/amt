@@ -783,6 +783,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_igmpv3_record_after_checksum_validation() {
+        let packet = ipv4_packet(igmpv3_report(&[]));
+        let mut packet = packet;
+        let igmp_offset = IPV4_MIN_HEADER_LEN;
+        packet[igmp_offset + 6..igmp_offset + 8].copy_from_slice(&1u16.to_be_bytes());
+        packet[igmp_offset + 2..igmp_offset + 4].copy_from_slice(&[0, 0]);
+        let checksum = checksum(&packet[igmp_offset..]);
+        packet[igmp_offset + 2..igmp_offset + 4].copy_from_slice(&checksum.to_be_bytes());
+
+        assert_eq!(
+            parse_membership_report(&packet),
+            Err(MembershipParseError::Truncated {
+                context: "IGMPv3 group record",
+                expected_at_least: 8,
+                actual: 0
+            })
+        );
+    }
+
+    #[test]
     fn builds_parseable_igmpv3_membership_report() {
         let report = MembershipReport {
             protocol: MembershipProtocol::Igmpv3,
@@ -816,6 +836,36 @@ mod tests {
         assert_eq!(packet[0], 0x60);
         assert_eq!(&packet[24..40], &MLDV2_REPORT_DESTINATION.octets());
         assert_eq!(parse_membership_report(&packet).unwrap(), report);
+    }
+
+    #[test]
+    fn build_rejects_empty_reports() {
+        let report = MembershipReport {
+            protocol: MembershipProtocol::Igmpv3,
+            records: Vec::new(),
+        };
+
+        assert_eq!(
+            build_membership_report(&report),
+            Err(MembershipBuildError::EmptyReport)
+        );
+    }
+
+    #[test]
+    fn build_rejects_multicast_sources() {
+        let report = MembershipReport {
+            protocol: MembershipProtocol::Igmpv3,
+            records: vec![MembershipRecord {
+                kind: MembershipRecordKind::ModeIsInclude,
+                group: IpAddr::V4(Ipv4Addr::new(232, 1, 2, 3)),
+                sources: vec![IpAddr::V4(Ipv4Addr::new(239, 1, 2, 4))],
+            }],
+        };
+
+        assert_eq!(
+            build_membership_report(&report),
+            Err(MembershipBuildError::MixedAddressFamilies)
+        );
     }
 
     pub(crate) fn ipv4_packet(mut payload: Vec<u8>) -> Vec<u8> {
