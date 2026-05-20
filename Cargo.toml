@@ -8,10 +8,17 @@ readme = "README.md"
 keywords = ["amt", "multicast", "tunnel", "udp", "networking"]
 categories = ["network-programming"]
 
+[features]
+default = []
+metrics = ["dep:serde_json", "mcrx-core/metrics"]
+
 [dependencies]
 ctrlc = { version = "3.5.2", features = ["termination"] }
 getrandom = "0.3.4"
 hmac = "0.13.0"
 mcrx-core = { version = "0.2.5", features = ["raw-packets"] }
 mctx-core = { version = "0.2.3", features = ["raw-packets"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", optional = true }
 sha2 = "0.11.0"
+toml = "1.1.2"

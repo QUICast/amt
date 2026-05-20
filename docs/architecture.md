@@ -123,6 +123,29 @@ Future runtime integrations can reuse:
 The blocking runners are intentionally not the architectural center of the
 crate.
 
+## Configuration
+
+The binary loads role-specific TOML config through `config::FileConfig`.
+Configuration is intentionally kept at the daemon edge: protocol/state modules
+do not know about TOML, filesystems, or process-level defaults. CLI arguments
+are applied after the file so a deployment config can be reused for local tests
+with small overrides.
+
+## Metrics
+
+The daemon edge also owns AMT metrics behind the `metrics` Cargo feature.
+`metrics::MetricsRecorder` accumulates role counters in process memory and
+periodically emits Heimdall-style single-header JSONL samples when the feature
+is enabled and an output directory is configured.
+
+The relay emits `amt-relay` samples with gateway and upstream subscription
+gauges plus AMT control/upstream forwarding counters. The gateway emits
+`amt-gateway` samples with relay/downstream/transparent-mode gauges plus AMT
+control, downstream forwarding, and local membership counters.
+
+Metric collection is deliberately passive: it should not change protocol state,
+native multicast subscription reconciliation, or forwarding behavior.
+
 ## Error Boundaries
 
 Protocol-level decode errors stay in `protocol`.

@@ -66,7 +66,7 @@ curl https://sh.rustup.rs -sSf | sh
 Build the relay and sender:
 
 ```bash
-cargo install amt
+cargo install amt --features metrics
 cargo install mctx-core --bin mctx_send
 ```
 
@@ -74,7 +74,7 @@ If using this repository checkout instead of crates.io:
 
 ```bash
 cd ~/multicast/amt
-cargo build --release
+cargo build --release --features metrics
 
 cd ~/multicast/mctx-core
 cargo build --release --bin mctx_send
@@ -100,7 +100,7 @@ Raw downstream transmit on the local gateway also usually needs `CAP_NET_RAW`
 or root. For a repository build on the local machine:
 
 ```bash
-cargo build --release
+cargo build --release --features metrics
 sudo setcap cap_net_raw+ep target/release/amt
 getcap target/release/amt
 ```
@@ -163,10 +163,14 @@ Use the right interface if your local machine is not on `en0`.
 On the Linode:
 
 ```bash
+HEIMDALL_IMPORT_DIR=$HOME/heimdall-import
+
 amt relay \
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
-  --upstream-interface "$LINODE_UPSTREAM_IF"
+  --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --metrics-dir "$HEIMDALL_IMPORT_DIR" \
+  --node-id linode-amt-relay
 ```
 
 For a repository build:
@@ -175,7 +179,9 @@ For a repository build:
 ~/multicast/amt/target/release/amt relay \
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
-  --upstream-interface "$LINODE_UPSTREAM_IF"
+  --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --metrics-dir "$HEIMDALL_IMPORT_DIR" \
+  --node-id linode-amt-relay
 ```
 
 `--relay-address` must be the public address reachable by the gateway. When
@@ -186,11 +192,15 @@ binding to `0.0.0.0`, omitting it would advertise loopback by default.
 On the local machine:
 
 ```bash
+HEIMDALL_IMPORT_DIR=$PWD/heimdall-import
+
 target/release/amt gateway \
   --relay "$LINODE_PUBLIC_IP:2268" \
   --transparent \
   --protocol igmpv3 \
-  --downstream-interface "$LOCAL_LAN_IP"
+  --downstream-interface "$LOCAL_LAN_IP" \
+  --metrics-dir "$HEIMDALL_IMPORT_DIR" \
+  --node-id local-amt-gateway
 ```
 
 The gateway logs an initial local IGMPv3 General Query and then listens for
@@ -207,6 +217,13 @@ If you need to separate the raw transmit interface from the report listener,
 add `--local-membership-interface "$LOCAL_LAN_IP"`. Use
 `--local-query-interval 0` if another querier is already present and you only
 want to passively learn reports.
+
+Metrics appear under:
+
+```text
+$HEIMDALL_IMPORT_DIR/linode-amt-relay/amt-relay.jsonl
+$HEIMDALL_IMPORT_DIR/local-amt-gateway/amt-gateway.jsonl
+```
 
 ## Start The Local Receiver
 

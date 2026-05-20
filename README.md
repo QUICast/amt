@@ -12,6 +12,8 @@ The crate currently includes:
   teardown state.
 - IGMPv3 and MLDv2 query/report packet helpers.
 - Simple blocking relay and gateway runners.
+- TOML configuration for the relay and gateway daemons.
+- Heimdall-style single-header JSONL metrics output.
 - Raw relay upstream receive through `mcrx-core` with its `raw-packets`
   feature.
 - Raw gateway downstream transmit through `mctx-core` with its `raw-packets`
@@ -39,6 +41,8 @@ Implemented:
 - Gateway local membership learning for transparent IGMPv3/MLDv2 operation.
 - Relay idle gateway pruning and gateway membership refreshes.
 - Gateway signal handling that sends AMT Teardown on graceful shutdown.
+- Config-file loading with CLI overrides.
+- Role-level daemon metrics counters and gauges written as Heimdall JSONL.
 - Localhost socket-level relay/gateway roundtrip test.
 
 Current limitations:
@@ -56,11 +60,15 @@ Current limitations:
   primary path.
 - Transparent mode does not yet age out silent local receivers with full
   IGMP/MLD listener timers; leave/state-change reports update the learned state.
+- AMT metrics use Heimdall's JSONL container format with `amt-relay` and
+  `amt-gateway` artifact types. The current local Heimdall tree needs matching
+  ingestors before those new artifact types are queryable there.
 
 ## Build
 
 ```bash
 cargo build
+cargo build --features metrics
 cargo test
 cargo run -- --help
 ```
@@ -73,8 +81,8 @@ The crate depends on crates.io releases:
 ## CLI
 
 ```text
-amt relay [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS]
-amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream]
+amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt gateway [--config FILE] --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
 ```
 
 ### Relay
@@ -82,10 +90,12 @@ amt gateway --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparen
 Run a relay on the standard AMT UDP port:
 
 ```bash
-cargo run --release -- relay \
+cargo run --release --features metrics -- relay \
   --bind 0.0.0.0:2268 \
   --relay-address 203.0.113.10 \
-  --upstream-interface 192.0.2.10
+  --upstream-interface 192.0.2.10 \
+  --metrics-dir ./heimdall-import \
+  --node-id linode-amt-relay
 ```
 
 `--relay-address` is the IP address advertised to gateways. It is important
@@ -105,7 +115,7 @@ Run a gateway that joins an ASM group through a remote relay and forwards
 received multicast IP datagrams locally:
 
 ```bash
-cargo run --release -- gateway \
+cargo run --release --features metrics -- gateway \
   --relay 203.0.113.10:2268 \
   --group 239.1.2.3 \
   --downstream-interface 192.168.1.20
@@ -137,11 +147,13 @@ Run a transparent IPv4 gateway that learns local receiver interest from IGMPv3
 reports instead of using a fixed `--group`:
 
 ```bash
-cargo run --release -- gateway \
+cargo run --release --features metrics -- gateway \
   --relay 203.0.113.10:2268 \
   --transparent \
   --protocol igmpv3 \
-  --downstream-interface 192.168.1.20
+  --downstream-interface 192.168.1.20 \
+  --metrics-dir ./heimdall-import \
+  --node-id local-amt-gateway
 ```
 
 The transparent gateway sends periodic local General Queries by default and
@@ -149,6 +161,82 @@ listens for receiver reports on the same interface. Use
 `--local-query-interval 0` to disable those local queries, or
 `--local-membership-interface` if the report listener must use a different
 interface address than downstream raw transmit.
+
+## Configuration
+
+Both daemon roles accept `--config FILE`. Values from the config file are loaded
+first; CLI flags override them.
+
+Minimal relay config:
+
+```toml
+[relay]
+bind = "0.0.0.0:2268"
+relay_address = "203.0.113.10"
+upstream_interface = "192.0.2.10"
+gateway_idle_timeout_secs = 260
+
+[metrics]
+output_dir = "./heimdall-import"
+node_id = "linode-amt-relay"
+interval_ms = 1000
+```
+
+Minimal transparent gateway config:
+
+```toml
+[gateway]
+relay = "203.0.113.10:2268"
+protocol = "igmpv3"
+transparent = true
+membership_refresh_interval_secs = 60
+
+[gateway.downstream]
+interface = "192.168.1.20"
+ttl = 16
+
+[gateway.local_membership]
+query_interval_secs = 30
+
+[metrics]
+output_dir = "./heimdall-import"
+node_id = "local-amt-gateway"
+interval_ms = 1000
+```
+
+Configured joins can also be expressed in TOML:
+
+```toml
+[[gateway.joins]]
+group = "239.1.2.3"
+
+[[gateway.joins]]
+group = "232.1.2.3"
+source = "192.0.2.10"
+```
+
+## Heimdall Metrics
+
+Metrics are compiled only with the `metrics` Cargo feature. When that feature
+is enabled and `--metrics-dir` or `[metrics].output_dir` is set, the daemon
+writes single-header JSONL files:
+
+```text
+<metrics-dir>/<node-id>/amt-relay.jsonl
+<metrics-dir>/<node-id>/amt-gateway.jsonl
+```
+
+Without `--features metrics`, the same config and CLI fields are accepted but
+the daemon logs that metrics were requested by a binary built without metrics
+support.
+
+Each sample row includes `ts`, `interval_secs`, role gauges, and counters in
+`*_total`, `*_delta`, and `*_per_sec` form. The relay reports gateway counts,
+upstream subscription counts, upstream receive/forward totals, AMT control
+traffic, authentication rejections, teardowns, and pruning. The gateway reports
+relay connectivity, configured joins, discovery/update traffic, AMT Multicast
+Data receive, downstream forwarding, local query, and transparent membership
+activity.
 
 ## Tests
 
@@ -176,6 +264,7 @@ test must be run with appropriate socket permissions.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Configuration and Heimdall metrics](docs/configuration.md)
 - [Linode to local network test](docs/linode-local-test.md)
 - [Raw `mctx-core` transmit integration](docs/mctx-raw-packets.md)
 

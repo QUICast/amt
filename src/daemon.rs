@@ -1,6 +1,10 @@
 use crate::downstream::{DownstreamConfig, DownstreamPublisher};
 use crate::gateway::{Gateway, GatewayAction, GatewayConfig};
 use crate::local_membership::{LocalMembershipConfig, LocalMembershipManager};
+use crate::metrics::{
+    GatewayMetricsGauges, MetricsConfig, MetricsFlags, MetricsRecorder, RelayMetricsGauges,
+    base_flags,
+};
 use crate::protocol::{Message, encode};
 use crate::relay::{Relay, RelayAction, RelayConfig};
 use crate::state::UpstreamSubscription;
@@ -28,6 +32,7 @@ pub struct RelayDaemonConfig {
     pub upstream: UpstreamConfig,
     pub gateway_idle_timeout: Option<Duration>,
     pub gateway_prune_interval: Duration,
+    pub metrics: MetricsConfig,
 }
 
 impl RelayDaemonConfig {
@@ -37,6 +42,7 @@ impl RelayDaemonConfig {
             upstream: UpstreamConfig::default(),
             gateway_idle_timeout: Some(DEFAULT_GATEWAY_IDLE_TIMEOUT),
             gateway_prune_interval: DEFAULT_GATEWAY_PRUNE_INTERVAL,
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -67,6 +73,7 @@ pub struct GatewayDaemonConfig {
     pub downstream: Option<DownstreamConfig>,
     pub local_membership: Option<LocalMembershipConfig>,
     pub membership_refresh_interval: Option<Duration>,
+    pub metrics: MetricsConfig,
 }
 
 impl GatewayDaemonConfig {
@@ -78,6 +85,7 @@ impl GatewayDaemonConfig {
             downstream: Some(DownstreamConfig::default()),
             local_membership: None,
             membership_refresh_interval: Some(DEFAULT_MEMBERSHIP_REFRESH_INTERVAL),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -85,12 +93,17 @@ impl GatewayDaemonConfig {
 /// Runs a small blocking AMT relay daemon.
 pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
     let config = config.into();
+    let metrics_config = config.metrics.clone();
     let socket = UdpSocket::bind(config.relay.bind)?;
     socket.set_nonblocking(true)?;
 
     let mut relay = Relay::new(config.relay);
     let mut upstream = UpstreamManager::new(config.upstream);
     let mut gateway_activity = GatewayActivity::default();
+    let mut metrics = MetricsRecorder::relay(
+        &metrics_config,
+        relay_metrics_flags(&metrics_config, socket.local_addr()?, &relay, &upstream),
+    )?;
     let mut last_gateway_prune = Instant::now();
     println!(
         "amt relay listening on {} (advertising IPv4 {}, IPv6 {})",
@@ -98,6 +111,11 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
         relay.config().advertise_ipv4,
         relay.config().advertise_ipv6
     );
+    if let Some(path) = metrics.path() {
+        println!("heimdall metrics enabled: {}", path.display());
+    } else if metrics_config.requested() {
+        println!("heimdall metrics requested but this binary was built without --features metrics");
+    }
 
     let mut buf = [0; MAX_UDP_DATAGRAM];
     loop {
@@ -112,6 +130,7 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
                         &mut relay,
                         &mut upstream,
                         &mut gateway_activity,
+                        &mut metrics,
                         peer,
                         &buf[..len],
                     )?;
@@ -126,18 +145,26 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
         {
             let expired = prune_stale_gateways(&mut relay, &mut gateway_activity, timeout);
             if expired != 0 {
+                metrics.counters_mut().gateways_expired_total += expired as u64;
                 println!(
                     "expired {expired} idle gateway(s); active gateways={}",
                     gateway_activity.len()
                 );
-                sync_upstream(&relay, &mut upstream)?;
+                sync_upstream(&relay, &mut upstream, &mut metrics)?;
             }
             last_gateway_prune = Instant::now();
             made_progress = true;
         }
 
-        let forwarded = drain_upstream(&socket, &relay, &mut upstream)?;
+        let forwarded = drain_upstream(&socket, &relay, &mut upstream, &mut metrics)?;
         made_progress |= forwarded != 0;
+        match metrics.maybe_emit_relay(RelayMetricsGauges {
+            active_gateways: gateway_activity.len() as u64,
+            active_upstream_subscriptions: upstream.active_subscription_count() as u64,
+        }) {
+            Ok(emitted) => made_progress |= emitted,
+            Err(error) => eprintln!("failed to write relay metrics sample: {error}"),
+        }
 
         if !made_progress {
             thread::sleep(IDLE_SLEEP);
@@ -147,6 +174,10 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
 
 /// Runs a small blocking AMT gateway daemon.
 pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
+    let metrics_config = config.metrics.clone();
+    let configured_joins = config.joins.len() as u64;
+    let transparent_enabled = config.local_membership.is_some();
+    let downstream_enabled = config.downstream.is_some();
     let socket = UdpSocket::bind(config.bind)?;
     socket.set_nonblocking(true)?;
     let shutdown = ShutdownSignal::install()?;
@@ -164,6 +195,17 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
         }
         None => None,
     };
+    let mut metrics = MetricsRecorder::gateway(
+        &metrics_config,
+        gateway_metrics_flags(
+            &metrics_config,
+            socket.local_addr()?,
+            &gateway,
+            downstream_enabled,
+            transparent_enabled,
+            configured_joins,
+        ),
+    )?;
     let mut last_discovery = Instant::now()
         .checked_sub(GATEWAY_REDISCOVER_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -182,18 +224,24 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
             local.config().protocol
         );
     }
+    if let Some(path) = metrics.path() {
+        println!("heimdall metrics enabled: {}", path.display());
+    } else if metrics_config.requested() {
+        println!("heimdall metrics requested but this binary was built without --features metrics");
+    }
 
     loop {
         let mut made_progress = false;
 
         if shutdown.requested() {
-            return shutdown_gateway(&socket, &gateway);
+            return shutdown_gateway(&socket, &gateway, &mut metrics);
         }
 
         if gateway.relay_endpoint().is_none()
             && last_discovery.elapsed() >= GATEWAY_REDISCOVER_INTERVAL
         {
             send_gateway_action(&socket, gateway.discovery())?;
+            metrics.counters_mut().gateway_discoveries_sent_total += 1;
             last_discovery = Instant::now();
             made_progress = true;
         }
@@ -208,7 +256,10 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
             if query_due {
                 if let Some(downstream) = downstream.as_mut() {
                     if let Err(error) = send_local_membership_query(downstream, local) {
+                        metrics.counters_mut().downstream_forward_errors_total += 1;
                         eprintln!("failed to send local membership query: {error}");
+                    } else {
+                        metrics.counters_mut().local_queries_sent_total += 1;
                     }
                 } else {
                     eprintln!(
@@ -233,9 +284,11 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                     &gateway,
                     &config.joins,
                     local_membership.as_mut(),
+                    &mut metrics,
                 )?;
                 last_membership_refresh = Some(Instant::now());
                 if refreshed != 0 {
+                    metrics.counters_mut().gateway_membership_refreshes_total += 1;
                     println!("refreshed {refreshed} membership update(s) to relay");
                 }
                 made_progress = true;
@@ -246,18 +299,25 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
             match socket.recv_from(&mut buf) {
                 Ok((len, peer)) => {
                     made_progress = true;
+                    metrics.counters_mut().control_datagrams_received_total += 1;
                     match gateway.handle_datagram(peer, &buf[..len]) {
                         Ok(GatewayAction::Send {
                             destination,
                             datagram,
                         }) => {
                             socket.send_to(&datagram, destination)?;
+                            metrics.counters_mut().control_responses_sent_total += 1;
+                            metrics.counters_mut().control_response_bytes_sent_total +=
+                                datagram.len() as u64;
                             println!(
                                 "{peer} triggered {} byte gateway response to {destination}",
                                 datagram.len()
                             );
                         }
                         Ok(GatewayAction::MembershipQuery { .. }) => {
+                            metrics
+                                .counters_mut()
+                                .gateway_membership_queries_received_total += 1;
                             println!(
                                 "{peer} sent Membership Query; sending configured/local joins"
                             );
@@ -272,17 +332,31 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                                         },
                                     )?,
                                 )?;
+                                metrics.counters_mut().gateway_membership_updates_sent_total += 1;
                             }
                             if let Some(local) = local_membership.as_mut() {
-                                send_pending_local_membership(&socket, &gateway, local)?;
+                                send_pending_local_membership(
+                                    &socket,
+                                    &gateway,
+                                    local,
+                                    &mut metrics,
+                                )?;
                             }
                             last_membership_refresh = Some(Instant::now());
                         }
                         Ok(GatewayAction::MulticastData { packet }) => {
+                            metrics.counters_mut().multicast_data_received_total += 1;
+                            metrics.counters_mut().multicast_data_bytes_received_total +=
+                                packet.len() as u64;
                             println!("{peer} sent {} byte AMT multicast packet", packet.len());
                             if let Some(downstream) = downstream.as_mut() {
                                 match downstream.forward_ip_datagram(&packet) {
                                     Ok(Some(report)) => {
+                                        metrics
+                                            .counters_mut()
+                                            .downstream_packets_forwarded_total += 1;
+                                        metrics.counters_mut().downstream_bytes_forwarded_total +=
+                                            report.bytes_sent as u64;
                                         let udp_port = report
                                             .udp_dst_port
                                             .map(|port| format!(":{port}"))
@@ -297,17 +371,31 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                                             report.bytes_sent
                                         );
                                     }
-                                    Ok(None) => println!(
-                                        "received AMT multicast packet is not a multicast IP datagram"
-                                    ),
-                                    Err(error) => eprintln!(
-                                        "failed to forward downstream multicast packet: {error}"
-                                    ),
+                                    Ok(None) => {
+                                        metrics
+                                            .counters_mut()
+                                            .downstream_non_multicast_packets_total += 1;
+                                        println!(
+                                            "received AMT multicast packet is not a multicast IP datagram"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        metrics.counters_mut().downstream_forward_errors_total += 1;
+                                        eprintln!(
+                                            "failed to forward downstream multicast packet: {error}"
+                                        );
+                                    }
                                 }
                             }
                         }
-                        Ok(GatewayAction::Ignored) => println!("{peer} ignored AMT message"),
-                        Err(error) => eprintln!("{peer} invalid gateway AMT datagram: {error}"),
+                        Ok(GatewayAction::Ignored) => {
+                            metrics.counters_mut().control_datagrams_ignored_total += 1;
+                            println!("{peer} ignored AMT message");
+                        }
+                        Err(error) => {
+                            metrics.counters_mut().control_datagrams_invalid_total += 1;
+                            eprintln!("{peer} invalid gateway AMT datagram: {error}");
+                        }
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
@@ -316,8 +404,17 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
         }
 
         if let Some(local) = local_membership.as_mut() {
-            let events = drain_local_membership(&socket, &gateway, local)?;
+            let events = drain_local_membership(&socket, &gateway, local, &mut metrics)?;
             made_progress |= events != 0;
+        }
+        match metrics.maybe_emit_gateway(GatewayMetricsGauges {
+            relay_connected: gateway.relay_endpoint().is_some(),
+            downstream_enabled,
+            transparent_enabled,
+            configured_joins,
+        }) {
+            Ok(emitted) => made_progress |= emitted,
+            Err(error) => eprintln!("failed to write gateway metrics sample: {error}"),
         }
 
         if !made_progress {
@@ -348,11 +445,17 @@ impl ShutdownSignal {
     }
 }
 
-fn shutdown_gateway(socket: &UdpSocket, gateway: &Gateway) -> io::Result<()> {
+fn shutdown_gateway(
+    socket: &UdpSocket,
+    gateway: &Gateway,
+    metrics: &mut MetricsRecorder,
+) -> io::Result<()> {
     match gateway.teardown() {
         Ok(action) => {
             println!("shutdown requested; sending AMT Teardown");
-            send_gateway_action(socket, action)
+            send_gateway_action(socket, action)?;
+            metrics.counters_mut().gateway_teardowns_sent_total += 1;
+            Ok(())
         }
         Err(error) => {
             println!("shutdown requested before AMT Teardown was available: {error}");
@@ -365,6 +468,7 @@ fn send_pending_local_membership(
     socket: &UdpSocket,
     gateway: &Gateway,
     local: &mut LocalMembershipManager,
+    metrics: &mut MetricsRecorder,
 ) -> io::Result<()> {
     let Some(report) = local.pending_report() else {
         return Ok(());
@@ -374,6 +478,7 @@ fn send_pending_local_membership(
         io::Error::other(format!("failed to build local membership update: {error}"))
     })?;
     send_gateway_action(socket, action)?;
+    metrics.counters_mut().gateway_membership_updates_sent_total += 1;
     local.mark_advertised();
     println!("advertised {record_count} local membership record(s) to relay");
     Ok(())
@@ -383,6 +488,7 @@ fn drain_local_membership(
     socket: &UdpSocket,
     gateway: &Gateway,
     local: &mut LocalMembershipManager,
+    metrics: &mut MetricsRecorder,
 ) -> io::Result<usize> {
     let mut events = 0;
 
@@ -390,6 +496,7 @@ fn drain_local_membership(
         match local.try_recv() {
             Ok(Some(event)) => {
                 events += 1;
+                metrics.counters_mut().local_membership_reports_total += 1;
                 println!(
                     "local membership report from {} ({} records, {} active upstream subscriptions)",
                     event.reporter,
@@ -397,7 +504,7 @@ fn drain_local_membership(
                     event.active_subscriptions.len()
                 );
                 if gateway.response_mac().is_some() {
-                    send_pending_local_membership(socket, gateway, local)?;
+                    send_pending_local_membership(socket, gateway, local, metrics)?;
                 } else {
                     println!("local membership pending until relay Membership Query is received");
                 }
@@ -405,6 +512,7 @@ fn drain_local_membership(
             Ok(None) => break,
             Err(error) if error.is_parse_error() => {
                 events += 1;
+                metrics.counters_mut().local_membership_parse_errors_total += 1;
                 eprintln!("invalid local membership report: {error}");
             }
             Err(error) => {
@@ -423,6 +531,7 @@ fn refresh_gateway_memberships(
     gateway: &Gateway,
     joins: &[GatewayJoin],
     local: Option<&mut LocalMembershipManager>,
+    metrics: &mut MetricsRecorder,
 ) -> io::Result<usize> {
     let mut sent = 0;
 
@@ -435,6 +544,7 @@ fn refresh_gateway_memberships(
                     io::Error::other(format!("failed to build membership refresh: {error}"))
                 })?,
         )?;
+        metrics.counters_mut().gateway_membership_updates_sent_total += 1;
         sent += 1;
     }
 
@@ -445,6 +555,7 @@ fn refresh_gateway_memberships(
             io::Error::other(format!("failed to build local membership refresh: {error}"))
         })?;
         send_gateway_action(socket, action)?;
+        metrics.counters_mut().gateway_membership_updates_sent_total += 1;
         local.mark_advertised();
         sent += 1;
     }
@@ -543,9 +654,11 @@ fn handle_amt_datagram(
     relay: &mut Relay,
     upstream: &mut UpstreamManager,
     gateway_activity: &mut GatewayActivity,
+    metrics: &mut MetricsRecorder,
     peer: std::net::SocketAddr,
     datagram: &[u8],
 ) -> io::Result<()> {
+    metrics.counters_mut().control_datagrams_received_total += 1;
     match relay.handle_datagram(peer, datagram) {
         Ok(action) => {
             let sync_required = matches!(
@@ -556,6 +669,9 @@ fn handle_amt_datagram(
             match action {
                 RelayAction::Send(response) => {
                     socket.send_to(&response, peer)?;
+                    metrics.counters_mut().control_responses_sent_total += 1;
+                    metrics.counters_mut().control_response_bytes_sent_total +=
+                        response.len() as u64;
                     println!("{peer} sent {} byte response", response.len());
                 }
                 RelayAction::AcceptedMembershipUpdate {
@@ -564,6 +680,9 @@ fn handle_amt_datagram(
                     records_applied,
                     upstream_subscriptions,
                 } => {
+                    metrics.counters_mut().membership_updates_accepted_total += 1;
+                    metrics.counters_mut().membership_records_applied_total +=
+                        records_applied as u64;
                     if relay.state().contains_endpoint(peer) {
                         gateway_activity.mark_seen(peer);
                     } else {
@@ -576,6 +695,7 @@ fn handle_amt_datagram(
                     );
                 }
                 RelayAction::AcceptedTeardown { gateway, removed } => {
+                    metrics.counters_mut().teardowns_accepted_total += 1;
                     let gateway_ip = gateway
                         .address
                         .as_ipv4_compatible()
@@ -588,28 +708,41 @@ fn handle_amt_datagram(
                         gateway.port
                     );
                 }
-                RelayAction::RejectedAuth => println!("{peer} rejected AMT authentication"),
-                RelayAction::Ignored => println!("{peer} ignored AMT message"),
+                RelayAction::RejectedAuth => {
+                    metrics.counters_mut().auth_rejections_total += 1;
+                    println!("{peer} rejected AMT authentication");
+                }
+                RelayAction::Ignored => {
+                    metrics.counters_mut().control_datagrams_ignored_total += 1;
+                    println!("{peer} ignored AMT message");
+                }
             }
 
             if sync_required {
-                sync_upstream(relay, upstream)?;
+                sync_upstream(relay, upstream, metrics)?;
             }
 
             Ok(())
         }
         Err(error) => {
+            metrics.counters_mut().control_datagrams_invalid_total += 1;
             eprintln!("{peer} invalid AMT datagram: {error}");
             Ok(())
         }
     }
 }
 
-fn sync_upstream(relay: &Relay, upstream: &mut UpstreamManager) -> io::Result<()> {
+fn sync_upstream(
+    relay: &Relay,
+    upstream: &mut UpstreamManager,
+    metrics: &mut MetricsRecorder,
+) -> io::Result<()> {
     let subscriptions = relay.state().upstream_subscriptions();
     let changes = upstream
         .reconcile(subscriptions)
         .map_err(|error| io::Error::other(format!("failed to update upstream receive: {error}")))?;
+    metrics.counters_mut().upstream_subscription_adds_total += changes.added as u64;
+    metrics.counters_mut().upstream_subscription_removes_total += changes.removed as u64;
 
     if changes.changed() {
         println!(
@@ -628,6 +761,7 @@ fn drain_upstream(
     socket: &UdpSocket,
     relay: &Relay,
     upstream: &mut UpstreamManager,
+    metrics: &mut MetricsRecorder,
 ) -> io::Result<usize> {
     let mut forwarded_packets = 0;
 
@@ -638,11 +772,14 @@ fn drain_upstream(
         else {
             break;
         };
+        metrics.counters_mut().upstream_packets_received_total += 1;
+        metrics.counters_mut().upstream_bytes_received_total += datagram.datagram().len() as u64;
 
         let endpoints = relay
             .state()
             .endpoints_for_packet(datagram.source, datagram.group);
         if endpoints.is_empty() {
+            metrics.counters_mut().upstream_unmatched_packets_total += 1;
             println!(
                 "received upstream {} multicast datagram from {} to {}, but no gateway interest matched",
                 protocol_name(&datagram),
@@ -657,15 +794,23 @@ fn drain_upstream(
             packet: &forwarded_datagram,
         });
 
+        let mut successful_sends = 0u64;
         for endpoint in &endpoints {
             if let Err(error) = socket.send_to(&response, endpoint) {
+                metrics.counters_mut().send_errors_total += 1;
+                metrics.counters_mut().upstream_forward_errors_total += 1;
                 eprintln!(
                     "failed to forward {} byte multicast datagram to {endpoint}: {error}",
                     forwarded_datagram.len()
                 );
+            } else {
+                successful_sends += 1;
             }
         }
 
+        metrics.counters_mut().upstream_packets_forwarded_total += successful_sends;
+        metrics.counters_mut().upstream_bytes_forwarded_total +=
+            successful_sends * forwarded_datagram.len() as u64;
         forwarded_packets += 1;
         println!(
             "forwarded {} byte multicast datagram from {} to {} gateway(s)",
@@ -691,6 +836,84 @@ fn protocol_name(datagram: &UpstreamDatagram) -> &'static str {
         Some(2) => "IGMP",
         Some(58) => "ICMPv6",
         Some(_) | None => "IP",
+    }
+}
+
+fn relay_metrics_flags(
+    config: &MetricsConfig,
+    bind_addr: SocketAddr,
+    relay: &Relay,
+    upstream: &UpstreamManager,
+) -> MetricsFlags {
+    #[cfg(not(feature = "metrics"))]
+    {
+        let _ = (config, bind_addr, relay, upstream);
+        base_flags("relay", "")
+    }
+    #[cfg(feature = "metrics")]
+    {
+        let mut flags = base_flags("relay", &config.node_id);
+        flags.insert("bind_addr".to_string(), bind_addr.to_string().into());
+        flags.insert(
+            "advertise_ipv4".to_string(),
+            relay.config().advertise_ipv4.to_string().into(),
+        );
+        flags.insert(
+            "advertise_ipv6".to_string(),
+            relay.config().advertise_ipv6.to_string().into(),
+        );
+        if let Some(interface) = upstream.config().interface {
+            flags.insert(
+                "upstream_interface".to_string(),
+                interface.to_string().into(),
+            );
+        }
+        if let Some(index) = upstream.config().interface_index {
+            flags.insert("upstream_ifindex".to_string(), index.into());
+        }
+        flags
+    }
+}
+
+fn gateway_metrics_flags(
+    config: &MetricsConfig,
+    bind_addr: SocketAddr,
+    gateway: &Gateway,
+    downstream_enabled: bool,
+    transparent_enabled: bool,
+    configured_joins: u64,
+) -> MetricsFlags {
+    #[cfg(not(feature = "metrics"))]
+    {
+        let _ = (
+            config,
+            bind_addr,
+            gateway,
+            downstream_enabled,
+            transparent_enabled,
+            configured_joins,
+        );
+        base_flags("gateway", "")
+    }
+    #[cfg(feature = "metrics")]
+    {
+        let mut flags = base_flags("gateway", &config.node_id);
+        flags.insert("bind_addr".to_string(), bind_addr.to_string().into());
+        flags.insert(
+            "relay_addr".to_string(),
+            gateway.config().relay.to_string().into(),
+        );
+        flags.insert(
+            "protocol".to_string(),
+            format!("{:?}", gateway.config().protocol).into(),
+        );
+        flags.insert("downstream_enabled".to_string(), downstream_enabled.into());
+        flags.insert(
+            "transparent_enabled".to_string(),
+            transparent_enabled.into(),
+        );
+        flags.insert("configured_joins".to_string(), configured_joins.into());
+        flags
     }
 }
 

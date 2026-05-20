@@ -4,11 +4,13 @@
 //! loops, such as the simple blocking relay and gateway runners, live at the
 //! crate edge.
 
+pub mod config;
 pub mod daemon;
 pub mod downstream;
 pub mod gateway;
 pub mod local_membership;
 pub mod membership;
+pub mod metrics;
 pub mod protocol;
 pub mod query;
 pub mod relay;
