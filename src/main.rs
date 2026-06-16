@@ -1,5 +1,5 @@
 use amt::AMT_PORT;
-use amt::config::{FileConfig, MetricsFileConfig, load_file_config};
+use amt::config::{DriadFileConfig, FileConfig, MetricsFileConfig, load_file_config};
 use amt::daemon::{
     self, DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
     DEFAULT_MEMBERSHIP_REFRESH_INTERVAL, GatewayDaemonConfig, GatewayJoin, RelayDaemonConfig,
@@ -12,6 +12,30 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayRelayDiscovery {
+    Static,
+    Driad,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayDriadOptions {
+    resolvers: Vec<SocketAddr>,
+    timeout: Duration,
+    attempts: usize,
+}
+
+impl Default for GatewayDriadOptions {
+    fn default() -> Self {
+        Self {
+            resolvers: Vec::new(),
+            timeout: Duration::from_secs(2),
+            attempts: 2,
+        }
+    }
+}
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -204,13 +228,20 @@ fn parse_gateway_config(
         .and_then(|config| config.bind)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let mut relay = gateway_file.and_then(|config| config.relay);
+    let mut relay_discovery = gateway_file
+        .and_then(|config| config.relay_discovery.as_deref())
+        .map(parse_relay_discovery)
+        .transpose()?
+        .unwrap_or(GatewayRelayDiscovery::Static);
+    let mut driad_options =
+        driad_options_from_file(gateway_file.and_then(|config| config.driad.as_ref()))?;
     let mut protocol = gateway_file
         .and_then(|config| config.protocol.as_deref())
         .map(parse_protocol)
         .transpose()?;
     let mut group: Option<IpAddr> = gateway_file.and_then(|config| config.group);
     let mut source: Option<IpAddr> = gateway_file.and_then(|config| config.source);
-    let mut configured_joins = gateway_file
+    let configured_joins = gateway_file
         .map(|config| {
             config
                 .joins
@@ -288,6 +319,42 @@ fn parse_gateway_config(
                         .parse()
                         .map_err(|_| format!("invalid --relay address '{value}'"))?,
                 );
+            }
+            "--relay-discovery" => {
+                let value = args.next().ok_or_else(|| {
+                    "--relay-discovery requires static, driad, or auto".to_string()
+                })?;
+                relay_discovery = parse_relay_discovery(&value)?;
+            }
+            "--driad-resolver" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--driad-resolver requires an IP address".to_string())?;
+                driad_options.resolvers.push(parse_driad_resolver(&value)?);
+            }
+            "--driad-timeout-ms" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--driad-timeout-ms requires milliseconds".to_string())?;
+                let millis = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --driad-timeout-ms '{value}'"))?;
+                if millis == 0 {
+                    return Err("--driad-timeout-ms must not be 0".to_string());
+                }
+                driad_options.timeout = Duration::from_millis(millis);
+            }
+            "--driad-attempts" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--driad-attempts requires a positive count".to_string())?;
+                let attempts = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --driad-attempts '{value}'"))?;
+                if attempts == 0 {
+                    return Err("--driad-attempts must not be 0".to_string());
+                }
+                driad_options.attempts = attempts;
             }
             "--protocol" => {
                 let value = args
@@ -426,7 +493,6 @@ fn parse_gateway_config(
         }
     }
 
-    let relay = relay.ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string())?;
     if group.is_none() && configured_joins.is_empty() && !transparent {
         return Err("gateway requires --group IP unless --transparent is set".to_string());
     }
@@ -475,11 +541,14 @@ fn parse_gateway_config(
         }
     }
 
-    let mut config = GatewayDaemonConfig::new(bind, GatewayConfig::new(relay, protocol));
-    config.joins.append(&mut configured_joins);
+    let mut joins = configured_joins;
     if let Some(group) = group {
-        config.joins.push(GatewayJoin { group, source });
+        joins.push(GatewayJoin { group, source });
     }
+
+    let relay = resolve_gateway_relay(relay, relay_discovery, &joins, &driad_options, transparent)?;
+    let mut config = GatewayDaemonConfig::new(bind, GatewayConfig::new(relay, protocol));
+    config.joins = joins;
     config.downstream = downstream;
     config.membership_refresh_interval = membership_refresh_interval;
     config.metrics = metrics;
@@ -566,6 +635,156 @@ fn apply_metrics_file_config(
     Ok(())
 }
 
+fn parse_relay_discovery(value: &str) -> Result<GatewayRelayDiscovery, String> {
+    match value {
+        "static" => Ok(GatewayRelayDiscovery::Static),
+        "driad" => Ok(GatewayRelayDiscovery::Driad),
+        "auto" => Ok(GatewayRelayDiscovery::Auto),
+        _ => Err(format!(
+            "invalid relay discovery mode '{value}'; expected static, driad, or auto"
+        )),
+    }
+}
+
+fn driad_options_from_file(
+    config: Option<&DriadFileConfig>,
+) -> Result<GatewayDriadOptions, String> {
+    let mut options = GatewayDriadOptions::default();
+    let Some(config) = config else {
+        return Ok(options);
+    };
+
+    for resolver in config
+        .resolvers
+        .clone()
+        .map(|resolvers| resolvers.into_vec())
+        .unwrap_or_default()
+    {
+        options.resolvers.push(parse_driad_resolver(&resolver)?);
+    }
+    if let Some(timeout_ms) = config.timeout_ms {
+        if timeout_ms == 0 {
+            return Err("gateway.driad.timeout_ms must not be 0".to_string());
+        }
+        options.timeout = Duration::from_millis(timeout_ms);
+    }
+    if let Some(attempts) = config.attempts {
+        if attempts == 0 {
+            return Err("gateway.driad.attempts must not be 0".to_string());
+        }
+        options.attempts = attempts;
+    }
+
+    Ok(options)
+}
+
+fn parse_driad_resolver(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    value
+        .parse::<IpAddr>()
+        .map(|addr| SocketAddr::new(addr, 53))
+        .map_err(|_| format!("invalid DRIAD resolver '{value}'; expected IP or IP:PORT"))
+}
+
+fn resolve_gateway_relay(
+    relay: Option<SocketAddr>,
+    discovery: GatewayRelayDiscovery,
+    joins: &[GatewayJoin],
+    driad_options: &GatewayDriadOptions,
+    transparent: bool,
+) -> Result<SocketAddr, String> {
+    match discovery {
+        GatewayRelayDiscovery::Static => {
+            relay.ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string())
+        }
+        GatewayRelayDiscovery::Auto => match relay {
+            Some(relay) => Ok(relay),
+            None => resolve_driad_relay(joins, driad_options, transparent),
+        },
+        GatewayRelayDiscovery::Driad => resolve_driad_relay(joins, driad_options, transparent),
+    }
+}
+
+fn resolve_driad_relay(
+    joins: &[GatewayJoin],
+    driad_options: &GatewayDriadOptions,
+    transparent: bool,
+) -> Result<SocketAddr, String> {
+    if transparent {
+        return Err(
+            "DRIAD transparent membership learning is not implemented yet; use configured SSM --group/--source joins for now"
+                .to_string(),
+        );
+    }
+    let source = driad_source_for_joins(joins)?;
+
+    #[cfg(feature = "driad")]
+    {
+        let mut resolver_config = if driad_options.resolvers.is_empty() {
+            amt::driad::DriadResolverConfig::system().map_err(|error| {
+                format!("failed to load system DNS resolvers for DRIAD: {error}")
+            })?
+        } else {
+            amt::driad::DriadResolverConfig::new(driad_options.resolvers.clone())
+        };
+        resolver_config.timeout = driad_options.timeout;
+        resolver_config.attempts = driad_options.attempts;
+        let resolver = amt::driad::DriadResolver::new(resolver_config);
+        let selection = resolver.resolve_source(source).map_err(|error| {
+            format!("DRIAD relay discovery failed for source {source}: {error}")
+        })?;
+        println!(
+            "DRIAD selected AMT relay {} for source {} using {} (precedence {}, discovery_optional={})",
+            selection.relay,
+            selection.source,
+            selection.query_name,
+            selection.record.precedence,
+            selection.record.discovery_optional
+        );
+        Ok(selection.relay)
+    }
+
+    #[cfg(not(feature = "driad"))]
+    {
+        let _ = source;
+        let _ = driad_options;
+        Err("DRIAD relay discovery requires building with --features driad".to_string())
+    }
+}
+
+fn driad_source_for_joins(joins: &[GatewayJoin]) -> Result<IpAddr, String> {
+    let mut selected = None;
+
+    if joins.is_empty() {
+        return Err(
+            "DRIAD relay discovery requires a configured SSM --group and --source".to_string(),
+        );
+    }
+
+    for join in joins {
+        let Some(source) = join.source else {
+            return Err(
+                "DRIAD relay discovery requires all configured joins to be SSM joins with a source"
+                    .to_string(),
+            );
+        };
+        if let Some(existing) = selected {
+            if existing != source {
+                return Err(
+                    "this DRIAD implementation currently supports one source address per gateway session"
+                        .to_string(),
+                );
+            }
+        } else {
+            selected = Some(source);
+        }
+    }
+
+    selected.ok_or_else(|| "DRIAD relay discovery requires an SSM source".to_string())
+}
+
 fn parse_protocol(value: &str) -> Result<MembershipProtocol, String> {
     match value {
         "igmp" | "igmpv3" | "ipv4" => Ok(MembershipProtocol::Igmpv3),
@@ -613,8 +832,9 @@ fn usage() -> &'static str {
         "[--upstream-interface IP] [--upstream-ifindex INDEX] ",
         "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] ",
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n",
-        "  amt gateway [--config FILE] --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] ",
+        "  amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] ",
         "[--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] ",
+        "[--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] ",
         "[--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] ",
         "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
         "[--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] ",
@@ -623,6 +843,7 @@ fn usage() -> &'static str {
         "Relay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\n",
         "Relay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\n",
         "Gateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\n",
+        "Gateway static relay discovery requires --relay; DRIAD discovery requires a configured SSM --source and the driad Cargo feature.\n",
         "Gateway refreshes memberships every 60 seconds by default; pass --membership-refresh-interval 0 to disable refreshes.\n",
         "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
         "Use --metrics-dir to write Heimdall JSONL metrics under DIR/node-id/.\n",
@@ -714,6 +935,66 @@ mod tests {
                 .and_then(|downstream| downstream.ttl),
             Some(16)
         );
+    }
+
+    #[test]
+    fn gateway_auto_discovery_keeps_static_relay_when_configured() {
+        let config = parse_gateway_config([
+            "--relay".to_string(),
+            "203.0.113.10:2268".to_string(),
+            "--relay-discovery".to_string(),
+            "auto".to_string(),
+            "--group".to_string(),
+            "232.1.2.3".to_string(),
+            "--source".to_string(),
+            "192.0.2.10".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.gateway.relay, "203.0.113.10:2268".parse().unwrap());
+        assert_eq!(config.joins.len(), 1);
+    }
+
+    #[test]
+    fn driad_source_selection_rejects_asm_or_multiple_sources() {
+        assert!(driad_source_for_joins(&[]).is_err());
+        assert!(
+            driad_source_for_joins(&[GatewayJoin {
+                group: "239.1.2.3".parse().unwrap(),
+                source: None,
+            }])
+            .is_err()
+        );
+        assert!(
+            driad_source_for_joins(&[
+                GatewayJoin {
+                    group: "232.1.2.3".parse().unwrap(),
+                    source: Some("192.0.2.10".parse().unwrap()),
+                },
+                GatewayJoin {
+                    group: "232.1.2.4".parse().unwrap(),
+                    source: Some("192.0.2.11".parse().unwrap()),
+                },
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(not(feature = "driad"))]
+    #[test]
+    fn driad_discovery_requires_feature() {
+        let error = parse_gateway_config([
+            "--relay-discovery".to_string(),
+            "driad".to_string(),
+            "--group".to_string(),
+            "232.1.2.3".to_string(),
+            "--source".to_string(),
+            "192.0.2.10".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("--features driad"));
     }
 
     fn write_temp_config(name: &str, contents: &str) -> PathBuf {

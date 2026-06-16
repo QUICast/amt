@@ -53,6 +53,8 @@ The gateway code is organized as follows:
 
 - `gateway::Gateway` handles Relay Advertisement, Membership Query, Multicast
   Data, and Teardown state.
+- `driad` optionally resolves an SSM source address to AMTRELAY DNS records and
+  selects the relay used to build the gateway session.
 - `membership` builds IGMPv3 or MLDv2 membership reports for configured joins.
 - `local_membership::LocalMembershipManager` listens for local IGMPv3/MLDv2
   receiver reports in transparent mode and converts aggregate LAN interest into
@@ -66,6 +68,13 @@ The gateway supports both ASM and SSM membership requests toward the relay:
 
 - ASM is encoded as a `ModeIsExclude` record with no blocked sources.
 - SSM is encoded as a `ModeIsInclude` record with the selected source.
+
+With the `driad` Cargo feature, the daemon edge can resolve a configured SSM
+source through RFC 8777 DNS Reverse IP AMT Discovery before constructing the
+gateway session. This first integration keeps the core gateway state machine
+single-relay: DRIAD chooses that relay up front for one source address, then
+normal RFC 7450 discovery/request/membership handling continues. Future
+multi-source transparent DRIAD will need separate per-source relay sessions.
 
 The blocking gateway daemon periodically refreshes its current Membership
 Update state after the initial Membership Query. This keeps healthy gateways
@@ -116,6 +125,7 @@ Future runtime integrations can reuse:
 
 - `Relay::handle_datagram`
 - `Gateway::handle_datagram`
+- `DriadResolver` when built with `--features driad`
 - `LocalMembershipManager`
 - `UpstreamManager`
 - `DownstreamPublisher`

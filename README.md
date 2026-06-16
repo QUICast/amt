@@ -14,6 +14,7 @@ The crate currently includes:
 - IGMPv3 and MLDv2 query/report packet helpers.
 - Simple blocking relay and gateway runners.
 - TOML configuration for the relay and gateway daemons.
+- Optional DRIAD DNS relay discovery for configured SSM sources.
 - Heimdall-style single-header JSONL metrics output.
 - Raw relay upstream receive through `mcrx-core` with its `raw-packets`
   feature.
@@ -23,6 +24,7 @@ The crate currently includes:
   and turns them into AMT Membership Updates.
 
 [rfc7450]: https://datatracker.ietf.org/doc/html/rfc7450
+[rfc8777]: https://datatracker.ietf.org/doc/html/rfc8777
 
 ## Status
 
@@ -39,6 +41,7 @@ Implemented:
 - AMT Teardown.
 - Relay upstream subscription reconciliation for ASM/SSM interests.
 - Gateway joins for a configured group and optional source.
+- Gateway DRIAD relay discovery for a configured SSM source.
 - Gateway local membership learning for transparent IGMPv3/MLDv2 operation.
 - Relay idle gateway pruning and gateway membership refreshes.
 - Gateway signal handling that sends AMT Teardown on graceful shutdown.
@@ -61,6 +64,9 @@ Current limitations:
   primary path.
 - Transparent mode does not yet age out silent local receivers with full
   IGMP/MLD listener timers; leave/state-change reports update the learned state.
+- DRIAD is currently limited to explicitly configured SSM joins with one source
+  address per gateway session. Transparent-mode DRIAD and multi-source
+  multi-relay sessions are planned follow-ups.
 - AMT metrics use Heimdall's JSONL container format with `amt-relay` and
   `amt-gateway` artifact types. The current local Heimdall tree needs matching
   ingestors before those new artifact types are queryable there.
@@ -69,7 +75,9 @@ Current limitations:
 
 ```bash
 cargo build
+cargo build --features driad
 cargo build --features metrics
+cargo build --features driad,metrics
 cargo test
 cargo run -- --help
 cargo install quicast-amt
@@ -84,7 +92,7 @@ The crate depends on crates.io releases:
 
 ```text
 amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
-amt gateway [--config FILE] --relay ADDRESS:PORT [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
 ```
 
 ### Relay
@@ -136,6 +144,25 @@ cargo run --release -- gateway \
 The gateway uses raw downstream transmit, so local SSM receivers can join the
 original `(S,G)` carried inside AMT Multicast Data. Raw transmit may require
 elevated privileges.
+
+Run a gateway that discovers the AMT relay for an SSM source through DRIAD
+([RFC 8777][rfc8777]):
+
+```bash
+cargo run --release --features driad -- gateway \
+  --relay-discovery driad \
+  --group 232.1.2.3 \
+  --source 192.0.2.10 \
+  --downstream-interface 192.168.1.20
+```
+
+`--relay-discovery static` is the default and requires `--relay`.
+`--relay-discovery auto` uses `--relay` when present, otherwise it tries DRIAD.
+Use `--driad-resolver IP[:PORT]` to override `/etc/resolv.conf`.
+
+The first DRIAD implementation intentionally supports one configured SSM source
+per gateway session. It does not yet choose separate relays for different
+sources learned in transparent mode.
 
 The gateway daemon refreshes its current Membership Update state every 60
 seconds by default, which keeps relay-side idle pruning from removing healthy
@@ -211,6 +238,24 @@ Configured joins can also be expressed in TOML:
 ```toml
 [[gateway.joins]]
 group = "239.1.2.3"
+
+[[gateway.joins]]
+group = "232.1.2.3"
+source = "192.0.2.10"
+```
+
+DRIAD gateway config:
+
+```toml
+[gateway]
+relay_discovery = "driad"
+protocol = "igmpv3"
+membership_refresh_interval_secs = 60
+
+[gateway.driad]
+resolver = "192.0.2.53:53"
+timeout_ms = 1000
+attempts = 2
 
 [[gateway.joins]]
 group = "232.1.2.3"

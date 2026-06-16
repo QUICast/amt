@@ -206,7 +206,7 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
             configured_joins,
         ),
     )?;
-    let mut last_discovery = Instant::now()
+    let mut last_relay_probe = Instant::now()
         .checked_sub(GATEWAY_REDISCOVER_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut last_local_query: Option<Instant> = None;
@@ -238,11 +238,22 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
         }
 
         if gateway.relay_endpoint().is_none()
-            && last_discovery.elapsed() >= GATEWAY_REDISCOVER_INTERVAL
+            && last_relay_probe.elapsed() >= GATEWAY_REDISCOVER_INTERVAL
         {
             send_gateway_action(&socket, gateway.discovery())?;
             metrics.counters_mut().gateway_discoveries_sent_total += 1;
-            last_discovery = Instant::now();
+            last_relay_probe = Instant::now();
+            made_progress = true;
+        } else if gateway.response_mac().is_none()
+            && last_relay_probe.elapsed() >= GATEWAY_REDISCOVER_INTERVAL
+        {
+            send_gateway_action(
+                &socket,
+                gateway.request().map_err(|error| {
+                    io::Error::other(format!("failed to build gateway request: {error}"))
+                })?,
+            )?;
+            last_relay_probe = Instant::now();
             made_progress = true;
         }
 
@@ -279,6 +290,14 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                 None => false,
             };
             if refresh_due {
+                send_gateway_action(
+                    &socket,
+                    gateway.request().map_err(|error| {
+                        io::Error::other(format!("failed to build gateway request: {error}"))
+                    })?,
+                )?;
+                println!("requested fresh Membership Query from relay");
+
                 let refreshed = refresh_gateway_memberships(
                     &socket,
                     &gateway,

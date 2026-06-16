@@ -74,6 +74,19 @@ impl Gateway {
         }
     }
 
+    pub fn request(&self) -> Result<GatewayAction, GatewayError> {
+        let relay = self
+            .relay_endpoint
+            .ok_or(GatewayError::MissingRelayEndpoint)?;
+        Ok(GatewayAction::Send {
+            destination: relay,
+            datagram: encode(&Message::Request {
+                request_nonce: self.config.request_nonce,
+                protocol: self.config.protocol,
+            }),
+        })
+    }
+
     pub fn handle_datagram(
         &mut self,
         peer: SocketAddr,
@@ -350,6 +363,34 @@ mod tests {
             panic!("expected request send action");
         };
         assert_eq!(destination, SocketAddr::from(([192, 0, 2, 20], 2268)));
+        assert_eq!(
+            decode(&datagram),
+            Ok(Message::Request {
+                request_nonce: 0x0506_0708,
+                protocol: MembershipProtocol::Igmpv3
+            })
+        );
+    }
+
+    #[test]
+    fn request_builds_amt_request_for_discovered_relay() {
+        let relay = SocketAddr::from(([192, 0, 2, 20], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_nonces(0x0102_0304, 0x0506_0708),
+        );
+        gateway.relay_endpoint = Some(relay);
+
+        let action = gateway.request().unwrap();
+
+        let GatewayAction::Send {
+            destination,
+            datagram,
+        } = action
+        else {
+            panic!("expected send action");
+        };
+        assert_eq!(destination, relay);
         assert_eq!(
             decode(&datagram),
             Ok(Message::Request {

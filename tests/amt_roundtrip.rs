@@ -1,7 +1,7 @@
 use amt::protocol::encode;
 use amt::{
     Gateway, GatewayAction, GatewayConfig, MembershipProtocol, Message, Relay, RelayAction,
-    RelayConfig, UpstreamSubscription,
+    RelayConfig, RelaySecret, UpstreamSubscription,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -86,6 +86,86 @@ fn gateway_and_relay_complete_amt_round_trip_over_udp() {
             .endpoints_for_packet(IpAddr::V4(source), IpAddr::V4(group))
             .is_empty()
     );
+}
+
+#[test]
+fn gateway_can_refresh_membership_query_after_relay_restart() {
+    let relay_socket = bound_local_udp();
+    let gateway_socket = bound_local_udp();
+    let relay_addr = relay_socket.local_addr().unwrap();
+    let gateway_addr = gateway_socket.local_addr().unwrap();
+
+    let group = Ipv4Addr::new(232, 1, 2, 3);
+    let source = Ipv4Addr::new(192, 0, 2, 1);
+    let mut relay = relay_with_secret(relay_addr, 1);
+    let mut gateway = Gateway::new(
+        GatewayConfig::new(relay_addr, MembershipProtocol::Igmpv3)
+            .with_nonces(0x0102_0304, 0x0506_0708),
+    );
+
+    send_gateway_action(&gateway_socket, gateway.discovery());
+    relay_recv_and_respond(&relay_socket, &mut relay);
+    let action = gateway_recv(&gateway_socket, &mut gateway);
+    send_gateway_action(&gateway_socket, action);
+    relay_recv_and_respond(&relay_socket, &mut relay);
+    assert!(matches!(
+        gateway_recv(&gateway_socket, &mut gateway),
+        GatewayAction::MembershipQuery { .. }
+    ));
+    send_gateway_action(
+        &gateway_socket,
+        gateway
+            .join_group(IpAddr::V4(group), Some(IpAddr::V4(source)))
+            .unwrap(),
+    );
+    assert!(matches!(
+        relay_recv_action(&relay_socket, &mut relay),
+        RelayAction::AcceptedMembershipUpdate { .. }
+    ));
+
+    let mut restarted_relay = relay_with_secret(relay_addr, 2);
+    send_gateway_action(
+        &gateway_socket,
+        gateway
+            .join_group(IpAddr::V4(group), Some(IpAddr::V4(source)))
+            .unwrap(),
+    );
+    assert_eq!(
+        relay_recv_action(&relay_socket, &mut restarted_relay),
+        RelayAction::RejectedAuth
+    );
+    assert!(restarted_relay.state().upstream_subscriptions().is_empty());
+
+    send_gateway_action(&gateway_socket, gateway.request().unwrap());
+    relay_recv_and_respond(&relay_socket, &mut restarted_relay);
+    assert!(matches!(
+        gateway_recv(&gateway_socket, &mut gateway),
+        GatewayAction::MembershipQuery { .. }
+    ));
+    send_gateway_action(
+        &gateway_socket,
+        gateway
+            .join_group(IpAddr::V4(group), Some(IpAddr::V4(source)))
+            .unwrap(),
+    );
+
+    assert!(matches!(
+        relay_recv_action(&relay_socket, &mut restarted_relay),
+        RelayAction::AcceptedMembershipUpdate { .. }
+    ));
+    assert_eq!(
+        restarted_relay
+            .state()
+            .endpoints_for_packet(IpAddr::V4(source), IpAddr::V4(group)),
+        vec![gateway_addr]
+    );
+}
+
+fn relay_with_secret(addr: SocketAddr, secret_byte: u8) -> Relay {
+    Relay::new(RelayConfig {
+        secret: RelaySecret::new([secret_byte; 32]),
+        ..RelayConfig::for_bind(addr)
+    })
 }
 
 fn bound_local_udp() -> UdpSocket {

@@ -363,10 +363,19 @@ impl MetricsRecorder {
             .as_ref()
             .expect("previous snapshot exists before metrics emission");
         let sample = metrics_sample_json(previous, &snapshot);
-        append_jsonl_sample_row(&writer.path, &writer.header, &sample)?;
+        let result = append_jsonl_sample_row(&writer.path, &writer.header, &sample);
         writer.previous = Some(snapshot);
         writer.next_emit_at = now + writer.sample_interval;
-        Ok(true)
+
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    self.writer = None;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -702,6 +711,8 @@ fn rate_per_sec(count: u64, interval_secs: f64) -> f64 {
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::Instant;
 
     #[test]
     fn sample_json_reports_totals_deltas_rates_and_gauges() {
@@ -738,5 +749,63 @@ mod tests {
         assert_eq!(sample["upstream_packets_received_delta"], 4);
         assert_eq!(sample["upstream_packets_received_per_sec"], 2.0);
         assert_eq!(sample["upstream_bytes_received_per_sec"], 200.0);
+    }
+
+    #[test]
+    fn failed_sample_write_advances_next_emit_time() {
+        let now = Instant::now();
+        let bad_parent = std::env::temp_dir().join(format!(
+            "amt_metrics_bad_parent_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&bad_parent, b"not a directory").unwrap();
+        let previous = MetricsSnapshot {
+            captured_at: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            counters: AmtMetricsCounters::default(),
+            gauges: MetricsGauges::Relay(RelayMetricsGauges {
+                active_gateways: 1,
+                active_upstream_subscriptions: 1,
+            }),
+        };
+        let mut recorder = MetricsRecorder {
+            counters: AmtMetricsCounters {
+                upstream_packets_received_total: 1,
+                ..AmtMetricsCounters::default()
+            },
+            writer: Some(MetricsWriter {
+                path: bad_parent.join("amt-relay.jsonl"),
+                header: Value::Object(Map::new()),
+                sample_interval: Duration::from_secs(60),
+                next_emit_at: now - Duration::from_secs(1),
+                previous: Some(previous),
+            }),
+        };
+
+        assert!(
+            recorder
+                .maybe_emit_relay(RelayMetricsGauges {
+                    active_gateways: 1,
+                    active_upstream_subscriptions: 1,
+                })
+                .is_err()
+        );
+        assert!(
+            recorder
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.next_emit_at > now)
+        );
+        assert_eq!(
+            recorder
+                .maybe_emit_relay(RelayMetricsGauges {
+                    active_gateways: 1,
+                    active_upstream_subscriptions: 1,
+                })
+                .unwrap(),
+            false
+        );
     }
 }

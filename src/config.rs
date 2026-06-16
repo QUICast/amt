@@ -28,6 +28,7 @@ pub struct RelayFileConfig {
 pub struct GatewayFileConfig {
     pub bind: Option<SocketAddr>,
     pub relay: Option<SocketAddr>,
+    pub relay_discovery: Option<String>,
     pub protocol: Option<String>,
     pub group: Option<IpAddr>,
     pub source: Option<IpAddr>,
@@ -37,8 +38,18 @@ pub struct GatewayFileConfig {
     pub local_membership: Option<LocalMembershipFileConfig>,
     pub local_query_interval_secs: Option<u64>,
     pub membership_refresh_interval_secs: Option<u64>,
+    pub driad: Option<DriadFileConfig>,
     #[serde(default, alias = "join")]
     pub joins: Vec<GatewayJoinFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DriadFileConfig {
+    #[serde(default, alias = "nameserver", alias = "resolver")]
+    pub resolvers: Option<OneOrMany<String>>,
+    pub timeout_ms: Option<u64>,
+    pub attempts: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -137,9 +148,15 @@ mod tests {
             r#"
             [gateway]
             relay = "203.0.113.10:2268"
+            relay_discovery = "static"
             protocol = "igmpv3"
             transparent = true
             membership_refresh_interval_secs = 30
+
+            [gateway.driad]
+            resolver = ["192.0.2.53:53"]
+            timeout_ms = 500
+            attempts = 2
 
             [gateway.downstream]
             interface = "192.168.1.20"
@@ -158,6 +175,8 @@ mod tests {
 
         let gateway = config.gateway.unwrap();
         assert_eq!(gateway.relay.unwrap(), "203.0.113.10:2268".parse().unwrap());
+        assert_eq!(gateway.relay_discovery.as_deref(), Some("static"));
+        assert_eq!(gateway.driad.unwrap().attempts, Some(2));
         assert_eq!(gateway.joins.len(), 1);
         assert_eq!(gateway.downstream.unwrap().ttl, Some(16));
         assert_eq!(gateway.local_membership.unwrap().interface_index, Some(4));

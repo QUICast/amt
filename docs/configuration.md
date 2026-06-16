@@ -81,6 +81,30 @@ Run it with:
 amt gateway --config gateway.toml
 ```
 
+DRIAD SSM discovery:
+
+```toml
+[gateway]
+relay_discovery = "driad"
+protocol = "igmpv3"
+membership_refresh_interval_secs = 60
+
+[gateway.driad]
+resolver = "192.0.2.53:53"
+timeout_ms = 1000
+attempts = 2
+
+[[gateway.joins]]
+group = "232.1.2.3"
+source = "192.0.2.10"
+```
+
+Build the binary with `--features driad` to enable DRIAD. In `static` mode,
+`relay` is required. In `auto` mode, a configured `relay` wins; without one,
+the gateway performs DRIAD for the configured SSM source. The current DRIAD
+path intentionally supports one source address per gateway session and does not
+yet perform transparent-mode per-source relay selection.
+
 CLI overrides are applied after the file:
 
 ```bash
