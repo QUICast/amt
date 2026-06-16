@@ -1,6 +1,6 @@
 [package]
 name = "quicast-amt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "Lightweight Automatic Multicast Tunneling (AMT) implementation."
