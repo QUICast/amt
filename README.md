@@ -62,6 +62,9 @@ Current limitations:
   MLDv2 reports to `ff02::16`. It is not yet a full multicast router/TUN mode,
   and legacy IGMPv1/v2 reports sent directly to a multicast group are not the
   primary path.
+- Transparent mode filters LAN-local multicast groups from AMT Membership
+  Updates, including IPv4 `224.0.0.0/24`, SSDP/SLP discovery groups, and IPv6
+  link-local multicast (`ff02::/16`).
 - Transparent mode does not yet age out silent local receivers with full
   IGMP/MLD listener timers; leave/state-change reports update the learned state.
 - DRIAD is currently limited to explicitly configured SSM joins with one source

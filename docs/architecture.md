@@ -92,6 +92,11 @@ local receiver has ASM interest for a group, the gateway advertises ASM
 upstream for that group. Otherwise it advertises the exact set of SSM sources
 reported by local receivers.
 
+Transparent mode filters LAN-local control and discovery groups before building
+AMT Membership Updates. IPv4 `224.0.0.0/24`, common local discovery groups such
+as SSDP, and IPv6 link-local multicast scope stay local to the receiver LAN and
+are not exported to the relay.
+
 The current transparent gateway learns from reports and state changes, but it
 does not yet run the full IGMP/MLD listener timer machinery needed to age out
 silent receivers.

@@ -21,6 +21,7 @@ const MAX_UDP_DATAGRAM: usize = 65_535;
 const MAX_UPSTREAM_DRAIN: usize = 64;
 const MAX_LOCAL_MEMBERSHIP_DRAIN: usize = 64;
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
+const DATA_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const GATEWAY_REDISCOVER_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(260);
 pub const DEFAULT_GATEWAY_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
@@ -105,6 +106,7 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
         relay_metrics_flags(&metrics_config, socket.local_addr()?, &relay, &upstream),
     )?;
     let mut last_gateway_prune = Instant::now();
+    let mut data_log = RelayDataLog::new();
     println!(
         "amt relay listening on {} (advertising IPv4 {}, IPv6 {})",
         socket.local_addr()?,
@@ -156,7 +158,8 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
             made_progress = true;
         }
 
-        let forwarded = drain_upstream(&socket, &relay, &mut upstream, &mut metrics)?;
+        let forwarded =
+            drain_upstream(&socket, &relay, &mut upstream, &mut metrics, &mut data_log)?;
         made_progress |= forwarded != 0;
         match metrics.maybe_emit_relay(RelayMetricsGauges {
             active_gateways: gateway_activity.len() as u64,
@@ -165,6 +168,7 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
             Ok(emitted) => made_progress |= emitted,
             Err(error) => eprintln!("failed to write relay metrics sample: {error}"),
         }
+        data_log.maybe_emit();
 
         if !made_progress {
             thread::sleep(IDLE_SLEEP);
@@ -211,6 +215,7 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
         .unwrap_or_else(Instant::now);
     let mut last_local_query: Option<Instant> = None;
     let mut last_membership_refresh: Option<Instant> = None;
+    let mut data_log = GatewayDataLog::new();
     let mut buf = [0; MAX_UDP_DATAGRAM];
 
     println!(
@@ -367,7 +372,7 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                             metrics.counters_mut().multicast_data_received_total += 1;
                             metrics.counters_mut().multicast_data_bytes_received_total +=
                                 packet.len() as u64;
-                            println!("{peer} sent {} byte AMT multicast packet", packet.len());
+                            data_log.record_amt_packet(packet.len());
                             if let Some(downstream) = downstream.as_mut() {
                                 match downstream.forward_ip_datagram(&packet) {
                                     Ok(Some(report)) => {
@@ -376,33 +381,17 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                                             .downstream_packets_forwarded_total += 1;
                                         metrics.counters_mut().downstream_bytes_forwarded_total +=
                                             report.bytes_sent as u64;
-                                        let udp_port = report
-                                            .udp_dst_port
-                                            .map(|port| format!(":{port}"))
-                                            .unwrap_or_default();
-                                        println!(
-                                            "forwarded downstream raw multicast {} -> {}{} (protocol {}, {} datagram bytes, {} sent)",
-                                            report.source,
-                                            report.group,
-                                            udp_port,
-                                            report.ip_protocol,
-                                            report.datagram_len,
-                                            report.bytes_sent
-                                        );
+                                        data_log.record_downstream_forwarded(report.bytes_sent);
                                     }
                                     Ok(None) => {
                                         metrics
                                             .counters_mut()
                                             .downstream_non_multicast_packets_total += 1;
-                                        println!(
-                                            "received AMT multicast packet is not a multicast IP datagram"
-                                        );
+                                        data_log.record_non_multicast();
                                     }
                                     Err(error) => {
                                         metrics.counters_mut().downstream_forward_errors_total += 1;
-                                        eprintln!(
-                                            "failed to forward downstream multicast packet: {error}"
-                                        );
+                                        data_log.record_downstream_error(error.to_string());
                                     }
                                 }
                             }
@@ -435,6 +424,7 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
             Ok(emitted) => made_progress |= emitted,
             Err(error) => eprintln!("failed to write gateway metrics sample: {error}"),
         }
+        data_log.maybe_emit();
 
         if !made_progress {
             thread::sleep(IDLE_SLEEP);
@@ -781,7 +771,12 @@ fn drain_upstream(
     relay: &Relay,
     upstream: &mut UpstreamManager,
     metrics: &mut MetricsRecorder,
+    data_log: &mut RelayDataLog,
 ) -> io::Result<usize> {
+    if upstream.active_subscription_count() == 0 {
+        return Ok(0);
+    }
+
     let mut forwarded_packets = 0;
 
     for _ in 0..MAX_UPSTREAM_DRAIN {
@@ -793,18 +788,14 @@ fn drain_upstream(
         };
         metrics.counters_mut().upstream_packets_received_total += 1;
         metrics.counters_mut().upstream_bytes_received_total += datagram.datagram().len() as u64;
+        data_log.record_received(datagram.datagram().len());
 
         let endpoints = relay
             .state()
             .endpoints_for_packet(datagram.source, datagram.group);
         if endpoints.is_empty() {
             metrics.counters_mut().upstream_unmatched_packets_total += 1;
-            println!(
-                "received upstream {} multicast datagram from {} to {}, but no gateway interest matched",
-                protocol_name(&datagram),
-                datagram.source,
-                datagram.group
-            );
+            data_log.record_unmatched(protocol_name(&datagram));
             continue;
         }
 
@@ -818,10 +809,7 @@ fn drain_upstream(
             if let Err(error) = socket.send_to(&response, endpoint) {
                 metrics.counters_mut().send_errors_total += 1;
                 metrics.counters_mut().upstream_forward_errors_total += 1;
-                eprintln!(
-                    "failed to forward {} byte multicast datagram to {endpoint}: {error}",
-                    forwarded_datagram.len()
-                );
+                data_log.record_send_error(format!("{endpoint}: {error}"));
             } else {
                 successful_sends += 1;
             }
@@ -831,15 +819,184 @@ fn drain_upstream(
         metrics.counters_mut().upstream_bytes_forwarded_total +=
             successful_sends * forwarded_datagram.len() as u64;
         forwarded_packets += 1;
-        println!(
-            "forwarded {} byte multicast datagram from {} to {} gateway(s)",
-            forwarded_datagram.len(),
-            datagram.source,
-            endpoints.len()
-        );
+        data_log.record_forwarded(forwarded_datagram.len(), successful_sends);
     }
 
     Ok(forwarded_packets)
+}
+
+#[derive(Debug)]
+struct RelayDataLog {
+    last_emit: Instant,
+    received_packets: u64,
+    received_bytes: u64,
+    forwarded_packets: u64,
+    forwarded_bytes: u64,
+    forwarded_gateway_sends: u64,
+    unmatched_packets: u64,
+    last_unmatched_protocol: Option<&'static str>,
+    send_errors: u64,
+    last_send_error: Option<String>,
+}
+
+impl RelayDataLog {
+    fn new() -> Self {
+        Self {
+            last_emit: Instant::now(),
+            received_packets: 0,
+            received_bytes: 0,
+            forwarded_packets: 0,
+            forwarded_bytes: 0,
+            forwarded_gateway_sends: 0,
+            unmatched_packets: 0,
+            last_unmatched_protocol: None,
+            send_errors: 0,
+            last_send_error: None,
+        }
+    }
+
+    fn record_received(&mut self, bytes: usize) {
+        self.received_packets += 1;
+        self.received_bytes += bytes as u64;
+    }
+
+    fn record_unmatched(&mut self, protocol: &'static str) {
+        self.unmatched_packets += 1;
+        self.last_unmatched_protocol = Some(protocol);
+    }
+
+    fn record_forwarded(&mut self, bytes: usize, gateway_sends: u64) {
+        self.forwarded_packets += 1;
+        self.forwarded_bytes += bytes as u64;
+        self.forwarded_gateway_sends += gateway_sends;
+    }
+
+    fn record_send_error(&mut self, error: String) {
+        self.send_errors += 1;
+        self.last_send_error = Some(error);
+    }
+
+    fn maybe_emit(&mut self) {
+        if self.last_emit.elapsed() < DATA_LOG_INTERVAL || !self.has_events() {
+            return;
+        }
+
+        println!(
+            "relay data-plane summary: received={} packets/{} bytes, forwarded={} packets to {} gateway endpoint(s)/{} bytes, unmatched={}, send_errors={}",
+            self.received_packets,
+            self.received_bytes,
+            self.forwarded_packets,
+            self.forwarded_gateway_sends,
+            self.forwarded_bytes,
+            self.unmatched_packets,
+            self.send_errors
+        );
+        if let Some(protocol) = self.last_unmatched_protocol {
+            println!("  last unmatched upstream protocol: {protocol}");
+        }
+        if let Some(error) = self.last_send_error.as_deref() {
+            println!("  last relay forward error: {error}");
+        }
+        self.reset();
+    }
+
+    fn has_events(&self) -> bool {
+        self.received_packets != 0 || self.send_errors != 0
+    }
+
+    fn reset(&mut self) {
+        self.last_emit = Instant::now();
+        self.received_packets = 0;
+        self.received_bytes = 0;
+        self.forwarded_packets = 0;
+        self.forwarded_bytes = 0;
+        self.forwarded_gateway_sends = 0;
+        self.unmatched_packets = 0;
+        self.last_unmatched_protocol = None;
+        self.send_errors = 0;
+        self.last_send_error = None;
+    }
+}
+
+#[derive(Debug)]
+struct GatewayDataLog {
+    last_emit: Instant,
+    amt_packets: u64,
+    amt_bytes: u64,
+    downstream_packets: u64,
+    downstream_bytes: u64,
+    non_multicast_packets: u64,
+    downstream_errors: u64,
+    last_downstream_error: Option<String>,
+}
+
+impl GatewayDataLog {
+    fn new() -> Self {
+        Self {
+            last_emit: Instant::now(),
+            amt_packets: 0,
+            amt_bytes: 0,
+            downstream_packets: 0,
+            downstream_bytes: 0,
+            non_multicast_packets: 0,
+            downstream_errors: 0,
+            last_downstream_error: None,
+        }
+    }
+
+    fn record_amt_packet(&mut self, bytes: usize) {
+        self.amt_packets += 1;
+        self.amt_bytes += bytes as u64;
+    }
+
+    fn record_downstream_forwarded(&mut self, bytes: usize) {
+        self.downstream_packets += 1;
+        self.downstream_bytes += bytes as u64;
+    }
+
+    fn record_non_multicast(&mut self) {
+        self.non_multicast_packets += 1;
+    }
+
+    fn record_downstream_error(&mut self, error: String) {
+        self.downstream_errors += 1;
+        self.last_downstream_error = Some(error);
+    }
+
+    fn maybe_emit(&mut self) {
+        if self.last_emit.elapsed() < DATA_LOG_INTERVAL || !self.has_events() {
+            return;
+        }
+
+        println!(
+            "gateway data-plane summary: received={} AMT packets/{} bytes, forwarded={} downstream packets/{} bytes, non_multicast={}, forward_errors={}",
+            self.amt_packets,
+            self.amt_bytes,
+            self.downstream_packets,
+            self.downstream_bytes,
+            self.non_multicast_packets,
+            self.downstream_errors
+        );
+        if let Some(error) = self.last_downstream_error.as_deref() {
+            println!("  last gateway downstream error: {error}");
+        }
+        self.reset();
+    }
+
+    fn has_events(&self) -> bool {
+        self.amt_packets != 0 || self.downstream_errors != 0
+    }
+
+    fn reset(&mut self) {
+        self.last_emit = Instant::now();
+        self.amt_packets = 0;
+        self.amt_bytes = 0;
+        self.downstream_packets = 0;
+        self.downstream_bytes = 0;
+        self.non_multicast_packets = 0;
+        self.downstream_errors = 0;
+        self.last_downstream_error = None;
+    }
 }
 
 fn format_subscription(subscription: &UpstreamSubscription) -> String {

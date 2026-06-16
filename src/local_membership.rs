@@ -97,7 +97,7 @@ impl LocalMembershipManager {
     }
 
     pub fn pending_report(&self) -> Option<MembershipReport> {
-        let current = self.current_interests();
+        let current = self.current_exportable_interests();
         let records = delta_records(self.config.protocol, &self.advertised, &current);
         (!records.is_empty()).then_some(MembershipReport {
             protocol: self.config.protocol,
@@ -107,7 +107,7 @@ impl LocalMembershipManager {
 
     pub fn current_report(&self) -> Option<MembershipReport> {
         let records = self
-            .current_interests()
+            .current_exportable_interests()
             .into_iter()
             .filter(|(group, _)| group_matches_protocol(self.config.protocol, *group))
             .map(|(group, interest)| record_for_interest(group, &interest, ReportRecordMode::State))
@@ -120,7 +120,7 @@ impl LocalMembershipManager {
     }
 
     pub fn mark_advertised(&mut self) {
-        self.advertised = self.current_interests();
+        self.advertised = self.current_exportable_interests();
     }
 
     fn current_subscriptions(&self) -> Vec<UpstreamSubscription> {
@@ -129,6 +129,10 @@ impl LocalMembershipManager {
 
     fn current_interests(&self) -> BTreeMap<IpAddr, GroupInterest> {
         self.state.aggregate_interests()
+    }
+
+    fn current_exportable_interests(&self) -> BTreeMap<IpAddr, GroupInterest> {
+        filter_exportable_interests(self.config.protocol, self.current_interests())
     }
 
     fn query_config(&self) -> GeneralQueryConfig {
@@ -300,6 +304,40 @@ fn group_matches_protocol(protocol: MembershipProtocol, group: IpAddr) -> bool {
     )
 }
 
+fn filter_exportable_interests(
+    protocol: MembershipProtocol,
+    interests: BTreeMap<IpAddr, GroupInterest>,
+) -> BTreeMap<IpAddr, GroupInterest> {
+    interests
+        .into_iter()
+        .filter(|(group, _)| group_matches_protocol(protocol, *group))
+        .filter(|(group, _)| is_amt_exportable_group(*group))
+        .collect()
+}
+
+fn is_amt_exportable_group(group: IpAddr) -> bool {
+    match group {
+        IpAddr::V4(group) => is_amt_exportable_ipv4_group(group),
+        IpAddr::V6(group) => is_amt_exportable_ipv6_group(group),
+    }
+}
+
+fn is_amt_exportable_ipv4_group(group: Ipv4Addr) -> bool {
+    if !group.is_multicast() {
+        return false;
+    }
+
+    let octets = group.octets();
+    !matches!(
+        octets,
+        [224, 0, 0, _] | [239, 255, 255, 250] | [239, 255, 255, 253]
+    )
+}
+
+fn is_amt_exportable_ipv6_group(group: Ipv6Addr) -> bool {
+    group.is_multicast() && group.segments()[0] & 0x000f != 0x0002
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReportRecordMode {
     State,
@@ -418,6 +456,101 @@ mod tests {
                 MembershipRecordKind::ModeIsInclude,
                 group,
                 vec![source]
+            )]))
+        );
+    }
+
+    #[test]
+    fn transparent_export_filters_ipv4_link_local_and_service_discovery_groups() {
+        let link_local = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        let ssdp = IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250));
+        let exportable = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let current = BTreeMap::from([
+            (link_local, GroupInterest::exclude([])),
+            (ssdp, GroupInterest::exclude([])),
+            (exportable, GroupInterest::exclude([])),
+        ]);
+
+        assert_eq!(
+            filter_exportable_interests(MembershipProtocol::Igmpv3, current),
+            BTreeMap::from([(exportable, GroupInterest::exclude([]))])
+        );
+    }
+
+    #[test]
+    fn transparent_export_filters_ipv6_link_local_groups() {
+        let link_local = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
+        let site_local = IpAddr::V6(Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x1234));
+        let current = BTreeMap::from([
+            (link_local, GroupInterest::exclude([])),
+            (site_local, GroupInterest::exclude([])),
+        ]);
+
+        assert_eq!(
+            filter_exportable_interests(MembershipProtocol::Mldv2, current),
+            BTreeMap::from([(site_local, GroupInterest::exclude([]))])
+        );
+    }
+
+    #[test]
+    fn current_report_omits_non_exportable_transparent_groups() {
+        let exportable = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let mut manager = LocalMembershipManager {
+            config: LocalMembershipConfig::new(MembershipProtocol::Igmpv3),
+            context: RawContext::new(),
+            subscription_id: SubscriptionId(0),
+            state: RelayState::default(),
+            advertised: BTreeMap::new(),
+        };
+
+        manager.state.apply_report(
+            SocketAddr::from(([192, 168, 1, 10], 0)),
+            &report(vec![
+                record(
+                    MembershipRecordKind::ModeIsExclude,
+                    Ipv4Addr::new(224, 0, 0, 251),
+                    Vec::new(),
+                ),
+                record(MembershipRecordKind::ModeIsExclude, exportable, Vec::new()),
+            ]),
+        );
+
+        assert_eq!(
+            manager.current_report(),
+            Some(report(vec![record(
+                MembershipRecordKind::ModeIsExclude,
+                exportable,
+                Vec::new()
+            )]))
+        );
+    }
+
+    #[test]
+    fn pending_report_leaves_previously_advertised_exportable_group() {
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let mut manager = LocalMembershipManager {
+            config: LocalMembershipConfig::new(MembershipProtocol::Igmpv3),
+            context: RawContext::new(),
+            subscription_id: SubscriptionId(0),
+            state: RelayState::default(),
+            advertised: BTreeMap::from([(group, GroupInterest::exclude([]))]),
+        };
+
+        manager.state.apply_report(
+            SocketAddr::from(([192, 168, 1, 10], 0)),
+            &report(vec![record(
+                MembershipRecordKind::ModeIsExclude,
+                Ipv4Addr::new(224, 0, 0, 251),
+                Vec::new(),
+            )]),
+        );
+
+        assert_eq!(
+            manager.pending_report(),
+            Some(report(vec![record(
+                MembershipRecordKind::ChangeToInclude,
+                group,
+                Vec::new()
             )]))
         );
     }
