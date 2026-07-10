@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod downstream;
 #[cfg(feature = "driad")]
 pub mod driad;
+pub mod ecn;
 pub mod gateway;
 pub mod ip;
 #[cfg(feature = "runtime")]
@@ -26,6 +27,8 @@ pub mod query;
 pub mod relay;
 pub mod state;
 #[cfg(feature = "runtime")]
+mod udp;
+#[cfg(feature = "runtime")]
 pub mod upstream;
 
 #[cfg(feature = "runtime")]
@@ -35,6 +38,7 @@ pub use driad::{
     AMTRELAY_RRTYPE, AmtRelayRecord, AmtRelayTarget, DriadError, DriadRelaySelection,
     DriadResolver, DriadResolverConfig, reverse_source_name,
 };
+pub use ecn::{EcnCodepoint, EcnDecapsulation, EcnError, decapsulate_ecn, ip_ecn};
 pub use gateway::{Gateway, GatewayAction, GatewayConfig, GatewayError, GatewayPhase, GatewaySend};
 pub use ip::{IpPacketError, MulticastPacket, is_amt_forwardable_group, parse_multicast_packet};
 #[cfg(feature = "runtime")]

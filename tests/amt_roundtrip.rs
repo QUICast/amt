@@ -69,7 +69,7 @@ fn gateway_and_relay_complete_amt_round_trip_over_udp() {
         .unwrap();
 
     let action = gateway_recv(&gateway_socket, &mut gateway);
-    let GatewayAction::MulticastData { packet } = action else {
+    let GatewayAction::MulticastData { packet, .. } = action else {
         panic!("expected multicast data action");
     };
     assert_eq!(packet, multicast_packet);

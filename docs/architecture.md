@@ -37,6 +37,8 @@ The relay code is organized as follows:
   `mcrx_core::RawContext` subscriptions.
 - `daemon::run_relay` connects the UDP AMT socket to the relay state machine and
   forwards raw upstream datagrams as AMT Multicast Data.
+- `udp::AmtUdpSocket` supplies per-datagram outer ECN metadata and transmit
+  markings through `quinn-udp`.
 
 The relay currently uses HMAC-SHA256 for the Response MAC derivation and takes
 the first six bytes as the RFC 7450 Response MAC field. Secrets rotate
@@ -82,8 +84,12 @@ With the `driad` Cargo feature, the daemon edge can resolve a configured SSM
 source through RFC 8777 DNS Reverse IP AMT Discovery before constructing the
 gateway session. DRIAD candidates remain ordered by precedence and are tried on
 handshake timeout. DNS replies are source-bound and fully question-checked;
-remote plaintext resolvers require an explicit insecure override. Future
-multi-source transparent DRIAD will still need separate per-source sessions.
+truncated UDP answers fall back to DNS over TCP, and remote plaintext resolvers
+require an explicit insecure override. The minimum effective DNS TTL schedules
+an asynchronous refresh. A successful refresh atomically replaces failover
+candidates without disturbing a healthy active tunnel; failures retain the
+last usable set and back off. Future multi-source transparent DRIAD will still
+need separate per-source sessions.
 
 The blocking gateway daemon periodically starts a fresh Request-Nonce cycle,
 waits for a validated Membership Query, and then replays complete desired
@@ -128,11 +134,15 @@ can configure 1280 bytes for a conservative Internet-path assumption. ICMP
 Packet Too Big feedback toward SSM sources still requires a portable
 raw-unicast transmit path.
 
-RFC 9601 ECN capability negotiation is intentionally left disabled: gateway
-Request messages keep the E bit clear and the daemon creates ordinary UDP
-sockets whose outer ECN field is Not-ECT. This is the safe compatibility mode;
-the implementation never copies the inner ECN bits into an outer header that a
-non-ECN gateway might discard.
+RFC 9601 ECN support is opt-in. An enabled gateway sets the Request `E` bit; an
+enabled relay stores that capability in a bounded, expiring endpoint table and
+uses RFC 6040 normal-mode encapsulation only for those gateways. All control
+traffic and data for unknown or non-capable gateways use a Not-ECT outer header.
+At the gateway, RFC 6040 Figure 4 combines inner and outer markings before raw
+downstream injection. IPv4 header checksums are repaired when ECN changes, and
+the invalid inner-Not-ECT/outer-CE combination is dropped. This keeps the
+default compatibility mode safe while allowing complete propagation when both
+ends opt in.
 
 ## SSM Fidelity
 
@@ -158,6 +168,7 @@ Future runtime integrations can reuse:
 
 - `Relay::handle_datagram`
 - `Gateway::handle_datagram`
+- `Gateway::handle_datagram_with_ecn`
 - `DriadResolver` when built with `--features driad`
 - `LocalMembershipManager`
 - `UpstreamManager`

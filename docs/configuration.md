@@ -10,6 +10,7 @@ easy.
 ```toml
 [relay]
 bind = "0.0.0.0:2268"
+ecn = true
 relay_address = "203.0.113.10"
 upstream_interface = "192.0.2.10"
 gateway_idle_timeout_secs = 260
@@ -72,6 +73,12 @@ packets with header options, or IPv6 payloads rather than creating outer
 fragments. ICMP Packet Too Big feedback requires raw unicast transmit support
 that `mctx-core` does not currently expose.
 
+`ecn = true` enables RFC 9601 support. The relay records the Request `E` bit
+per gateway and copies inner ECN into the outer AMT IP header only for capable
+gateways. It uses safe Not-ECT compatibility mode for every other gateway.
+The equivalent CLI switches are `--ecn` and `--no-ecn`; compatibility mode is
+the default.
+
 The downstream interface belongs to the inner multicast family, not the AMT
 tunnel family. An IGMPv3 gateway therefore requires an IPv4 downstream
 interface and an MLDv2 gateway requires an IPv6 downstream interface, even when
@@ -85,6 +92,7 @@ Transparent gateway:
 [gateway]
 bind = "0.0.0.0:0"
 relay = "203.0.113.10:2268"
+ecn = true
 protocol = "igmpv3"
 transparent = true
 membership_refresh_interval_secs = 60
@@ -107,6 +115,13 @@ interval_ms = 1000
 `reporter_timeout_secs` must be at least twice `query_interval_secs` plus 10
 seconds. Setting the query interval to zero disables both General Queries and
 reporter aging.
+
+`ecn = true` makes the gateway set the RFC 9601 Request `E` bit and apply RFC
+6040 decapsulation to tunneled multicast. Outer CE is propagated into an
+ECN-capable inner packet; outer CE with an inner Not-ECT packet is dropped.
+The daemon fails startup when ECN receive metadata cannot be enabled on a
+supported platform, rather than advertising a capability it cannot honor.
+With ECN disabled, the daemon retains its plain `UdpSocket` compatibility path.
 
 Configured ASM/SSM joins:
 
@@ -135,6 +150,7 @@ DRIAD SSM discovery:
 [gateway]
 relay_discovery = "driad"
 protocol = "igmpv3"
+ecn = true
 membership_refresh_interval_secs = 60
 
 [gateway.driad]
@@ -152,6 +168,14 @@ Build the binary with `--features driad` to enable DRIAD. In `static` mode,
 the gateway performs DRIAD for the configured SSM source. The current DRIAD
 path intentionally supports one source address per gateway session and does not
 yet perform transparent-mode per-source relay selection.
+
+The effective minimum TTL across AMTRELAY, CNAME/DNAME, and A/AAAA answers
+drives asynchronous refreshes, bounded to 1 second through 24 hours. Refresh
+failure retains the current relay set and uses randomized exponential backoff.
+Successful refreshes replace the failover candidates immediately, while a
+healthy active tunnel stays in place until normal rediscovery to avoid packet
+loss or duplication from an unnecessary RPF-tree change. An explicit AMTRELAY
+`NoRelay` result withdraws the tunnel and stops the daemon.
 
 DRIAD accepts loopback resolvers by default so DNS trust can be supplied by a
 local validating resolver. To use plaintext DNS to a remote resolver, set
@@ -214,11 +238,14 @@ Counter families include:
 
 - AMT control datagrams, invalid/ignored/rate-limited datagrams, responses, and send errors.
 - Relay resource-limit rejections, upstream reconciliation failures, tunnel
-  MTU drops, and generated IPv4 fragments.
+  MTU drops, generated IPv4 fragments, and RFC 6040 normal-mode sends.
 - Relay membership updates, applied records, teardowns, authentication rejections, and gateway expiry.
 - Relay upstream subscription changes, native multicast receive, unmatched packets, forwarded packets, and forward errors.
 - Gateway discovery, membership queries, membership updates, refreshes, and teardown.
 - Gateway AMT Multicast Data receive, downstream forwarding, non-multicast packets, and forwarding errors.
+- DRIAD refresh starts, successes, failures, and relay-candidate changes.
+- Gateway ECN CE reception/propagation, currently-unused combinations, and
+  invalid Not-ECT/CE drops.
 - Transparent gateway local queries, local membership reports, and parse errors.
 
 Each counter is emitted as:

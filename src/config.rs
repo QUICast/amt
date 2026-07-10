@@ -14,6 +14,7 @@ pub struct FileConfig {
 #[serde(deny_unknown_fields)]
 pub struct RelayFileConfig {
     pub bind: Option<SocketAddr>,
+    pub ecn: Option<bool>,
     #[serde(default, alias = "advertise", alias = "relay_addresses")]
     pub relay_address: Option<OneOrMany<IpAddr>>,
     pub upstream_interface: Option<IpAddr>,
@@ -53,6 +54,7 @@ pub struct RateLimitFileConfig {
 #[serde(deny_unknown_fields)]
 pub struct GatewayFileConfig {
     pub bind: Option<SocketAddr>,
+    pub ecn: Option<bool>,
     pub relay: Option<SocketAddr>,
     pub relay_discovery: Option<String>,
     pub protocol: Option<String>,
@@ -151,6 +153,7 @@ mod tests {
             r#"
             [relay]
             bind = "0.0.0.0:2268"
+            ecn = true
             relay_addresses = ["203.0.113.10", "2001:db8::10"]
             upstream_interface = "192.0.2.10"
             upstream_ifindex = 7
@@ -174,6 +177,7 @@ mod tests {
 
         let relay = config.relay.unwrap();
         assert_eq!(relay.bind.unwrap(), "0.0.0.0:2268".parse().unwrap());
+        assert_eq!(relay.ecn, Some(true));
         assert_eq!(relay.relay_address.unwrap().into_vec().len(), 2);
         assert_eq!(relay.upstream_interface_index, Some(7));
         assert_eq!(relay.path_mtu, Some(1500));
@@ -190,6 +194,7 @@ mod tests {
             r#"
             [gateway]
             relay = "203.0.113.10:2268"
+            ecn = true
             relay_discovery = "static"
             protocol = "igmpv3"
             transparent = true
@@ -217,6 +222,7 @@ mod tests {
 
         let gateway = config.gateway.unwrap();
         assert_eq!(gateway.relay.unwrap(), "203.0.113.10:2268".parse().unwrap());
+        assert_eq!(gateway.ecn, Some(true));
         assert_eq!(gateway.relay_discovery.as_deref(), Some("static"));
         assert_eq!(gateway.driad.unwrap().attempts, Some(2));
         assert_eq!(gateway.joins.len(), 1);

@@ -2,6 +2,8 @@ use amt::AMT_PORT;
 use amt::config::{
     DriadFileConfig, FileConfig, MetricsFileConfig, RelayLimitsFileConfig, load_file_config,
 };
+#[cfg(feature = "driad")]
+use amt::daemon::GatewayDriadConfig;
 use amt::daemon::{
     self, DEFAULT_CONTROL_RATE_BURST, DEFAULT_CONTROL_RATE_PER_SECOND,
     DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
@@ -41,6 +43,23 @@ impl Default for GatewayDriadOptions {
             timeout: Duration::from_secs(2),
             attempts: 2,
             allow_insecure_dns: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedGatewayRelays {
+    relays: Vec<SocketAddr>,
+    #[cfg(feature = "driad")]
+    driad: Option<GatewayDriadConfig>,
+}
+
+impl ResolvedGatewayRelays {
+    fn static_relay(relay: SocketAddr) -> Self {
+        Self {
+            relays: vec![relay],
+            #[cfg(feature = "driad")]
+            driad: None,
         }
     }
 }
@@ -94,6 +113,7 @@ fn parse_relay_config(
         .and_then(|config| config.relay.as_ref());
 
     let mut bind = relay_file.and_then(|config| config.bind);
+    let mut ecn = relay_file.and_then(|config| config.ecn).unwrap_or(false);
     let mut relay_addresses = relay_file
         .and_then(|config| config.relay_address.clone())
         .map(|addresses| addresses.into_vec())
@@ -217,6 +237,8 @@ fn parse_relay_config(
                     .map_err(|_| format!("invalid --path-mtu '{value}'"))?;
                 validate_path_mtu(path_mtu)?;
             }
+            "--ecn" => ecn = true,
+            "--no-ecn" => ecn = false,
             "--metrics-dir" => {
                 let value = args
                     .next()
@@ -258,6 +280,7 @@ fn parse_relay_config(
         }
     });
     let mut config = RelayConfig::for_bind(bind);
+    config.ecn = ecn;
     for addr in relay_addresses {
         config = config.with_advertise_addr(addr);
     }
@@ -293,6 +316,7 @@ fn parse_gateway_config(
         .and_then(|config| config.gateway.as_ref());
 
     let mut bind = gateway_file.and_then(|config| config.bind);
+    let mut ecn = gateway_file.and_then(|config| config.ecn).unwrap_or(false);
     let mut relay = gateway_file.and_then(|config| config.relay);
     let mut relay_discovery = gateway_file
         .and_then(|config| config.relay_discovery.as_deref())
@@ -433,6 +457,8 @@ fn parse_gateway_config(
                 driad_options.attempts = attempts;
             }
             "--driad-allow-insecure-dns" => driad_options.allow_insecure_dns = true,
+            "--ecn" => ecn = true,
+            "--no-ecn" => ecn = false,
             "--protocol" => {
                 let value = args
                     .next()
@@ -645,8 +671,20 @@ fn parse_gateway_config(
         joins.push(GatewayJoin { group, source });
     }
 
-    let relays =
+    let resolved =
         resolve_gateway_relays(relay, relay_discovery, &joins, &driad_options, transparent)?;
+    let mut relays = resolved.relays;
+    if relays.len() > 1
+        && let Some(bind) = bind
+    {
+        relays.retain(|relay| same_family(bind.ip(), relay.ip()));
+        if relays.is_empty() {
+            return Err(
+                "gateway discovery returned no relay matching the explicit bind address family"
+                    .to_string(),
+            );
+        }
+    }
     for relay in &relays {
         validate_relay_address(relay.ip(), "gateway relay")?;
         if relay.port() == 0 {
@@ -661,9 +699,14 @@ fn parse_gateway_config(
     if !same_family(bind.ip(), relay.ip()) {
         return Err("gateway bind and relay must use the same outer address family".to_string());
     }
-    let gateway =
-        GatewayConfig::new(relay, protocol).with_fallback_relays(relays.into_iter().skip(1));
+    let gateway = GatewayConfig::new(relay, protocol)
+        .with_ecn(ecn)
+        .with_fallback_relays(relays.into_iter().skip(1));
     let mut config = GatewayDaemonConfig::new(bind, gateway);
+    #[cfg(feature = "driad")]
+    {
+        config.driad = resolved.driad;
+    }
     config.joins = joins;
     config.downstream = downstream;
     config.membership_refresh_interval = membership_refresh_interval;
@@ -853,13 +896,13 @@ fn resolve_gateway_relays(
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
-) -> Result<Vec<SocketAddr>, String> {
+) -> Result<ResolvedGatewayRelays, String> {
     match discovery {
         GatewayRelayDiscovery::Static => relay
-            .map(|relay| vec![relay])
+            .map(ResolvedGatewayRelays::static_relay)
             .ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string()),
         GatewayRelayDiscovery::Auto => match relay {
-            Some(relay) => Ok(vec![relay]),
+            Some(relay) => Ok(ResolvedGatewayRelays::static_relay(relay)),
             None => resolve_driad_relays(joins, driad_options, transparent),
         },
         GatewayRelayDiscovery::Driad => resolve_driad_relays(joins, driad_options, transparent),
@@ -870,7 +913,7 @@ fn resolve_driad_relays(
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
-) -> Result<Vec<SocketAddr>, String> {
+) -> Result<ResolvedGatewayRelays, String> {
     if transparent {
         return Err(
             "DRIAD transparent membership learning is not implemented yet; use configured SSM --group/--source joins for now"
@@ -899,17 +942,27 @@ fn resolve_driad_relays(
             })?;
         let selection = &selections[0];
         println!(
-            "DRIAD selected AMT relay {} for source {} using {} (precedence {}, discovery_optional={})",
+            "DRIAD selected AMT relay {} for source {} using {} (precedence {}, discovery_optional={}, ttl={}s)",
             selection.relay,
             selection.source,
             selection.query_name,
             selection.record.precedence,
-            selection.record.discovery_optional
+            selection.record.discovery_optional,
+            selection.ttl.as_secs()
         );
-        Ok(selections
+        let initial_ttl = selections
+            .iter()
+            .map(|selection| selection.ttl)
+            .min()
+            .unwrap_or(Duration::from_secs(1));
+        let relays = selections
             .into_iter()
             .map(|selection| selection.relay)
-            .collect())
+            .collect();
+        Ok(ResolvedGatewayRelays {
+            relays,
+            driad: Some(GatewayDriadConfig::new(source, resolver, initial_ttl)),
+        })
     }
 
     #[cfg(not(feature = "driad"))]
@@ -1024,11 +1077,13 @@ fn usage() -> &'static str {
         "  amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] ",
         "[--upstream-interface IP] [--upstream-ifindex INDEX] ",
         "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] ",
+        "[--ecn|--no-ecn] ",
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n",
         "  amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] ",
         "[--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] ",
         "[--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] ",
         "[--driad-allow-insecure-dns] ",
+        "[--ecn|--no-ecn] ",
         "[--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] ",
         "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
         "[--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] ",
@@ -1040,6 +1095,7 @@ fn usage() -> &'static str {
         "Gateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\n",
         "Gateway static relay discovery requires --relay; DRIAD discovery requires a configured SSM --source and the driad Cargo feature.\n",
         "Gateway refreshes memberships every 60 seconds by default; 0 retains the 60-second liveness probe.\n",
+        "RFC 9601 ECN propagation is opt-in with --ecn; compatibility mode is the default.\n",
         "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
         "Use --metrics-dir to write Heimdall JSONL metrics under DIR/node-id/.\n",
         "Raw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms.",
@@ -1060,6 +1116,7 @@ mod tests {
             r#"
             [relay]
             bind = "0.0.0.0:2268"
+            ecn = true
             relay_address = "203.0.113.10"
             upstream_interface = "192.0.2.10"
             gateway_idle_timeout_secs = 120
@@ -1077,6 +1134,7 @@ mod tests {
             path.display().to_string(),
             "--bind".to_string(),
             "127.0.0.1:9999".to_string(),
+            "--no-ecn".to_string(),
         ])
         .unwrap()
         .unwrap();
@@ -1088,6 +1146,7 @@ mod tests {
         );
         assert_eq!(config.gateway_idle_timeout, Some(Duration::from_secs(120)));
         assert_eq!(config.path_mtu, 1500);
+        assert!(!config.relay.ecn);
         assert_eq!(
             config.metrics.output_dir.as_deref(),
             Some(Path::new("/tmp/heimdall"))
@@ -1104,6 +1163,7 @@ mod tests {
             [gateway]
             relay = "203.0.113.10:2268"
             protocol = "igmpv3"
+            ecn = true
 
             [gateway.downstream]
             interface = "192.168.1.20"
@@ -1124,6 +1184,7 @@ mod tests {
 
         assert_eq!(config.gateway.relay, "203.0.113.10:2268".parse().unwrap());
         assert_eq!(config.gateway.protocol, MembershipProtocol::Igmpv3);
+        assert!(config.gateway.ecn);
         assert_eq!(config.joins.len(), 2);
         assert_eq!(
             config

@@ -8,7 +8,8 @@ use crate::AMT_PORT;
 use getrandom::fill as fill_random;
 use std::collections::HashSet;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 pub const AMTRELAY_RRTYPE: u16 = 260;
@@ -45,6 +46,8 @@ pub struct DriadRelaySelection {
     pub query_name: String,
     pub record: AmtRelayRecord,
     pub relay: SocketAddr,
+    /// Minimum DNS lifetime across the AMTRELAY, alias, and address records.
+    pub ttl: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +74,7 @@ impl DriadResolverConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriadResolver {
     config: DriadResolverConfig,
 }
@@ -113,31 +116,32 @@ impl DriadResolver {
         let mut records = self.lookup_amtrelay_following_aliases(&query_name)?;
         if records
             .iter()
-            .any(|record| matches!(record.target, AmtRelayTarget::NoRelay))
+            .any(|record| matches!(record.value.target, AmtRelayTarget::NoRelay))
         {
             return Err(DriadError::NoRelayPresent);
         }
-        records.sort_by_key(|record| record.precedence);
+        records.sort_by_key(|record| record.value.precedence);
         let mut selections = Vec::new();
         for record in records {
-            let Ok(relays) = self.relay_socket_addrs(&record.target) else {
+            let Ok(relays) = self.relay_socket_addrs(&record.value.target) else {
                 continue;
             };
             for relay in relays {
-                if !is_usable_relay_address(relay.ip()) {
+                if !is_usable_relay_address(relay.value.ip()) {
                     continue;
                 }
                 if selections
                     .iter()
-                    .any(|selection: &DriadRelaySelection| selection.relay == relay)
+                    .any(|selection: &DriadRelaySelection| selection.relay == relay.value)
                 {
                     continue;
                 }
                 selections.push(DriadRelaySelection {
                     source,
                     query_name: query_name.clone(),
-                    record: record.clone(),
-                    relay,
+                    record: record.value.clone(),
+                    relay: relay.value,
+                    ttl: record.ttl.min(relay.ttl),
                 });
             }
         }
@@ -151,9 +155,10 @@ impl DriadResolver {
     fn lookup_amtrelay_following_aliases(
         &self,
         query_name: &str,
-    ) -> Result<Vec<AmtRelayRecord>, DriadError> {
+    ) -> Result<Vec<Timed<AmtRelayRecord>>, DriadError> {
         let mut current = query_name.to_string();
         let mut visited = HashSet::new();
+        let mut alias_ttl = Duration::MAX;
 
         for _ in 0..MAX_ALIAS_DEPTH {
             if !visited.insert(current.to_ascii_lowercase()) {
@@ -162,13 +167,21 @@ impl DriadResolver {
 
             let response = self.lookup_amtrelay_name(&current)?;
             if !response.records.is_empty() {
-                return Ok(response.records);
+                return Ok(response
+                    .records
+                    .into_iter()
+                    .map(|record| Timed {
+                        value: record.value,
+                        ttl: record.ttl.min(alias_ttl),
+                    })
+                    .collect());
             }
 
             let Some(alias) = response.aliases.into_iter().next() else {
                 return Err(DriadError::NoRecords(current));
             };
-            current = alias;
+            alias_ttl = alias_ttl.min(alias.ttl);
+            current = alias.value;
         }
 
         Err(DriadError::AliasDepthExceeded(query_name.to_string()))
@@ -177,9 +190,10 @@ impl DriadResolver {
     fn lookup_amtrelay_name(&self, name: &str) -> Result<DnsAmtRelayResponse, DriadError> {
         let mut last_error = None;
 
-        for _ in 0..self.config.attempts.max(1) {
+        for attempt in 0..self.config.attempts.max(1) {
+            let timeout = self.retry_timeout(attempt);
             for resolver in &self.config.resolvers {
-                match self.query_resolver(*resolver, name) {
+                match self.query_resolver(*resolver, name, timeout) {
                     Ok(response) => return Ok(response),
                     Err(error) => last_error = Some(error),
                 }
@@ -193,8 +207,9 @@ impl DriadResolver {
         &self,
         resolver: SocketAddr,
         name: &str,
+        timeout: Duration,
     ) -> Result<DnsAmtRelayResponse, DriadError> {
-        let (id, response) = self.query_wire(resolver, name, AMTRELAY_RRTYPE)?;
+        let (id, response) = self.query_wire(resolver, name, AMTRELAY_RRTYPE, timeout)?;
         parse_dns_response(id, name, &response)
     }
 
@@ -203,6 +218,7 @@ impl DriadResolver {
         resolver: SocketAddr,
         name: &str,
         query_type: u16,
+        timeout: Duration,
     ) -> Result<(u16, Vec<u8>), DriadError> {
         let id = random_dns_id()?;
         let query = build_dns_query(id, name, query_type)?;
@@ -213,10 +229,10 @@ impl DriadResolver {
         let socket = UdpSocket::bind(bind)
             .map_err(|error| DriadError::Io(format!("failed to bind DNS socket: {error}")))?;
         socket
-            .set_read_timeout(Some(self.config.timeout))
+            .set_read_timeout(Some(timeout))
             .map_err(|error| DriadError::Io(format!("failed to set DNS read timeout: {error}")))?;
         socket
-            .set_write_timeout(Some(self.config.timeout))
+            .set_write_timeout(Some(timeout))
             .map_err(|error| DriadError::Io(format!("failed to set DNS write timeout: {error}")))?;
         socket
             .connect(resolver)
@@ -229,19 +245,85 @@ impl DriadResolver {
         let len = socket
             .recv(&mut buf)
             .map_err(|error| DriadError::Io(format!("failed to receive DNS response: {error}")))?;
+        if len >= 4 && u16::from_be_bytes([buf[2], buf[3]]) & 0x0200 != 0 {
+            return self
+                .query_tcp(resolver, &query, timeout)
+                .map(|response| (id, response));
+        }
         Ok((id, buf[..len].to_vec()))
     }
 
-    fn relay_socket_addrs(&self, target: &AmtRelayTarget) -> Result<Vec<SocketAddr>, DriadError> {
+    fn query_tcp(
+        &self,
+        resolver: SocketAddr,
+        query: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, DriadError> {
+        let mut stream = TcpStream::connect_timeout(&resolver, timeout).map_err(|error| {
+            DriadError::Io(format!("failed to connect DNS TCP socket: {error}"))
+        })?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| DriadError::Io(format!("failed to set DNS TCP timeout: {error}")))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| DriadError::Io(format!("failed to set DNS TCP timeout: {error}")))?;
+        let query_len = u16::try_from(query.len())
+            .map_err(|_| DriadError::Io("DNS query is too large for TCP framing".to_string()))?;
+        stream
+            .write_all(&query_len.to_be_bytes())
+            .and_then(|_| stream.write_all(query))
+            .map_err(|error| DriadError::Io(format!("failed to send DNS TCP query: {error}")))?;
+
+        let mut length = [0u8; 2];
+        stream
+            .read_exact(&mut length)
+            .map_err(|error| DriadError::Io(format!("failed to read DNS TCP length: {error}")))?;
+        let response_len = usize::from(u16::from_be_bytes(length));
+        if response_len < DNS_HEADER_LEN {
+            return Err(DriadError::Truncated("DNS TCP response"));
+        }
+        let mut response = vec![0u8; response_len];
+        stream
+            .read_exact(&mut response)
+            .map_err(|error| DriadError::Io(format!("failed to read DNS TCP response: {error}")))?;
+        Ok(response)
+    }
+
+    fn retry_timeout(&self, attempt: usize) -> Duration {
+        let multiplier = 1u32 << attempt.min(6);
+        let maximum = Duration::from_secs(120);
+        let upper = self
+            .config
+            .timeout
+            .checked_mul(multiplier)
+            .unwrap_or(maximum)
+            .min(maximum);
+        randomized_duration(self.config.timeout.min(upper), upper)
+    }
+
+    fn relay_socket_addrs(
+        &self,
+        target: &AmtRelayTarget,
+    ) -> Result<Vec<Timed<SocketAddr>>, DriadError> {
         match target {
             AmtRelayTarget::NoRelay => Err(DriadError::NoRelayPresent),
-            AmtRelayTarget::Ipv4(addr) => Ok(vec![SocketAddr::new(IpAddr::V4(*addr), AMT_PORT)]),
-            AmtRelayTarget::Ipv6(addr) => Ok(vec![SocketAddr::new(IpAddr::V6(*addr), AMT_PORT)]),
+            AmtRelayTarget::Ipv4(addr) => Ok(vec![Timed {
+                value: SocketAddr::new(IpAddr::V4(*addr), AMT_PORT),
+                ttl: Duration::MAX,
+            }]),
+            AmtRelayTarget::Ipv6(addr) => Ok(vec![Timed {
+                value: SocketAddr::new(IpAddr::V6(*addr), AMT_PORT),
+                ttl: Duration::MAX,
+            }]),
             AmtRelayTarget::Name(name) => {
                 let addresses = self
                     .lookup_host(name)?
                     .into_iter()
-                    .map(|address| SocketAddr::new(address, AMT_PORT))
+                    .map(|address| Timed {
+                        value: SocketAddr::new(address.value, AMT_PORT),
+                        ttl: address.ttl,
+                    })
                     .collect::<Vec<_>>();
                 if addresses.is_empty() {
                     Err(DriadError::NoUsableRelay)
@@ -252,12 +334,15 @@ impl DriadResolver {
         }
     }
 
-    fn lookup_host(&self, name: &str) -> Result<Vec<IpAddr>, DriadError> {
+    fn lookup_host(&self, name: &str) -> Result<Vec<Timed<IpAddr>>, DriadError> {
         let mut addresses = Vec::new();
         for query_type in [DNS_TYPE_A, DNS_TYPE_AAAA] {
             if let Ok(found) = self.lookup_host_type(name, query_type) {
                 for address in found {
-                    if !addresses.contains(&address) {
+                    if !addresses
+                        .iter()
+                        .any(|existing: &Timed<IpAddr>| existing.value == address.value)
+                    {
                         addresses.push(address);
                     }
                 }
@@ -270,34 +355,53 @@ impl DriadResolver {
         }
     }
 
-    fn lookup_host_type(&self, name: &str, query_type: u16) -> Result<Vec<IpAddr>, DriadError> {
+    fn lookup_host_type(
+        &self,
+        name: &str,
+        query_type: u16,
+    ) -> Result<Vec<Timed<IpAddr>>, DriadError> {
         let mut current = name.to_string();
         let mut visited = HashSet::new();
+        let mut alias_ttl = Duration::MAX;
         for _ in 0..MAX_ALIAS_DEPTH {
             if !visited.insert(current.to_ascii_lowercase()) {
                 return Err(DriadError::AliasLoop(current));
             }
             let mut last_error = DriadError::NoRecords(current.clone());
             let mut alias = None;
-            'queries: for _ in 0..self.config.attempts.max(1) {
+            'queries: for attempt in 0..self.config.attempts.max(1) {
+                let timeout = self.retry_timeout(attempt);
                 for resolver in &self.config.resolvers {
-                    match self.query_wire(*resolver, &current, query_type).and_then(
-                        |(id, response)| {
+                    match self
+                        .query_wire(*resolver, &current, query_type, timeout)
+                        .and_then(|(id, response)| {
                             parse_address_response(id, &current, query_type, &response)
-                        },
-                    ) {
-                        Ok((addresses, _)) if !addresses.is_empty() => return Ok(addresses),
-                        Ok((_, Some(next_alias))) => {
+                        }) {
+                        Ok(response) if !response.addresses.is_empty() => {
+                            return Ok(response
+                                .addresses
+                                .into_iter()
+                                .map(|address| Timed {
+                                    value: address.value,
+                                    ttl: address.ttl.min(alias_ttl),
+                                })
+                                .collect());
+                        }
+                        Ok(DnsAddressResponse {
+                            alias: Some(next_alias),
+                            ..
+                        }) => {
                             alias = Some(next_alias);
                             break 'queries;
                         }
-                        Ok((_, None)) => {}
+                        Ok(DnsAddressResponse { alias: None, .. }) => {}
                         Err(error) => last_error = error,
                     }
                 }
             }
             if let Some(alias) = alias {
-                current = alias;
+                alias_ttl = alias_ttl.min(alias.ttl);
+                current = alias.value;
             } else {
                 return Err(last_error);
             }
@@ -317,8 +421,20 @@ fn is_usable_relay_address(address: IpAddr) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DnsAmtRelayResponse {
-    records: Vec<AmtRelayRecord>,
-    aliases: Vec<String>,
+    records: Vec<Timed<AmtRelayRecord>>,
+    aliases: Vec<Timed<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsAddressResponse {
+    addresses: Vec<Timed<IpAddr>>,
+    alias: Option<Timed<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Timed<T> {
+    value: T,
+    ttl: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +654,7 @@ fn parse_dns_response(
         }
         let rrtype = read_u16(response, offset)?;
         let class = read_u16(response, offset + 2)?;
+        let ttl = Duration::from_secs(u64::from(read_u32(response, offset + 4)?));
         let rdlen = read_u16(response, offset + 8)? as usize;
         offset += 10;
         let rdata_end = offset
@@ -549,18 +666,22 @@ fn parse_dns_response(
 
         if class == DNS_CLASS_IN && rrtype == AMTRELAY_RRTYPE && dns_name_eq(&owner, query_name) {
             if let Ok(record) = parse_amtrelay_rdata(&response[offset..rdata_end]) {
-                records.push(record);
+                records.push(Timed { value: record, ttl });
             }
         } else if class == DNS_CLASS_IN
             && rrtype == DNS_TYPE_CNAME
             && dns_name_eq(&owner, query_name)
         {
-            let (alias, _) = parse_dns_name(response, offset)?;
-            aliases.push(alias);
+            let (alias, consumed) = parse_dns_name(response, offset)?;
+            if consumed == rdata_end {
+                aliases.push(Timed { value: alias, ttl });
+            }
         } else if class == DNS_CLASS_IN && rrtype == DNS_TYPE_DNAME {
-            let (target, _) = parse_dns_name(response, offset)?;
-            if let Some(alias) = apply_dname(query_name, &owner, &target) {
-                aliases.push(alias);
+            let (target, consumed) = parse_dns_name(response, offset)?;
+            if consumed == rdata_end
+                && let Some(alias) = apply_dname(query_name, &owner, &target)
+            {
+                aliases.push(Timed { value: alias, ttl });
             }
         }
 
@@ -575,7 +696,7 @@ fn parse_address_response(
     query_name: &str,
     query_type: u16,
     response: &[u8],
-) -> Result<(Vec<IpAddr>, Option<String>), DriadError> {
+) -> Result<DnsAddressResponse, DriadError> {
     let (ancount, mut offset) =
         validate_dns_response(expected_id, query_name, query_type, response)?;
     let mut addresses = Vec::new();
@@ -588,6 +709,7 @@ fn parse_address_response(
         }
         let rrtype = read_u16(response, offset)?;
         let class = read_u16(response, offset + 2)?;
+        let ttl = Duration::from_secs(u64::from(read_u32(response, offset + 4)?));
         let rdlen = read_u16(response, offset + 8)? as usize;
         offset += 10;
         let rdata_end = offset
@@ -599,28 +721,35 @@ fn parse_address_response(
 
         if class == DNS_CLASS_IN && dns_name_eq(&owner, query_name) {
             match (rrtype, rdlen) {
-                (DNS_TYPE_A, 4) if query_type == DNS_TYPE_A => {
-                    addresses.push(IpAddr::V4(Ipv4Addr::new(
+                (DNS_TYPE_A, 4) if query_type == DNS_TYPE_A => addresses.push(Timed {
+                    value: IpAddr::V4(Ipv4Addr::new(
                         response[offset],
                         response[offset + 1],
                         response[offset + 2],
                         response[offset + 3],
-                    )))
-                }
+                    )),
+                    ttl,
+                }),
                 (DNS_TYPE_AAAA, 16) if query_type == DNS_TYPE_AAAA => {
                     let mut octets = [0; 16];
                     octets.copy_from_slice(&response[offset..rdata_end]);
-                    addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                    addresses.push(Timed {
+                        value: IpAddr::V6(Ipv6Addr::from(octets)),
+                        ttl,
+                    });
                 }
                 (DNS_TYPE_CNAME, _) => {
-                    alias = Some(parse_dns_name(response, offset)?.0);
+                    let (name, consumed) = parse_dns_name(response, offset)?;
+                    if consumed == rdata_end {
+                        alias = Some(Timed { value: name, ttl });
+                    }
                 }
                 _ => {}
             }
         }
         offset = rdata_end;
     }
-    Ok((addresses, alias))
+    Ok(DnsAddressResponse { addresses, alias })
 }
 
 fn validate_dns_response(
@@ -758,10 +887,32 @@ fn read_u16(input: &[u8], offset: usize) -> Result<u16, DriadError> {
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
+fn read_u32(input: &[u8], offset: usize) -> Result<u32, DriadError> {
+    let bytes = input
+        .get(offset..offset + 4)
+        .ok_or(DriadError::Truncated("u32"))?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 fn random_dns_id() -> Result<u16, DriadError> {
     let mut bytes = [0; 2];
     fill_random(&mut bytes).map_err(|error| DriadError::Randomness(error.to_string()))?;
     Ok(u16::from_be_bytes(bytes))
+}
+
+fn randomized_duration(lower: Duration, upper: Duration) -> Duration {
+    let lower_ms = lower.as_millis() as u64;
+    let upper_ms = upper.as_millis() as u64;
+    if lower_ms >= upper_ms {
+        return lower;
+    }
+    let mut bytes = [0u8; 8];
+    let random = if fill_random(&mut bytes).is_ok() {
+        u64::from_ne_bytes(bytes)
+    } else {
+        upper_ms
+    };
+    Duration::from_millis(lower_ms + random % (upper_ms - lower_ms + 1))
 }
 
 #[cfg(test)]
@@ -859,10 +1010,13 @@ mod tests {
 
         assert_eq!(
             parsed.records,
-            vec![AmtRelayRecord {
-                precedence: 10,
-                discovery_optional: false,
-                target: AmtRelayTarget::Ipv4(Ipv4Addr::new(203, 0, 113, 15)),
+            vec![Timed {
+                value: AmtRelayRecord {
+                    precedence: 10,
+                    discovery_optional: false,
+                    target: AmtRelayTarget::Ipv4(Ipv4Addr::new(203, 0, 113, 15)),
+                },
+                ttl: Duration::from_secs(60),
             }]
         );
     }
@@ -893,7 +1047,45 @@ mod tests {
 
         let parsed = parse_dns_response(0x1234, name, &response).unwrap();
 
-        assert_eq!(parsed.aliases, vec!["relay.example.com"]);
+        assert_eq!(
+            parsed.aliases,
+            vec![Timed {
+                value: "relay.example.com".to_string(),
+                ttl: Duration::from_secs(60),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_address_ttl_for_named_relay() {
+        let name = "relay.example.com";
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x1234u16.to_be_bytes());
+        response.extend_from_slice(&0x8180u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        put_dns_name(&mut response, name).unwrap();
+        response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&30u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[203, 0, 113, 15]);
+
+        let parsed = parse_address_response(0x1234, name, DNS_TYPE_A, &response).unwrap();
+
+        assert_eq!(
+            parsed.addresses,
+            vec![Timed {
+                value: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15)),
+                ttl: Duration::from_secs(30),
+            }]
+        );
+        assert_eq!(parsed.alias, None);
     }
 
     #[test]
@@ -917,6 +1109,109 @@ mod tests {
             driad.resolve_source(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12))),
             Err(DriadError::InsecureResolver(resolver))
         );
+    }
+
+    #[test]
+    fn resolver_returns_effective_amtrelay_ttl() {
+        let dns = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let resolver_addr = dns.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut query = [0u8; 512];
+            let (len, peer) = dns.recv_from(&mut query).unwrap();
+            let query = &query[..len];
+            let (_, question_end) = parse_dns_name(query, DNS_HEADER_LEN).unwrap();
+            let question_end = question_end + 4;
+
+            let mut response = Vec::new();
+            response.extend_from_slice(&query[..2]);
+            response.extend_from_slice(&0x8180u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]);
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&AMTRELAY_RRTYPE.to_be_bytes());
+            response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+            response.extend_from_slice(&2u32.to_be_bytes());
+            response.extend_from_slice(&6u16.to_be_bytes());
+            response.extend_from_slice(&[10, 1, 203, 0, 113, 15]);
+            dns.send_to(&response, peer).unwrap();
+        });
+        let mut config = DriadResolverConfig::new(vec![resolver_addr]);
+        config.timeout = Duration::from_secs(1);
+        config.attempts = 1;
+        let resolver = DriadResolver::new(config);
+
+        let selection = resolver
+            .resolve_source(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12)))
+            .unwrap();
+
+        responder.join().unwrap();
+        assert_eq!(
+            selection.relay,
+            SocketAddr::from(([203, 0, 113, 15], AMT_PORT))
+        );
+        assert_eq!(selection.ttl, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn resolver_retries_truncated_udp_answer_over_tcp() {
+        let tcp = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let resolver_addr = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(resolver_addr).unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut udp_query = [0u8; 512];
+            let (len, peer) = udp.recv_from(&mut udp_query).unwrap();
+            let query = &udp_query[..len];
+            let mut truncated = [0u8; DNS_HEADER_LEN];
+            truncated[..2].copy_from_slice(&query[..2]);
+            truncated[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+            truncated[4..6].copy_from_slice(&1u16.to_be_bytes());
+            udp.send_to(&truncated, peer).unwrap();
+
+            let (mut stream, _) = tcp.accept().unwrap();
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).unwrap();
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+            stream.read_exact(&mut query).unwrap();
+            let (_, question_end) = parse_dns_name(&query, DNS_HEADER_LEN).unwrap();
+            let question_end = question_end + 4;
+
+            let mut response = Vec::new();
+            response.extend_from_slice(&query[..2]);
+            response.extend_from_slice(&0x8180u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]);
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&AMTRELAY_RRTYPE.to_be_bytes());
+            response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+            response.extend_from_slice(&5u32.to_be_bytes());
+            response.extend_from_slice(&6u16.to_be_bytes());
+            response.extend_from_slice(&[10, 1, 203, 0, 113, 16]);
+            stream
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let mut config = DriadResolverConfig::new(vec![resolver_addr]);
+        config.timeout = Duration::from_secs(1);
+        config.attempts = 1;
+        let resolver = DriadResolver::new(config);
+
+        let selection = resolver
+            .resolve_source(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12)))
+            .unwrap();
+
+        responder.join().unwrap();
+        assert_eq!(
+            selection.relay,
+            SocketAddr::from(([203, 0, 113, 16], AMT_PORT))
+        );
+        assert_eq!(selection.ttl, Duration::from_secs(5));
     }
 
     #[test]

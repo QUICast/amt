@@ -170,6 +170,8 @@ pub enum Message<'a> {
     Request {
         request_nonce: u32,
         protocol: MembershipProtocol,
+        /// RFC 9601 gateway ECN capability (`E`) flag.
+        ecn_capable: bool,
     },
     MembershipQuery {
         response_mac: ResponseMac,
@@ -240,11 +242,10 @@ impl<'a> Message<'a> {
             Self::Request {
                 request_nonce,
                 protocol,
+                ecn_capable,
             } => {
                 out.push(header(MessageType::Request));
-                // RFC 9601 E remains clear: this implementation uses safe
-                // non-ECN compatibility mode.
-                out.push(u8::from(protocol.p_flag()));
+                out.push((u8::from(*ecn_capable) << 1) | u8::from(protocol.p_flag()));
                 out.extend_from_slice(&[0, 0]);
                 put_u32(out, *request_nonce);
             }
@@ -417,6 +418,7 @@ fn decode_request(input: &[u8]) -> Result<Message<'_>, DecodeError> {
     Ok(Message::Request {
         request_nonce: read_u32(input, 4),
         protocol: MembershipProtocol::from_p_flag(input[1] & 0x01 != 0),
+        ecn_capable: input[1] & 0x02 != 0,
     })
 }
 
@@ -621,11 +623,26 @@ mod tests {
         let message = Message::Request {
             request_nonce: 0x1122_3344,
             protocol: MembershipProtocol::Mldv2,
+            ecn_capable: false,
         };
 
         let encoded = encode(&message);
 
         assert_eq!(encoded, [0x03, 1, 0, 0, 0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(decode(&encoded), Ok(message));
+    }
+
+    #[test]
+    fn request_uses_rfc_9601_e_flag() {
+        let message = Message::Request {
+            request_nonce: 0x1122_3344,
+            protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: true,
+        };
+
+        let encoded = encode(&message);
+
+        assert_eq!(encoded, [0x03, 2, 0, 0, 0x11, 0x22, 0x33, 0x44]);
         assert_eq!(decode(&encoded), Ok(message));
     }
 

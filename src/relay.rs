@@ -8,6 +8,7 @@ use crate::query::{GeneralQueryConfig, build_general_query, query_interval};
 use crate::state::{RelayLimits, RelayState, StateLimitError, UpstreamSubscription};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -57,6 +58,8 @@ pub struct RelayConfig {
     pub advertise_ipv6: Ipv6Addr,
     pub secret: RelaySecret,
     pub include_gateway_address: bool,
+    /// Enables RFC 9601 normal-mode ECN propagation for capable gateways.
+    pub ecn: bool,
     pub limit: bool,
     pub limits: RelayLimits,
     pub secret_rotation_interval: Option<Duration>,
@@ -101,6 +104,7 @@ impl Default for RelayConfig {
             advertise_ipv6: Ipv6Addr::LOCALHOST,
             secret: RelaySecret::default(),
             include_gateway_address: true,
+            ecn: false,
             limit: false,
             limits: RelayLimits::default(),
             secret_rotation_interval: Some(Duration::from_secs(2 * 60 * 60)),
@@ -115,6 +119,7 @@ pub struct Relay {
     state: RelayState,
     previous_secret: Option<PreviousSecret>,
     secret_rotated_at: Instant,
+    gateway_ecn_capabilities: BTreeMap<SocketAddr, Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +135,7 @@ impl Relay {
             state: RelayState::default(),
             previous_secret: None,
             secret_rotated_at: Instant::now(),
+            gateway_ecn_capabilities: BTreeMap::new(),
         }
     }
 
@@ -142,7 +148,23 @@ impl Relay {
     }
 
     pub fn remove_gateway(&mut self, endpoint: SocketAddr) -> bool {
+        self.gateway_ecn_capabilities.remove(&endpoint);
         self.state.remove_endpoint(endpoint)
+    }
+
+    pub fn gateway_ecn_capable(&self, endpoint: SocketAddr) -> bool {
+        self.config.ecn
+            && self
+                .gateway_ecn_capabilities
+                .get(&endpoint)
+                .is_some_and(|observed| observed.elapsed() <= self.gateway_capability_lifetime())
+    }
+
+    pub fn ecn_capable_gateway_count(&self) -> usize {
+        self.gateway_ecn_capabilities
+            .keys()
+            .filter(|endpoint| self.gateway_ecn_capable(**endpoint))
+            .count()
     }
 
     pub fn handle_datagram(
@@ -178,10 +200,12 @@ impl Relay {
             Message::Request {
                 request_nonce,
                 protocol,
+                ecn_capable,
             } => {
                 if request_nonce == 0 {
                     return Err(RelayError::ZeroNonce);
                 }
+                self.remember_gateway_ecn_capability(peer, ecn_capable);
                 let response_mac = self.response_mac(peer.ip(), peer.port(), request_nonce);
                 let general_query = build_general_query(protocol, &self.config.general_query);
                 let gateway = self.config.include_gateway_address.then(|| {
@@ -269,6 +293,7 @@ impl Relay {
                     .unwrap_or_else(|| IpAddr::V6(gateway.address.as_ipv6()));
                 let endpoint = SocketAddr::new(gateway_ip, gateway.port);
                 if self.valid_response_mac(response_mac, gateway_ip, gateway.port, request_nonce) {
+                    self.gateway_ecn_capabilities.remove(&endpoint);
                     if !self.state.contains_endpoint(endpoint) {
                         return Ok((
                             RelayAction::AcceptedTeardown {
@@ -362,6 +387,27 @@ impl Relay {
             rotated_at: now,
         });
         self.secret_rotated_at = now;
+    }
+
+    fn gateway_capability_lifetime(&self) -> Duration {
+        query_interval(self.config.general_query.query_interval_code) * 2
+    }
+
+    fn remember_gateway_ecn_capability(&mut self, endpoint: SocketAddr, capable: bool) {
+        let lifetime = self.gateway_capability_lifetime();
+        self.gateway_ecn_capabilities
+            .retain(|_, observed| observed.elapsed() <= lifetime);
+
+        if !self.config.ecn || !capable {
+            self.gateway_ecn_capabilities.remove(&endpoint);
+            return;
+        }
+        if self.gateway_ecn_capabilities.contains_key(&endpoint)
+            || self.gateway_ecn_capabilities.len() < self.config.limits.max_endpoints
+        {
+            self.gateway_ecn_capabilities
+                .insert(endpoint, Instant::now());
+        }
     }
 }
 
@@ -480,6 +526,7 @@ mod tests {
         let request = encode(&Message::Request {
             request_nonce: 0x0102_0304,
             protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: false,
         });
 
         let action = relay.handle_datagram(peer, &request).unwrap();
@@ -519,6 +566,7 @@ mod tests {
         let request = encode(&Message::Request {
             request_nonce: 99,
             protocol: MembershipProtocol::Mldv2,
+            ecn_capable: false,
         });
 
         let action = relay
@@ -533,6 +581,45 @@ mod tests {
         };
         assert_eq!(general_query[0] >> 4, 6);
         assert_eq!(general_query[48], 130);
+    }
+
+    #[test]
+    fn rfc_9601_request_tracks_gateway_ecn_capability() {
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let mut relay = relay();
+        relay.config.ecn = true;
+        let capable = encode(&Message::Request {
+            request_nonce: 99,
+            protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: true,
+        });
+
+        relay.handle_datagram(peer, &capable).unwrap();
+        assert!(relay.gateway_ecn_capable(peer));
+        assert_eq!(relay.ecn_capable_gateway_count(), 1);
+
+        let compatibility = encode(&Message::Request {
+            request_nonce: 100,
+            protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: false,
+        });
+        relay.handle_datagram(peer, &compatibility).unwrap();
+        assert!(!relay.gateway_ecn_capable(peer));
+    }
+
+    #[test]
+    fn disabled_relay_ignores_gateway_ecn_declaration() {
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let mut relay = relay();
+        let request = encode(&Message::Request {
+            request_nonce: 99,
+            protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: true,
+        });
+
+        relay.handle_datagram(peer, &request).unwrap();
+
+        assert!(!relay.gateway_ecn_capable(peer));
     }
 
     #[test]
@@ -594,6 +681,7 @@ mod tests {
         let request = encode(&Message::Request {
             request_nonce: 0,
             protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: false,
         });
 
         assert_eq!(
@@ -656,6 +744,7 @@ mod tests {
         let request = encode(&Message::Request {
             request_nonce: 42,
             protocol: MembershipProtocol::Igmpv3,
+            ecn_capable: false,
         });
 
         let RelayAction::Send(response) = relay

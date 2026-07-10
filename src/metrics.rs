@@ -90,13 +90,22 @@ pub struct AmtMetricsCounters {
     pub upstream_forward_errors_total: u64,
     pub upstream_mtu_drops_total: u64,
     pub upstream_fragments_sent_total: u64,
+    pub relay_ecn_normal_mode_datagrams_sent_total: u64,
     pub gateway_discoveries_sent_total: u64,
     pub gateway_membership_queries_received_total: u64,
     pub gateway_membership_updates_sent_total: u64,
     pub gateway_membership_refreshes_total: u64,
     pub gateway_teardowns_sent_total: u64,
+    pub driad_refreshes_started_total: u64,
+    pub driad_refreshes_succeeded_total: u64,
+    pub driad_refreshes_failed_total: u64,
+    pub driad_candidate_changes_total: u64,
     pub multicast_data_received_total: u64,
     pub multicast_data_bytes_received_total: u64,
+    pub gateway_ecn_ce_received_total: u64,
+    pub gateway_ecn_ce_propagated_total: u64,
+    pub gateway_ecn_currently_unused_total: u64,
+    pub gateway_ecn_invalid_drops_total: u64,
     pub downstream_packets_forwarded_total: u64,
     pub downstream_bytes_forwarded_total: u64,
     pub downstream_non_multicast_packets_total: u64,
@@ -182,6 +191,9 @@ impl AmtMetricsCounters {
             upstream_fragments_sent_total: self
                 .upstream_fragments_sent_total
                 .saturating_sub(earlier.upstream_fragments_sent_total),
+            relay_ecn_normal_mode_datagrams_sent_total: self
+                .relay_ecn_normal_mode_datagrams_sent_total
+                .saturating_sub(earlier.relay_ecn_normal_mode_datagrams_sent_total),
             gateway_discoveries_sent_total: self
                 .gateway_discoveries_sent_total
                 .saturating_sub(earlier.gateway_discoveries_sent_total),
@@ -197,12 +209,36 @@ impl AmtMetricsCounters {
             gateway_teardowns_sent_total: self
                 .gateway_teardowns_sent_total
                 .saturating_sub(earlier.gateway_teardowns_sent_total),
+            driad_refreshes_started_total: self
+                .driad_refreshes_started_total
+                .saturating_sub(earlier.driad_refreshes_started_total),
+            driad_refreshes_succeeded_total: self
+                .driad_refreshes_succeeded_total
+                .saturating_sub(earlier.driad_refreshes_succeeded_total),
+            driad_refreshes_failed_total: self
+                .driad_refreshes_failed_total
+                .saturating_sub(earlier.driad_refreshes_failed_total),
+            driad_candidate_changes_total: self
+                .driad_candidate_changes_total
+                .saturating_sub(earlier.driad_candidate_changes_total),
             multicast_data_received_total: self
                 .multicast_data_received_total
                 .saturating_sub(earlier.multicast_data_received_total),
             multicast_data_bytes_received_total: self
                 .multicast_data_bytes_received_total
                 .saturating_sub(earlier.multicast_data_bytes_received_total),
+            gateway_ecn_ce_received_total: self
+                .gateway_ecn_ce_received_total
+                .saturating_sub(earlier.gateway_ecn_ce_received_total),
+            gateway_ecn_ce_propagated_total: self
+                .gateway_ecn_ce_propagated_total
+                .saturating_sub(earlier.gateway_ecn_ce_propagated_total),
+            gateway_ecn_currently_unused_total: self
+                .gateway_ecn_currently_unused_total
+                .saturating_sub(earlier.gateway_ecn_currently_unused_total),
+            gateway_ecn_invalid_drops_total: self
+                .gateway_ecn_invalid_drops_total
+                .saturating_sub(earlier.gateway_ecn_invalid_drops_total),
             downstream_packets_forwarded_total: self
                 .downstream_packets_forwarded_total
                 .saturating_sub(earlier.downstream_packets_forwarded_total),
@@ -694,6 +730,13 @@ fn extend_counters(
     );
     counter(
         sample,
+        "relay_ecn_normal_mode_datagrams_sent",
+        total.relay_ecn_normal_mode_datagrams_sent_total,
+        delta.relay_ecn_normal_mode_datagrams_sent_total,
+        interval_secs,
+    );
+    counter(
+        sample,
         "gateway_discoveries_sent",
         total.gateway_discoveries_sent_total,
         delta.gateway_discoveries_sent_total,
@@ -729,6 +772,34 @@ fn extend_counters(
     );
     counter(
         sample,
+        "driad_refreshes_started",
+        total.driad_refreshes_started_total,
+        delta.driad_refreshes_started_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_refreshes_succeeded",
+        total.driad_refreshes_succeeded_total,
+        delta.driad_refreshes_succeeded_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_refreshes_failed",
+        total.driad_refreshes_failed_total,
+        delta.driad_refreshes_failed_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_candidate_changes",
+        total.driad_candidate_changes_total,
+        delta.driad_candidate_changes_total,
+        interval_secs,
+    );
+    counter(
+        sample,
         "multicast_data_received",
         total.multicast_data_received_total,
         delta.multicast_data_received_total,
@@ -739,6 +810,34 @@ fn extend_counters(
         "multicast_data_bytes_received",
         total.multicast_data_bytes_received_total,
         delta.multicast_data_bytes_received_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "gateway_ecn_ce_received",
+        total.gateway_ecn_ce_received_total,
+        delta.gateway_ecn_ce_received_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "gateway_ecn_ce_propagated",
+        total.gateway_ecn_ce_propagated_total,
+        delta.gateway_ecn_ce_propagated_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "gateway_ecn_currently_unused",
+        total.gateway_ecn_currently_unused_total,
+        delta.gateway_ecn_currently_unused_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "gateway_ecn_invalid_drops",
+        total.gateway_ecn_invalid_drops_total,
+        delta.gateway_ecn_invalid_drops_total,
         interval_secs,
     );
     counter(
@@ -830,6 +929,8 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 10,
                 upstream_bytes_received_total: 1000,
+                driad_refreshes_succeeded_total: 1,
+                gateway_ecn_ce_propagated_total: 2,
                 ..AmtMetricsCounters::default()
             },
             gauges: MetricsGauges::Relay(RelayMetricsGauges {
@@ -842,6 +943,8 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 14,
                 upstream_bytes_received_total: 1400,
+                driad_refreshes_succeeded_total: 3,
+                gateway_ecn_ce_propagated_total: 5,
                 ..AmtMetricsCounters::default()
             },
             gauges: MetricsGauges::Relay(RelayMetricsGauges {
@@ -858,6 +961,8 @@ mod tests {
         assert_eq!(sample["upstream_packets_received_delta"], 4);
         assert_eq!(sample["upstream_packets_received_per_sec"], 2.0);
         assert_eq!(sample["upstream_bytes_received_per_sec"], 200.0);
+        assert_eq!(sample["driad_refreshes_succeeded_delta"], 2);
+        assert_eq!(sample["gateway_ecn_ce_propagated_delta"], 3);
     }
 
     #[test]

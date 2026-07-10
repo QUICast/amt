@@ -1,4 +1,7 @@
 use crate::downstream::{DownstreamConfig, DownstreamPublisher};
+#[cfg(feature = "driad")]
+use crate::driad::{DriadError, DriadRelaySelection, DriadResolver};
+use crate::ecn::{EcnCodepoint, ip_ecn};
 use crate::gateway::{Gateway, GatewayAction, GatewayConfig};
 use crate::local_membership::{LocalMembershipConfig, LocalMembershipManager};
 use crate::membership::{MembershipRecord, MembershipRecordKind, MembershipReport};
@@ -10,12 +13,15 @@ use crate::mtu::{Ipv4FragmentError, fragment_ipv4_for_tunnel};
 use crate::protocol::Message;
 use crate::relay::{Relay, RelayAction, RelayConfig, RelayError};
 use crate::state::{FilterMode, RelayState};
+use crate::udp::AmtUdpSocket;
 use crate::upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "driad")]
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +36,10 @@ const GATEWAY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const GATEWAY_RETRY_MAX: Duration = Duration::from_secs(120);
 const GATEWAY_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_REPORTER_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "driad")]
+const DRIAD_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "driad")]
+const DRIAD_MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(260);
 pub const DEFAULT_GATEWAY_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_RELAY_PATH_MTU: usize = 1_500;
@@ -96,7 +106,28 @@ pub struct GatewayDaemonConfig {
     pub downstream: Option<DownstreamConfig>,
     pub local_membership: Option<LocalMembershipConfig>,
     pub membership_refresh_interval: Option<Duration>,
+    #[cfg(feature = "driad")]
+    pub driad: Option<GatewayDriadConfig>,
     pub metrics: MetricsConfig,
+}
+
+#[cfg(feature = "driad")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDriadConfig {
+    pub source: IpAddr,
+    pub resolver: DriadResolver,
+    pub initial_ttl: Duration,
+}
+
+#[cfg(feature = "driad")]
+impl GatewayDriadConfig {
+    pub fn new(source: IpAddr, resolver: DriadResolver, initial_ttl: Duration) -> Self {
+        Self {
+            source,
+            resolver,
+            initial_ttl,
+        }
+    }
 }
 
 impl GatewayDaemonConfig {
@@ -108,6 +139,8 @@ impl GatewayDaemonConfig {
             downstream: Some(DownstreamConfig::default()),
             local_membership: None,
             membership_refresh_interval: Some(DEFAULT_MEMBERSHIP_REFRESH_INTERVAL),
+            #[cfg(feature = "driad")]
+            driad: None,
             metrics: MetricsConfig::default(),
         }
     }
@@ -117,8 +150,7 @@ impl GatewayDaemonConfig {
 pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
     let config = config.into();
     let metrics_config = config.metrics.clone();
-    let socket = UdpSocket::bind(config.relay.bind)?;
-    socket.set_nonblocking(true)?;
+    let socket = AmtUdpSocket::bind(config.relay.bind, config.relay.ecn)?;
 
     let rate_source_capacity = config
         .relay
@@ -162,7 +194,7 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
 
         for _ in 0..MAX_CONTROL_DRAIN {
             match socket.recv_from(&mut buf) {
-                Ok((len, peer)) => {
+                Ok((len, peer, _outer_ecn)) => {
                     made_progress = true;
                     if !rate_limiter.allow(peer.ip()) {
                         metrics.counters_mut().control_datagrams_received_total += 1;
@@ -236,11 +268,12 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
     let configured_joins = config.joins.len() as u64;
     let transparent_enabled = config.local_membership.is_some();
     let downstream_enabled = config.downstream.is_some();
-    let socket = UdpSocket::bind(config.bind)?;
-    socket.set_nonblocking(true)?;
+    let socket = AmtUdpSocket::bind(config.bind, config.gateway.ecn)?;
     let shutdown = ShutdownSignal::install()?;
 
     let mut gateway = Gateway::new(config.gateway);
+    #[cfg(feature = "driad")]
+    let mut driad_refresh = config.driad.map(DriadRefreshState::new);
     let mut downstream = config.downstream.map(DownstreamPublisher::new);
     let mut local_membership = match config.local_membership {
         Some(local_config) => {
@@ -294,6 +327,80 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
 
         if shutdown.requested() {
             return shutdown_gateway(&socket, &gateway, &mut metrics);
+        }
+
+        #[cfg(feature = "driad")]
+        if let Some(refresh) = driad_refresh.as_mut() {
+            match refresh.poll() {
+                DriadPoll::Idle => {}
+                DriadPoll::Started => {
+                    metrics.counters_mut().driad_refreshes_started_total += 1;
+                    made_progress = true;
+                }
+                DriadPoll::Resolved(Ok(selections)) => {
+                    let ttl = selections
+                        .iter()
+                        .map(|selection| selection.ttl)
+                        .min()
+                        .unwrap_or(DRIAD_MIN_REFRESH_INTERVAL);
+                    let candidates = selections
+                        .iter()
+                        .map(|selection| selection.relay)
+                        .filter(|relay| {
+                            same_address_family(relay.ip(), gateway.config().relay.ip())
+                        })
+                        .collect::<Vec<_>>();
+                    if candidates.is_empty() {
+                        metrics.counters_mut().driad_refreshes_failed_total += 1;
+                        refresh.schedule_failure();
+                        eprintln!(
+                            "DRIAD refresh returned no relay in the gateway's outer address family; retaining the current relay set"
+                        );
+                    } else {
+                        metrics.counters_mut().driad_refreshes_succeeded_total += 1;
+                        let changed = gateway.replace_relay_candidates(candidates);
+                        if changed {
+                            metrics.counters_mut().driad_candidate_changes_total += 1;
+                            println!(
+                                "DRIAD refreshed relay candidates for {} ({} usable in the active outer family)",
+                                refresh.source(),
+                                gateway.config().fallback_relays.len() + 1
+                            );
+                        }
+                        refresh.schedule_success(ttl);
+                        if gateway.current_relay_is_retired() && !gateway.is_established() {
+                            send_gateway_action(&socket, gateway.restart_discovery())?;
+                            metrics.counters_mut().gateway_discoveries_sent_total += 1;
+                            query_cycle_started = Some(Instant::now());
+                            relay_retry.reset_after_send();
+                        }
+                    }
+                    made_progress = true;
+                }
+                DriadPoll::Resolved(Err(DriadError::NoRelayPresent)) => {
+                    metrics.counters_mut().driad_refreshes_failed_total += 1;
+                    if let Ok(action) = gateway.teardown() {
+                        send_gateway_action(&socket, action)?;
+                        metrics.counters_mut().gateway_teardowns_sent_total += 1;
+                    }
+                    return Err(io::Error::new(
+                        ErrorKind::NotFound,
+                        format!(
+                            "DRIAD now reports no relay for source {}; stopped the existing tunnel",
+                            refresh.source()
+                        ),
+                    ));
+                }
+                DriadPoll::Resolved(Err(error)) => {
+                    metrics.counters_mut().driad_refreshes_failed_total += 1;
+                    refresh.schedule_failure();
+                    eprintln!(
+                        "DRIAD refresh for source {} failed; retaining the current relay set: {error}",
+                        refresh.source()
+                    );
+                    made_progress = true;
+                }
+            }
         }
 
         if query_cycle_started.is_some_and(|started| started.elapsed() >= GATEWAY_QUERY_TIMEOUT) {
@@ -367,15 +474,15 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
 
         for _ in 0..MAX_CONTROL_DRAIN {
             match socket.recv_from(&mut buf) {
-                Ok((len, peer)) => {
+                Ok((len, peer, outer_ecn)) => {
                     made_progress = true;
                     metrics.counters_mut().control_datagrams_received_total += 1;
-                    match gateway.handle_datagram(peer, &buf[..len]) {
+                    match gateway.handle_datagram_with_ecn(peer, &buf[..len], outer_ecn) {
                         Ok(GatewayAction::Send {
                             destination,
                             datagram,
                         }) => {
-                            socket.send_to(&datagram, destination)?;
+                            socket.send_to(&datagram, destination, EcnCodepoint::NotEct)?;
                             metrics.counters_mut().control_responses_sent_total += 1;
                             metrics.counters_mut().control_response_bytes_sent_total +=
                                 datagram.len() as u64;
@@ -398,6 +505,7 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                                 socket.send_to(
                                     &previous_teardown.datagram,
                                     previous_teardown.destination,
+                                    EcnCodepoint::NotEct,
                                 )?;
                                 metrics.counters_mut().gateway_teardowns_sent_total += 1;
                             }
@@ -430,10 +538,21 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                             query_cycle_started = None;
                             last_membership_refresh = Some(Instant::now());
                         }
-                        Ok(GatewayAction::MulticastData { packet }) => {
+                        Ok(GatewayAction::MulticastData { packet, ecn }) => {
                             metrics.counters_mut().multicast_data_received_total += 1;
                             metrics.counters_mut().multicast_data_bytes_received_total +=
                                 packet.len() as u64;
+                            if let Some(ecn) = ecn {
+                                if ecn.outer == EcnCodepoint::Ce {
+                                    metrics.counters_mut().gateway_ecn_ce_received_total += 1;
+                                }
+                                if ecn.propagated_ce() {
+                                    metrics.counters_mut().gateway_ecn_ce_propagated_total += 1;
+                                }
+                                if ecn.currently_unused {
+                                    metrics.counters_mut().gateway_ecn_currently_unused_total += 1;
+                                }
+                            }
                             data_log.record_amt_packet(packet.len());
                             if let Some(downstream) = downstream.as_mut() {
                                 match downstream.forward_ip_datagram(&packet) {
@@ -457,6 +576,18 @@ pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
                                     }
                                 }
                             }
+                        }
+                        Ok(GatewayAction::DroppedEcn { ecn, packet_len }) => {
+                            metrics.counters_mut().multicast_data_received_total += 1;
+                            metrics.counters_mut().multicast_data_bytes_received_total +=
+                                packet_len as u64;
+                            if ecn.outer == EcnCodepoint::Ce {
+                                metrics.counters_mut().gateway_ecn_ce_received_total += 1;
+                            }
+                            if ecn.currently_unused {
+                                metrics.counters_mut().gateway_ecn_currently_unused_total += 1;
+                            }
+                            metrics.counters_mut().gateway_ecn_invalid_drops_total += 1;
                         }
                         Ok(GatewayAction::Ignored) => {
                             metrics.counters_mut().control_datagrams_ignored_total += 1;
@@ -533,6 +664,87 @@ fn effective_refresh_interval_for(configured: Duration, suggested: Duration) -> 
     }
 }
 
+#[cfg(feature = "driad")]
+#[derive(Debug)]
+struct DriadRefreshState {
+    config: GatewayDriadConfig,
+    next_refresh: Instant,
+    pending: Option<Receiver<Result<Vec<DriadRelaySelection>, DriadError>>>,
+    retry_attempt: u32,
+}
+
+#[cfg(feature = "driad")]
+impl DriadRefreshState {
+    fn new(config: GatewayDriadConfig) -> Self {
+        let next_refresh = Instant::now() + clamp_driad_refresh(config.initial_ttl);
+        Self {
+            config,
+            next_refresh,
+            pending: None,
+            retry_attempt: 0,
+        }
+    }
+
+    fn source(&self) -> IpAddr {
+        self.config.source
+    }
+
+    fn poll(&mut self) -> DriadPoll {
+        if let Some(pending) = self.pending.as_ref() {
+            match pending.try_recv() {
+                Ok(result) => {
+                    self.pending = None;
+                    return DriadPoll::Resolved(result);
+                }
+                Err(TryRecvError::Empty) => return DriadPoll::Idle,
+                Err(TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    return DriadPoll::Resolved(Err(DriadError::Io(
+                        "DRIAD resolver worker stopped without a result".to_string(),
+                    )));
+                }
+            }
+        }
+        if Instant::now() < self.next_refresh {
+            return DriadPoll::Idle;
+        }
+
+        let resolver = self.config.resolver.clone();
+        let source = self.config.source;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = resolver.resolve_source_candidates(source);
+            let _ = sender.send(result);
+        });
+        self.pending = Some(receiver);
+        DriadPoll::Started
+    }
+
+    fn schedule_success(&mut self, ttl: Duration) {
+        self.retry_attempt = 0;
+        self.next_refresh = Instant::now() + clamp_driad_refresh(ttl);
+    }
+
+    fn schedule_failure(&mut self) {
+        let upper = GatewayRetry::upper_delay(self.retry_attempt);
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+        self.next_refresh = Instant::now() + randomized_retry_delay(upper);
+    }
+}
+
+#[cfg(feature = "driad")]
+#[derive(Debug)]
+enum DriadPoll {
+    Idle,
+    Started,
+    Resolved(Result<Vec<DriadRelaySelection>, DriadError>),
+}
+
+#[cfg(feature = "driad")]
+fn clamp_driad_refresh(ttl: Duration) -> Duration {
+    ttl.clamp(DRIAD_MIN_REFRESH_INTERVAL, DRIAD_MAX_REFRESH_INTERVAL)
+}
+
 #[derive(Debug)]
 struct GatewayRetry {
     attempt: u32,
@@ -604,7 +816,7 @@ impl ShutdownSignal {
 }
 
 fn shutdown_gateway(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     gateway: &Gateway,
     metrics: &mut MetricsRecorder,
 ) -> io::Result<()> {
@@ -623,7 +835,7 @@ fn shutdown_gateway(
 }
 
 fn send_desired_membership(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     gateway: &mut Gateway,
     joins: &[GatewayJoin],
     local: Option<&mut LocalMembershipManager>,
@@ -647,7 +859,7 @@ fn send_desired_membership(
 }
 
 fn drain_local_membership(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     gateway: &mut Gateway,
     local: &mut LocalMembershipManager,
     joins: &[GatewayJoin],
@@ -690,7 +902,7 @@ fn drain_local_membership(
 }
 
 fn refresh_gateway_memberships(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     gateway: &mut Gateway,
     joins: &[GatewayJoin],
     local: Option<&mut LocalMembershipManager>,
@@ -778,13 +990,13 @@ fn send_local_membership_query(
     Ok(())
 }
 
-fn send_gateway_action(socket: &UdpSocket, action: GatewayAction) -> io::Result<()> {
+fn send_gateway_action(socket: &AmtUdpSocket, action: GatewayAction) -> io::Result<()> {
     if let GatewayAction::Send {
         destination,
         datagram,
     } = action
     {
-        socket.send_to(&datagram, destination)?;
+        socket.send_to(&datagram, destination, EcnCodepoint::NotEct)?;
     }
 
     Ok(())
@@ -937,7 +1149,7 @@ fn prune_stale_gateways(
 }
 
 struct RelayControlPlane<'a> {
-    socket: &'a UdpSocket,
+    socket: &'a AmtUdpSocket,
     relay: &'a mut Relay,
     upstream: &'a mut UpstreamManager,
     gateway_activity: &'a mut GatewayActivity,
@@ -978,14 +1190,16 @@ fn handle_amt_datagram(
             }
 
             match action {
-                RelayAction::Send(response) => match socket.send_to(&response, peer) {
-                    Ok(_) => {
-                        metrics.counters_mut().control_responses_sent_total += 1;
-                        metrics.counters_mut().control_response_bytes_sent_total +=
-                            response.len() as u64;
+                RelayAction::Send(response) => {
+                    match socket.send_to(&response, peer, EcnCodepoint::NotEct) {
+                        Ok(_) => {
+                            metrics.counters_mut().control_responses_sent_total += 1;
+                            metrics.counters_mut().control_response_bytes_sent_total +=
+                                response.len() as u64;
+                        }
+                        Err(_) => metrics.counters_mut().send_errors_total += 1,
                     }
-                    Err(_) => metrics.counters_mut().send_errors_total += 1,
-                },
+                }
                 RelayAction::AcceptedMembershipUpdate {
                     records_applied, ..
                 } => {
@@ -1054,7 +1268,7 @@ fn sync_upstream(
 }
 
 fn drain_upstream(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     relay: &Relay,
     upstream: &mut UpstreamManager,
     path_mtu: usize,
@@ -1098,7 +1312,13 @@ fn drain_upstream(
         for endpoint in endpoints {
             let tunnel_mtu = tunnel_mtu(path_mtu, endpoint);
             if inner_packet.len() <= tunnel_mtu {
-                if send_tunnel_datagram(socket, &response, endpoint, metrics, data_log) {
+                let (ecn, normal_mode) = tunnel_ecn(relay, endpoint, inner_packet);
+                if send_tunnel_datagram(socket, &response, endpoint, ecn, metrics, data_log) {
+                    if normal_mode {
+                        metrics
+                            .counters_mut()
+                            .relay_ecn_normal_mode_datagrams_sent_total += 1;
+                    }
                     successful_endpoints += 1;
                     successful_bytes += inner_packet.len() as u64;
                 }
@@ -1119,7 +1339,13 @@ fn drain_upstream(
 
             let mut complete = true;
             for fragment in fragments {
-                if send_tunnel_datagram(socket, fragment, endpoint, metrics, data_log) {
+                let (ecn, normal_mode) = tunnel_ecn(relay, endpoint, &fragment[2..]);
+                if send_tunnel_datagram(socket, fragment, endpoint, ecn, metrics, data_log) {
+                    if normal_mode {
+                        metrics
+                            .counters_mut()
+                            .relay_ecn_normal_mode_datagrams_sent_total += 1;
+                    }
                     metrics.counters_mut().upstream_fragments_sent_total += 1;
                     successful_bytes += fragment.len().saturating_sub(2) as u64;
                 } else {
@@ -1193,14 +1419,23 @@ fn tunnel_mtu(path_mtu: usize, endpoint: SocketAddr) -> usize {
     path_mtu.saturating_sub(outer_ip_header + 8 + 2)
 }
 
+fn tunnel_ecn(relay: &Relay, endpoint: SocketAddr, packet: &[u8]) -> (EcnCodepoint, bool) {
+    if relay.gateway_ecn_capable(endpoint) {
+        (ip_ecn(packet).unwrap_or(EcnCodepoint::NotEct), true)
+    } else {
+        (EcnCodepoint::NotEct, false)
+    }
+}
+
 fn send_tunnel_datagram(
-    socket: &UdpSocket,
+    socket: &AmtUdpSocket,
     datagram: &[u8],
     endpoint: SocketAddr,
+    ecn: EcnCodepoint,
     metrics: &mut MetricsRecorder,
     data_log: &mut RelayDataLog,
 ) -> bool {
-    if let Err(error) = socket.send_to(datagram, endpoint) {
+    if let Err(error) = socket.send_to(datagram, endpoint, ecn) {
         metrics.counters_mut().send_errors_total += 1;
         metrics.counters_mut().upstream_forward_errors_total += 1;
         data_log.record_send_error(format!("{endpoint}: {error}"));
@@ -1447,6 +1682,14 @@ fn protocol_name(datagram: &UpstreamDatagram) -> &'static str {
     }
 }
 
+#[cfg(feature = "driad")]
+fn same_address_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
 fn relay_metrics_flags(
     config: &MetricsConfig,
     bind_addr: SocketAddr,
@@ -1481,6 +1724,7 @@ fn relay_metrics_flags(
             flags.insert("upstream_ifindex".to_string(), index.into());
         }
         flags.insert("path_mtu".to_string(), path_mtu.into());
+        flags.insert("ecn_enabled".to_string(), relay.config().ecn.into());
         flags
     }
 }
@@ -1517,6 +1761,7 @@ fn gateway_metrics_flags(
             "protocol".to_string(),
             format!("{:?}", gateway.config().protocol).into(),
         );
+        flags.insert("ecn_enabled".to_string(), gateway.config().ecn.into());
         flags.insert("downstream_enabled".to_string(), downstream_enabled.into());
         flags.insert(
             "transparent_enabled".to_string(),
@@ -1644,5 +1889,22 @@ mod tests {
         assert_eq!(GatewayRetry::upper_delay(3), Duration::from_secs(8));
         assert_eq!(GatewayRetry::upper_delay(7), Duration::from_secs(120));
         assert_eq!(GatewayRetry::upper_delay(20), Duration::from_secs(120));
+    }
+
+    #[cfg(feature = "driad")]
+    #[test]
+    fn driad_refresh_interval_is_bounded() {
+        assert_eq!(
+            clamp_driad_refresh(Duration::ZERO),
+            DRIAD_MIN_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            clamp_driad_refresh(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            clamp_driad_refresh(Duration::from_secs(7 * 24 * 60 * 60)),
+            DRIAD_MAX_REFRESH_INTERVAL
+        );
     }
 }

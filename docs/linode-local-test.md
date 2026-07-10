@@ -169,6 +169,7 @@ amt relay \
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
   --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --ecn \
   --metrics-dir "$HEIMDALL_IMPORT_DIR" \
   --node-id linode-amt-relay
 ```
@@ -180,6 +181,7 @@ For a repository build:
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
   --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --ecn \
   --metrics-dir "$HEIMDALL_IMPORT_DIR" \
   --node-id linode-amt-relay
 ```
@@ -198,6 +200,7 @@ target/release/amt gateway \
   --relay "$LINODE_PUBLIC_IP:2268" \
   --transparent \
   --protocol igmpv3 \
+  --ecn \
   --downstream-interface "$LOCAL_LAN_IP" \
   --metrics-dir "$HEIMDALL_IMPORT_DIR" \
   --node-id local-amt-gateway
@@ -205,6 +208,10 @@ target/release/amt gateway \
 
 The gateway logs an initial local IGMPv3 General Query and then listens for
 local reports to `224.0.0.22`.
+
+The matching `--ecn` flags enable RFC 9601 negotiation and RFC 6040 ECN
+propagation. They are optional for the basic fire test; omit both to test the
+safe compatibility mode instead.
 
 Expected startup lines include:
 

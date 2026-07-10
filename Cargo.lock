@@ -257,12 +257,28 @@ dependencies = [
  "ctrlc",
  "getrandom",
  "hmac",
+ "libc",
  "mcrx-core",
  "mctx-core",
+ "quinn-udp",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "toml",
+ "windows-sys",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "socket2",
+ "windows-sys",
 ]
 
 [[package]]

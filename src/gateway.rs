@@ -1,3 +1,4 @@
+use crate::ecn::{EcnCodepoint, EcnDecapsulation, EcnError, decapsulate_ecn};
 use crate::ip::{IpPacketError, parse_multicast_packet};
 use crate::membership::{
     MembershipBuildError, MembershipRecord, MembershipRecordKind, MembershipReport,
@@ -22,6 +23,7 @@ pub struct GatewayConfig {
     pub relay: SocketAddr,
     pub fallback_relays: Vec<SocketAddr>,
     pub protocol: MembershipProtocol,
+    pub ecn: bool,
     pub discovery_nonce: u32,
     pub request_nonce: u32,
 }
@@ -32,6 +34,7 @@ impl GatewayConfig {
             relay,
             fallback_relays: Vec::new(),
             protocol,
+            ecn: false,
             discovery_nonce: random_nonce(),
             request_nonce: random_nonce(),
         }
@@ -40,6 +43,11 @@ impl GatewayConfig {
     pub const fn with_nonces(mut self, discovery_nonce: u32, request_nonce: u32) -> Self {
         self.discovery_nonce = discovery_nonce;
         self.request_nonce = request_nonce;
+        self
+    }
+
+    pub const fn with_ecn(mut self, enabled: bool) -> Self {
+        self.ecn = enabled;
         self
     }
 
@@ -60,6 +68,7 @@ impl GatewayConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gateway {
     config: GatewayConfig,
+    relay_candidates: Vec<SocketAddr>,
     phase: GatewayPhase,
     relay_endpoint: Option<SocketAddr>,
     session: Option<GatewaySession>,
@@ -83,12 +92,16 @@ struct GatewaySession {
 
 impl Gateway {
     pub fn new(config: GatewayConfig) -> Self {
+        let mut relay_candidates = Vec::with_capacity(1 + config.fallback_relays.len());
+        relay_candidates.push(config.relay);
+        relay_candidates.extend(config.fallback_relays.iter().copied());
         Self {
             config: GatewayConfig {
                 discovery_nonce: nonzero_or_random(config.discovery_nonce),
                 request_nonce: nonzero_or_random(config.request_nonce),
                 ..config
             },
+            relay_candidates,
             phase: GatewayPhase::Discovering,
             relay_endpoint: None,
             session: None,
@@ -143,6 +156,7 @@ impl Gateway {
             datagram: encode(&Message::Request {
                 request_nonce: self.config.request_nonce,
                 protocol: self.config.protocol,
+                ecn_capable: self.config.ecn,
             }),
         })
     }
@@ -160,7 +174,9 @@ impl Gateway {
         if !self.config.fallback_relays.is_empty() {
             let next = self.config.fallback_relays.remove(0);
             let previous = std::mem::replace(&mut self.config.relay, next);
-            self.config.fallback_relays.push(previous);
+            if self.relay_candidates.contains(&previous) {
+                self.config.fallback_relays.push(previous);
+            }
         }
         self.config.discovery_nonce = random_nonce();
         self.config.request_nonce = random_nonce();
@@ -170,10 +186,52 @@ impl Gateway {
         self.discovery()
     }
 
+    /// Replaces the failover set while leaving a healthy active relay in place.
+    ///
+    /// If the current relay is no longer present, it is retired on the next
+    /// discovery restart rather than disrupting an established traffic flow.
+    pub fn replace_relay_candidates(
+        &mut self,
+        relays: impl IntoIterator<Item = SocketAddr>,
+    ) -> bool {
+        let mut candidates = Vec::new();
+        for relay in relays {
+            if same_family(relay.ip(), self.config.relay.ip()) && !candidates.contains(&relay) {
+                candidates.push(relay);
+            }
+        }
+        if candidates.is_empty() || candidates == self.relay_candidates {
+            return false;
+        }
+
+        self.relay_candidates = candidates;
+        self.config.fallback_relays = self
+            .relay_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != self.config.relay)
+            .collect();
+        true
+    }
+
+    pub fn current_relay_is_retired(&self) -> bool {
+        !self.relay_candidates.contains(&self.config.relay)
+    }
+
     pub fn handle_datagram(
         &mut self,
         peer: SocketAddr,
         datagram: &[u8],
+    ) -> Result<GatewayAction, GatewayError> {
+        self.handle_datagram_with_ecn(peer, datagram, EcnCodepoint::NotEct)
+    }
+
+    /// Handles one AMT datagram together with the ECN field from its outer IP header.
+    pub fn handle_datagram_with_ecn(
+        &mut self,
+        peer: SocketAddr,
+        datagram: &[u8],
+        outer_ecn: EcnCodepoint,
     ) -> Result<GatewayAction, GatewayError> {
         let expected_peer = self.relay_endpoint.unwrap_or(self.config.relay);
         if peer != expected_peer {
@@ -212,6 +270,7 @@ impl Gateway {
                     datagram: encode(&Message::Request {
                         request_nonce: self.config.request_nonce,
                         protocol: self.config.protocol,
+                        ecn_capable: self.config.ecn,
                     }),
                 })
             }
@@ -292,9 +351,22 @@ impl Gateway {
                 if !interested {
                     return Ok(GatewayAction::Ignored);
                 }
-                Ok(GatewayAction::MulticastData {
-                    packet: packet.to_vec(),
-                })
+                let mut packet = packet.to_vec();
+                if self.config.ecn {
+                    let ecn = decapsulate_ecn(&mut packet, outer_ecn)?;
+                    if ecn.is_drop() {
+                        return Ok(GatewayAction::DroppedEcn {
+                            ecn,
+                            packet_len: packet.len(),
+                        });
+                    }
+                    Ok(GatewayAction::MulticastData {
+                        packet,
+                        ecn: Some(ecn),
+                    })
+                } else {
+                    Ok(GatewayAction::MulticastData { packet, ecn: None })
+                }
             }
             Message::RelayDiscovery { .. }
             | Message::Request { .. }
@@ -413,6 +485,11 @@ pub enum GatewayAction {
     },
     MulticastData {
         packet: Vec<u8>,
+        ecn: Option<EcnDecapsulation>,
+    },
+    DroppedEcn {
+        ecn: EcnDecapsulation,
+        packet_len: usize,
     },
     Ignored,
 }
@@ -441,6 +518,7 @@ pub enum GatewayError {
     MembershipBuild(MembershipBuildError),
     InvalidGeneralQuery(QueryValidationError),
     InvalidMulticastPacket(IpPacketError),
+    InvalidEcn(EcnError),
     UnexpectedDiscoveryNonce {
         expected: u32,
         actual: u32,
@@ -470,6 +548,7 @@ impl fmt::Display for GatewayError {
             Self::MembershipBuild(error) => write!(f, "{error}"),
             Self::InvalidGeneralQuery(error) => write!(f, "invalid Membership Query: {error}"),
             Self::InvalidMulticastPacket(error) => write!(f, "invalid Multicast Data: {error}"),
+            Self::InvalidEcn(error) => write!(f, "invalid Multicast Data ECN: {error}"),
             Self::UnexpectedDiscoveryNonce { expected, actual } => write!(
                 f,
                 "unexpected Relay Advertisement nonce {actual:#x}; expected {expected:#x}"
@@ -524,6 +603,12 @@ impl From<QueryValidationError> for GatewayError {
 impl From<IpPacketError> for GatewayError {
     fn from(value: IpPacketError) -> Self {
         Self::InvalidMulticastPacket(value)
+    }
+}
+
+impl From<EcnError> for GatewayError {
+    fn from(value: EcnError) -> Self {
+        Self::InvalidEcn(value)
     }
 }
 
@@ -599,6 +684,15 @@ mod tests {
         packet
     }
 
+    fn multicast_packet_with_ecn(source: Ipv4Addr, group: Ipv4Addr, ecn: EcnCodepoint) -> Vec<u8> {
+        let mut packet = multicast_packet(source, group);
+        packet[1] = ecn.bits();
+        packet[10..12].fill(0);
+        let checksum = crate::checksum::checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
     #[test]
     fn discovery_builds_relay_discovery() {
         let relay = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2268));
@@ -652,7 +746,8 @@ mod tests {
             decode(&datagram),
             Ok(Message::Request {
                 request_nonce: 0x0506_0708,
-                protocol: MembershipProtocol::Igmpv3
+                protocol: MembershipProtocol::Igmpv3,
+                ecn_capable: false,
             })
         );
     }
@@ -680,7 +775,30 @@ mod tests {
             decode(&datagram),
             Ok(Message::Request {
                 request_nonce: 0x0506_0708,
-                protocol: MembershipProtocol::Igmpv3
+                protocol: MembershipProtocol::Igmpv3,
+                ecn_capable: false,
+            })
+        );
+    }
+
+    #[test]
+    fn ecn_gateway_sets_request_capability_flag() {
+        let relay = SocketAddr::from(([192, 0, 2, 20], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_ecn(true)
+                .with_nonces(0x0102_0304, 0x0506_0708),
+        );
+        await_query(&mut gateway, relay);
+
+        let (_, datagram) = gateway.request().unwrap().into_send().unwrap();
+
+        assert_eq!(
+            decode(&datagram),
+            Ok(Message::Request {
+                request_nonce: 0x0506_0708,
+                protocol: MembershipProtocol::Igmpv3,
+                ecn_capable: true,
             })
         );
     }
@@ -899,6 +1017,68 @@ mod tests {
     }
 
     #[test]
+    fn ecn_gateway_propagates_outer_ce_into_inner_packet() {
+        let relay = SocketAddr::from(([192, 0, 2, 10], 2268));
+        let source = Ipv4Addr::new(192, 0, 2, 1);
+        let group = Ipv4Addr::new(232, 1, 2, 3);
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_ecn(true)
+                .with_nonces(1, 2),
+        );
+        await_query(&mut gateway, relay);
+        let query = membership_query(ResponseMac::new([1; 6]), 2, None);
+        gateway.handle_datagram(relay, &query).unwrap();
+        gateway
+            .join_group(group.into(), Some(source.into()))
+            .unwrap();
+        let packet = multicast_packet_with_ecn(source, group, EcnCodepoint::Ect0);
+        let data = encode(&Message::MulticastData { packet: &packet });
+
+        let action = gateway
+            .handle_datagram_with_ecn(relay, &data, EcnCodepoint::Ce)
+            .unwrap();
+
+        let GatewayAction::MulticastData { packet, ecn } = action else {
+            panic!("expected forwarded multicast data");
+        };
+        assert_eq!(crate::ecn::ip_ecn(&packet), Ok(EcnCodepoint::Ce));
+        assert!(ecn.unwrap().propagated_ce());
+    }
+
+    #[test]
+    fn ecn_gateway_drops_not_ect_inner_with_outer_ce() {
+        let relay = SocketAddr::from(([192, 0, 2, 10], 2268));
+        let source = Ipv4Addr::new(192, 0, 2, 1);
+        let group = Ipv4Addr::new(232, 1, 2, 3);
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(relay, MembershipProtocol::Igmpv3)
+                .with_ecn(true)
+                .with_nonces(1, 2),
+        );
+        await_query(&mut gateway, relay);
+        let query = membership_query(ResponseMac::new([1; 6]), 2, None);
+        gateway.handle_datagram(relay, &query).unwrap();
+        gateway
+            .join_group(group.into(), Some(source.into()))
+            .unwrap();
+        let packet = multicast_packet_with_ecn(source, group, EcnCodepoint::NotEct);
+        let data = encode(&Message::MulticastData { packet: &packet });
+
+        let action = gateway
+            .handle_datagram_with_ecn(relay, &data, EcnCodepoint::Ce)
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            GatewayAction::DroppedEcn {
+                ecn: EcnDecapsulation { output: None, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_membership_query_without_valid_general_query() {
         let relay = SocketAddr::from(([192, 0, 2, 10], 2268));
         let mut gateway =
@@ -963,5 +1143,23 @@ mod tests {
             .with_fallback_relays([ipv6_fallback, ipv4_fallback]);
 
         assert_eq!(config.fallback_relays, vec![ipv4_fallback]);
+    }
+
+    #[test]
+    fn refreshed_candidates_retire_removed_relay_without_reintroducing_it() {
+        let first = SocketAddr::from(([192, 0, 2, 10], 2268));
+        let second = SocketAddr::from(([192, 0, 2, 11], 2268));
+        let third = SocketAddr::from(([192, 0, 2, 12], 2268));
+        let mut gateway = Gateway::new(
+            GatewayConfig::new(first, MembershipProtocol::Igmpv3).with_fallback_relays([second]),
+        );
+
+        assert!(gateway.replace_relay_candidates([second, third]));
+        assert_eq!(gateway.config().relay, first);
+        assert!(gateway.current_relay_is_retired());
+
+        assert_eq!(gateway.restart_discovery().into_send().unwrap().0, second);
+        assert_eq!(gateway.restart_discovery().into_send().unwrap().0, third);
+        assert_eq!(gateway.restart_discovery().into_send().unwrap().0, second);
     }
 }
