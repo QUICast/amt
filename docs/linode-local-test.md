@@ -259,9 +259,11 @@ Expected gateway and relay logs include these lines:
 ```text
 local membership report from ...
 advertised 1 local membership record(s) to relay
-accepted Igmpv3 membership update (... active gateways)
 upstream subscriptions changed: +1 -0 active=1
 ```
+
+High-volume control and data events are summarized or exposed through metrics
+rather than logged once per packet.
 
 The gateway refreshes its membership state every 60 seconds by default, and the
 relay expires idle gateways after 260 seconds by default. That means a crashed
@@ -269,8 +271,8 @@ gateway should eventually disappear from the relay's active gateway count and
 upstream subscription set.
 
 Stop the gateway with Ctrl-C for a graceful AMT Teardown. The relay should log
-`accepted teardown` and then reconcile upstream subscriptions down if no other
-gateway still needs the group.
+that the gateway disconnected and then reconcile upstream subscriptions down if
+no other gateway still needs the group.
 
 If the relay and gateway connect but these membership lines do not appear, debug
 the local report path first. On the local machine, `tcpdump` should see IGMPv3
@@ -309,8 +311,7 @@ mctx_send 239.1.2.3 5000 "hello over AMT" 1000 1000 \
 
 Expected behavior:
 
-- The Linode relay logs forwarded multicast datagrams.
-- The local gateway logs AMT Multicast Data and downstream forwarding.
+- Relay and gateway metrics/data summaries increase while traffic flows.
 - The local receiver prints the payload.
 
 ## Debugging

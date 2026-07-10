@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "quicast-amt"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ctrlc",
  "getrandom",

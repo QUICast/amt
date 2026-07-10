@@ -21,6 +21,32 @@ pub struct RelayFileConfig {
     pub upstream_interface_index: Option<u32>,
     pub gateway_idle_timeout_secs: Option<u64>,
     pub gateway_prune_interval_secs: Option<u64>,
+    pub secret_rotation_secs: Option<u64>,
+    pub path_mtu: Option<usize>,
+    pub limits: Option<RelayLimitsFileConfig>,
+    pub rate_limit: Option<RateLimitFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayLimitsFileConfig {
+    pub max_endpoints: Option<usize>,
+    pub max_endpoints_per_ip: Option<usize>,
+    pub max_groups_per_endpoint: Option<usize>,
+    pub max_sources_per_group: Option<usize>,
+    pub max_total_endpoint_groups: Option<usize>,
+    pub max_total_sources: Option<usize>,
+    pub max_upstream_subscriptions: Option<usize>,
+    pub max_records_per_report: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitFileConfig {
+    pub per_source_per_second: Option<u32>,
+    pub per_source_burst: Option<u32>,
+    pub global_per_second: Option<u32>,
+    pub global_burst: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -50,6 +76,7 @@ pub struct DriadFileConfig {
     pub resolvers: Option<OneOrMany<String>>,
     pub timeout_ms: Option<u64>,
     pub attempts: Option<usize>,
+    pub allow_insecure_dns: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -76,6 +103,7 @@ pub struct LocalMembershipFileConfig {
     #[serde(alias = "ifindex")]
     pub interface_index: Option<u32>,
     pub query_interval_secs: Option<u64>,
+    pub reporter_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
@@ -86,6 +114,7 @@ pub struct MetricsFileConfig {
     pub node_id: Option<String>,
     #[serde(alias = "sample_interval_ms")]
     pub interval_ms: Option<u64>,
+    pub max_file_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -126,6 +155,14 @@ mod tests {
             upstream_interface = "192.0.2.10"
             upstream_ifindex = 7
             gateway_idle_timeout_secs = 120
+            path_mtu = 1500
+
+            [relay.limits]
+            max_endpoints = 100
+            max_endpoints_per_ip = 25
+
+            [relay.rate_limit]
+            per_source_per_second = 5
 
             [metrics]
             output_dir = "/tmp/heimdall"
@@ -139,6 +176,11 @@ mod tests {
         assert_eq!(relay.bind.unwrap(), "0.0.0.0:2268".parse().unwrap());
         assert_eq!(relay.relay_address.unwrap().into_vec().len(), 2);
         assert_eq!(relay.upstream_interface_index, Some(7));
+        assert_eq!(relay.path_mtu, Some(1500));
+        let limits = relay.limits.unwrap();
+        assert_eq!(limits.max_endpoints, Some(100));
+        assert_eq!(limits.max_endpoints_per_ip, Some(25));
+        assert_eq!(relay.rate_limit.unwrap().per_source_per_second, Some(5));
         assert_eq!(config.metrics.unwrap().interval_ms, Some(500));
     }
 

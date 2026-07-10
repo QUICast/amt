@@ -2,18 +2,19 @@ use crate::membership::{
     MembershipParseError, MembershipRecord, MembershipRecordKind, MembershipReport,
 };
 use crate::protocol::MembershipProtocol;
-use crate::query::{GeneralQueryConfig, build_general_query};
-use crate::state::{FilterMode, GroupInterest, RelayState, UpstreamSubscription};
-use mcrx_core::{
-    McrxError, RawContext, RawPacket, RawSubscriptionConfig, SourceFilter, SubscriptionId,
+use crate::query::{GeneralQueryConfig, build_general_query, encode_query_interval};
+use crate::state::{
+    FilterMode, GroupInterest, RelayLimits, RelayState, StateLimitError, UpstreamSubscription,
 };
+use mcrx_core::{McrxError, RawContext, RawSubscriptionConfig, SourceFilter, SubscriptionId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const IGMPV3_REPORT_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 22);
 const MLDV2_REPORT_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
+const MAX_IRRELEVANT_PACKET_SKIP: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalMembershipConfig {
@@ -21,6 +22,7 @@ pub struct LocalMembershipConfig {
     pub interface: Option<IpAddr>,
     pub interface_index: Option<u32>,
     pub query_interval: Option<Duration>,
+    pub reporter_timeout: Duration,
 }
 
 impl LocalMembershipConfig {
@@ -30,6 +32,7 @@ impl LocalMembershipConfig {
             interface: None,
             interface_index: None,
             query_interval: Some(Duration::from_secs(30)),
+            reporter_timeout: Duration::from_secs(260),
         }
     }
 }
@@ -41,6 +44,8 @@ pub struct LocalMembershipManager {
     subscription_id: SubscriptionId,
     state: RelayState,
     advertised: BTreeMap<IpAddr, GroupInterest>,
+    reporter_last_seen: BTreeMap<IpAddr, Instant>,
+    limits: RelayLimits,
 }
 
 impl LocalMembershipManager {
@@ -55,6 +60,8 @@ impl LocalMembershipManager {
             subscription_id,
             state: RelayState::default(),
             advertised: BTreeMap::new(),
+            reporter_last_seen: BTreeMap::new(),
+            limits: RelayLimits::default(),
         })
     }
 
@@ -71,19 +78,28 @@ impl LocalMembershipManager {
     }
 
     pub fn try_recv(&mut self) -> Result<Option<LocalMembershipEvent>, LocalMembershipError> {
-        while let Some(packet) = self.context.try_recv_any()? {
+        for _ in 0..MAX_IRRELEVANT_PACKET_SKIP {
+            let Some(packet) = self.context.try_recv_any()? else {
+                return Ok(None);
+            };
             let report = crate::membership::parse_membership_report(packet.datagram())?;
             if report.protocol != self.config.protocol {
                 continue;
             }
 
-            let Some(reporter) = reporter_address(&packet) else {
+            let Some(reporter) = parse_datagram_source(packet.datagram()) else {
                 continue;
             };
 
             let records_received = report.records.len();
+            let endpoint = SocketAddr::new(reporter, 0);
             self.state
-                .apply_report(SocketAddr::new(reporter, 0), &report);
+                .apply_report_limited(endpoint, &report, &self.limits)?;
+            if self.state.contains_endpoint(endpoint) {
+                self.reporter_last_seen.insert(reporter, Instant::now());
+            } else {
+                self.reporter_last_seen.remove(&reporter);
+            }
             let active_subscriptions = self.current_subscriptions();
 
             return Ok(Some(LocalMembershipEvent {
@@ -123,6 +139,30 @@ impl LocalMembershipManager {
         self.advertised = self.current_exportable_interests();
     }
 
+    pub fn prune_stale_reporters(&mut self) -> usize {
+        self.prune_stale_reporters_at(Instant::now())
+    }
+
+    fn prune_stale_reporters_at(&mut self, now: Instant) -> usize {
+        if self.config.query_interval.is_none() {
+            return 0;
+        }
+        let stale = self
+            .reporter_last_seen
+            .iter()
+            .filter_map(|(reporter, last_seen)| {
+                now.checked_duration_since(*last_seen)
+                    .is_some_and(|elapsed| elapsed >= self.config.reporter_timeout)
+                    .then_some(*reporter)
+            })
+            .collect::<Vec<_>>();
+        for reporter in &stale {
+            self.reporter_last_seen.remove(reporter);
+            self.state.remove_endpoint(SocketAddr::new(*reporter, 0));
+        }
+        stale.len()
+    }
+
     fn current_subscriptions(&self) -> Vec<UpstreamSubscription> {
         self.state.upstream_subscriptions()
     }
@@ -137,6 +177,9 @@ impl LocalMembershipManager {
 
     fn query_config(&self) -> GeneralQueryConfig {
         let mut config = GeneralQueryConfig::default();
+        if let Some(interval) = self.config.query_interval {
+            config.query_interval_code = encode_query_interval(interval);
+        }
         match (self.config.protocol, self.config.interface) {
             (MembershipProtocol::Igmpv3, Some(IpAddr::V4(interface))) => {
                 config.igmp_source = interface;
@@ -161,11 +204,12 @@ pub struct LocalMembershipEvent {
 pub enum LocalMembershipError {
     Mcrx(McrxError),
     Parse(MembershipParseError),
+    StateLimit(StateLimitError),
 }
 
 impl LocalMembershipError {
     pub const fn is_parse_error(&self) -> bool {
-        matches!(self, Self::Parse(_))
+        matches!(self, Self::Parse(_) | Self::StateLimit(_))
     }
 }
 
@@ -174,6 +218,7 @@ impl fmt::Display for LocalMembershipError {
         match self {
             Self::Mcrx(error) => write!(f, "{error}"),
             Self::Parse(error) => write!(f, "{error}"),
+            Self::StateLimit(error) => write!(f, "{error}"),
         }
     }
 }
@@ -189,6 +234,12 @@ impl From<McrxError> for LocalMembershipError {
 impl From<MembershipParseError> for LocalMembershipError {
     fn from(value: MembershipParseError) -> Self {
         Self::Parse(value)
+    }
+}
+
+impl From<StateLimitError> for LocalMembershipError {
+    fn from(value: StateLimitError) -> Self {
+        Self::StateLimit(value)
     }
 }
 
@@ -212,12 +263,6 @@ fn raw_config_for(config: &LocalMembershipConfig) -> RawSubscriptionConfig {
             .then_some(config.interface_index)
             .flatten(),
     }
-}
-
-fn reporter_address(packet: &RawPacket) -> Option<IpAddr> {
-    packet
-        .source_ip
-        .or_else(|| parse_datagram_source(packet.datagram()))
 }
 
 fn parse_datagram_source(datagram: &[u8]) -> Option<IpAddr> {
@@ -316,6 +361,9 @@ fn filter_exportable_interests(
 }
 
 fn is_amt_exportable_group(group: IpAddr) -> bool {
+    if !crate::ip::is_amt_forwardable_group(group) {
+        return false;
+    }
     match group {
         IpAddr::V4(group) => is_amt_exportable_ipv4_group(group),
         IpAddr::V6(group) => is_amt_exportable_ipv6_group(group),
@@ -323,19 +371,12 @@ fn is_amt_exportable_group(group: IpAddr) -> bool {
 }
 
 fn is_amt_exportable_ipv4_group(group: Ipv4Addr) -> bool {
-    if !group.is_multicast() {
-        return false;
-    }
-
     let octets = group.octets();
-    !matches!(
-        octets,
-        [224, 0, 0, _] | [239, 255, 255, 250] | [239, 255, 255, 253]
-    )
+    !matches!(octets, [239, 255, 255, 250] | [239, 255, 255, 253])
 }
 
 fn is_amt_exportable_ipv6_group(group: Ipv6Addr) -> bool {
-    group.is_multicast() && group.segments()[0] & 0x000f != 0x0002
+    group.is_multicast()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +480,8 @@ mod tests {
             subscription_id: SubscriptionId(0),
             state: RelayState::default(),
             advertised: BTreeMap::new(),
+            reporter_last_seen: BTreeMap::new(),
+            limits: RelayLimits::default(),
         };
 
         manager.state.apply_report(
@@ -501,6 +544,8 @@ mod tests {
             subscription_id: SubscriptionId(0),
             state: RelayState::default(),
             advertised: BTreeMap::new(),
+            reporter_last_seen: BTreeMap::new(),
+            limits: RelayLimits::default(),
         };
 
         manager.state.apply_report(
@@ -534,6 +579,8 @@ mod tests {
             subscription_id: SubscriptionId(0),
             state: RelayState::default(),
             advertised: BTreeMap::from([(group, GroupInterest::exclude([]))]),
+            reporter_last_seen: BTreeMap::new(),
+            limits: RelayLimits::default(),
         };
 
         manager.state.apply_report(
@@ -553,6 +600,75 @@ mod tests {
                 Vec::new()
             )]))
         );
+    }
+
+    #[test]
+    fn stale_local_reporters_are_removed() {
+        let reporter = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let start = Instant::now();
+        let mut config = LocalMembershipConfig::new(MembershipProtocol::Igmpv3);
+        config.reporter_timeout = Duration::from_secs(10);
+        let mut manager = LocalMembershipManager {
+            config,
+            context: RawContext::new(),
+            subscription_id: SubscriptionId(0),
+            state: RelayState::default(),
+            advertised: BTreeMap::new(),
+            reporter_last_seen: BTreeMap::from([(reporter, start)]),
+            limits: RelayLimits::default(),
+        };
+        manager.state.apply_report(
+            SocketAddr::new(reporter, 0),
+            &report(vec![record(
+                MembershipRecordKind::ModeIsExclude,
+                group,
+                Vec::new(),
+            )]),
+        );
+
+        assert_eq!(
+            manager.prune_stale_reporters_at(start + Duration::from_secs(9)),
+            0
+        );
+        assert_eq!(
+            manager.prune_stale_reporters_at(start + Duration::from_secs(10)),
+            1
+        );
+        assert!(manager.current_report().is_none());
+    }
+
+    #[test]
+    fn disabled_queries_disable_reporter_aging() {
+        let reporter = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let start = Instant::now();
+        let mut config = LocalMembershipConfig::new(MembershipProtocol::Igmpv3);
+        config.query_interval = None;
+        config.reporter_timeout = Duration::from_secs(1);
+        let mut manager = LocalMembershipManager {
+            config,
+            context: RawContext::new(),
+            subscription_id: SubscriptionId(0),
+            state: RelayState::default(),
+            advertised: BTreeMap::new(),
+            reporter_last_seen: BTreeMap::from([(reporter, start)]),
+            limits: RelayLimits::default(),
+        };
+        manager.state.apply_report(
+            SocketAddr::new(reporter, 0),
+            &report(vec![record(
+                MembershipRecordKind::ModeIsExclude,
+                group,
+                Vec::new(),
+            )]),
+        );
+
+        assert_eq!(
+            manager.prune_stale_reporters_at(start + Duration::from_secs(60)),
+            0
+        );
+        assert!(manager.current_report().is_some());
     }
 
     #[test]

@@ -1,14 +1,16 @@
-use crate::membership::{MembershipParseError, parse_membership_report};
+use crate::membership::{
+    MembershipParseError, MembershipParseLimits, parse_membership_report_with_limits,
+};
 use crate::protocol::{
     DecodeError, GatewayAddress, GatewayEndpoint, MembershipProtocol, Message, ResponseMac, encode,
 };
-use crate::query::{GeneralQueryConfig, build_general_query};
-use crate::state::{RelayState, UpstreamSubscription};
+use crate::query::{GeneralQueryConfig, build_general_query, query_interval};
+use crate::state::{RelayLimits, RelayState, StateLimitError, UpstreamSubscription};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -21,19 +23,14 @@ impl RelaySecret {
     }
 
     pub fn generate() -> Self {
-        let mut bytes = [0; 32];
-        if getrandom::fill(&mut bytes).is_ok() {
-            return Self(bytes);
-        }
+        Self::try_generate()
+            .expect("operating-system randomness is required for AMT authentication")
+    }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = u128::from(std::process::id());
-        bytes[..16].copy_from_slice(&now.to_be_bytes());
-        bytes[16..].copy_from_slice(&(now.rotate_left(17) ^ pid).to_be_bytes());
-        Self(bytes)
+    pub fn try_generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
     }
 
     pub const fn expose_bytes(&self) -> &[u8; 32] {
@@ -61,13 +58,17 @@ pub struct RelayConfig {
     pub secret: RelaySecret,
     pub include_gateway_address: bool,
     pub limit: bool,
+    pub limits: RelayLimits,
+    pub secret_rotation_interval: Option<Duration>,
     pub general_query: GeneralQueryConfig,
 }
 
 impl RelayConfig {
     pub fn for_bind(bind: SocketAddr) -> Self {
-        let mut config = Self::default();
-        config.bind = bind;
+        let mut config = Self {
+            bind,
+            ..Self::default()
+        };
         match bind.ip() {
             IpAddr::V4(addr) if !addr.is_unspecified() => config.advertise_ipv4 = addr,
             IpAddr::V6(addr) if !addr.is_unspecified() => config.advertise_ipv6 = addr,
@@ -101,6 +102,8 @@ impl Default for RelayConfig {
             secret: RelaySecret::default(),
             include_gateway_address: true,
             limit: false,
+            limits: RelayLimits::default(),
+            secret_rotation_interval: Some(Duration::from_secs(2 * 60 * 60)),
             general_query: GeneralQueryConfig::default(),
         }
     }
@@ -110,6 +113,14 @@ impl Default for RelayConfig {
 pub struct Relay {
     config: RelayConfig,
     state: RelayState,
+    previous_secret: Option<PreviousSecret>,
+    secret_rotated_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviousSecret {
+    secret: RelaySecret,
+    rotated_at: Instant,
 }
 
 impl Relay {
@@ -117,6 +128,8 @@ impl Relay {
         Self {
             config,
             state: RelayState::default(),
+            previous_secret: None,
+            secret_rotated_at: Instant::now(),
         }
     }
 
@@ -137,19 +150,38 @@ impl Relay {
         peer: SocketAddr,
         datagram: &[u8],
     ) -> Result<RelayAction, RelayError> {
+        let (action, next_state) = self.prepare_datagram(peer, datagram)?;
+        if let Some(next_state) = next_state {
+            self.state = next_state;
+        }
+        Ok(action)
+    }
+
+    pub fn prepare_datagram(
+        &mut self,
+        peer: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<(RelayAction, Option<RelayState>), RelayError> {
+        self.rotate_secret_if_due();
         let message = Message::decode(datagram)?;
         match message {
             Message::RelayDiscovery { discovery_nonce } => {
+                if discovery_nonce == 0 {
+                    return Err(RelayError::ZeroNonce);
+                }
                 let response = Message::RelayAdvertisement {
                     discovery_nonce,
                     relay_address: self.config.advertised_addr_for(peer),
                 };
-                Ok(RelayAction::Send(encode(&response)))
+                Ok((RelayAction::Send(encode(&response)), None))
             }
             Message::Request {
                 request_nonce,
                 protocol,
             } => {
+                if request_nonce == 0 {
+                    return Err(RelayError::ZeroNonce);
+                }
                 let response_mac = self.response_mac(peer.ip(), peer.port(), request_nonce);
                 let general_query = build_general_query(protocol, &self.config.general_query);
                 let gateway = self.config.include_gateway_address.then(|| {
@@ -158,30 +190,68 @@ impl Relay {
                 let response = Message::MembershipQuery {
                     response_mac,
                     request_nonce,
-                    limit: self.config.limit,
+                    limit: self.refusing_new_endpoint(peer.ip()),
                     gateway,
                     general_query: &general_query,
                 };
-                Ok(RelayAction::Send(encode(&response)))
+                Ok((RelayAction::Send(encode(&response)), None))
             }
             Message::MembershipUpdate {
                 response_mac,
                 request_nonce,
                 membership_update,
             } => {
-                let expected = self.response_mac(peer.ip(), peer.port(), request_nonce);
-                if response_mac == expected {
-                    let report = parse_membership_report(membership_update)?;
-                    let records_applied = self.state.apply_report(peer, &report);
-                    let upstream_subscriptions = self.state.upstream_subscriptions();
-                    Ok(RelayAction::AcceptedMembershipUpdate {
-                        protocol: report.protocol,
-                        bytes: membership_update.len(),
-                        records_applied,
-                        upstream_subscriptions,
-                    })
+                if request_nonce == 0 {
+                    return Err(RelayError::ZeroNonce);
+                }
+                if self.valid_response_mac(response_mac, peer.ip(), peer.port(), request_nonce) {
+                    if !self.state.contains_endpoint(peer) && self.refusing_new_endpoint(peer.ip())
+                    {
+                        return Ok((RelayAction::Ignored, None));
+                    }
+                    let report = parse_membership_report_with_limits(
+                        membership_update,
+                        MembershipParseLimits {
+                            max_records: self.config.limits.max_records_per_report,
+                            max_sources_per_record: self.config.limits.max_sources_per_group,
+                        },
+                    )?;
+                    if let Some(group) = report
+                        .records
+                        .iter()
+                        .map(|record| record.group)
+                        .find(|group| !crate::ip::is_amt_forwardable_group(*group))
+                    {
+                        return Err(RelayError::Membership(
+                            MembershipParseError::InvalidMulticastGroup(group),
+                        ));
+                    }
+                    let (records_applied, changed) = self.state.preview_report(peer, &report);
+                    if !changed {
+                        return Ok((
+                            RelayAction::AcceptedMembershipUpdate {
+                                protocol: report.protocol,
+                                bytes: membership_update.len(),
+                                records_applied,
+                                upstream_subscriptions: self.state.upstream_subscriptions(),
+                            },
+                            None,
+                        ));
+                    }
+                    let mut next_state = self.state.clone();
+                    next_state.apply_report_limited(peer, &report, &self.config.limits)?;
+                    let upstream_subscriptions = next_state.upstream_subscriptions();
+                    Ok((
+                        RelayAction::AcceptedMembershipUpdate {
+                            protocol: report.protocol,
+                            bytes: membership_update.len(),
+                            records_applied,
+                            upstream_subscriptions,
+                        },
+                        Some(next_state),
+                    ))
                 } else {
-                    Ok(RelayAction::RejectedAuth)
+                    Ok((RelayAction::RejectedAuth, None))
                 }
             }
             Message::Teardown {
@@ -189,24 +259,43 @@ impl Relay {
                 request_nonce,
                 gateway,
             } => {
+                if request_nonce == 0 {
+                    return Err(RelayError::ZeroNonce);
+                }
                 let gateway_ip = gateway
                     .address
                     .as_ipv4_compatible()
                     .map(IpAddr::V4)
                     .unwrap_or_else(|| IpAddr::V6(gateway.address.as_ipv6()));
-                let expected = self.response_mac(gateway_ip, gateway.port, request_nonce);
-                if response_mac == expected {
-                    let endpoint = SocketAddr::new(gateway_ip, gateway.port);
-                    let removed = self.state.remove_endpoint(endpoint);
-                    Ok(RelayAction::AcceptedTeardown { gateway, removed })
+                let endpoint = SocketAddr::new(gateway_ip, gateway.port);
+                if self.valid_response_mac(response_mac, gateway_ip, gateway.port, request_nonce) {
+                    if !self.state.contains_endpoint(endpoint) {
+                        return Ok((
+                            RelayAction::AcceptedTeardown {
+                                gateway,
+                                removed: false,
+                            },
+                            None,
+                        ));
+                    }
+                    let mut next_state = self.state.clone();
+                    let removed = next_state.remove_endpoint(endpoint);
+                    Ok((
+                        RelayAction::AcceptedTeardown { gateway, removed },
+                        removed.then_some(next_state),
+                    ))
                 } else {
-                    Ok(RelayAction::RejectedAuth)
+                    Ok((RelayAction::RejectedAuth, None))
                 }
             }
             Message::RelayAdvertisement { .. }
             | Message::MembershipQuery { .. }
-            | Message::MulticastData { .. } => Ok(RelayAction::Ignored),
+            | Message::MulticastData { .. } => Ok((RelayAction::Ignored, None)),
         }
+    }
+
+    pub fn commit_state(&mut self, state: RelayState) {
+        self.state = state;
     }
 
     pub fn response_mac(
@@ -215,16 +304,82 @@ impl Relay {
         gateway_port: u16,
         request_nonce: u32,
     ) -> ResponseMac {
-        let mut mac = HmacSha256::new_from_slice(self.config.secret.expose_bytes())
-            .expect("HMAC accepts any key size");
-        mac.update(&GatewayAddress::from_ip_addr(gateway_ip).octets());
-        mac.update(&gateway_port.to_be_bytes());
-        mac.update(&request_nonce.to_be_bytes());
-        let digest = mac.finalize().into_bytes();
-        ResponseMac::new([
-            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
-        ])
+        response_mac_with_secret(&self.config.secret, gateway_ip, gateway_port, request_nonce)
     }
+
+    fn valid_response_mac(
+        &self,
+        actual: ResponseMac,
+        gateway_ip: IpAddr,
+        gateway_port: u16,
+        request_nonce: u32,
+    ) -> bool {
+        actual.constant_time_eq(self.response_mac(gateway_ip, gateway_port, request_nonce))
+            || self.previous_secret.as_ref().is_some_and(|previous| {
+                if previous.rotated_at.elapsed()
+                    > query_interval(self.config.general_query.query_interval_code) * 2
+                {
+                    return false;
+                }
+                actual.constant_time_eq(response_mac_with_secret(
+                    &previous.secret,
+                    gateway_ip,
+                    gateway_port,
+                    request_nonce,
+                ))
+            })
+    }
+
+    fn refusing_new_endpoint(&self, address: IpAddr) -> bool {
+        self.config.limit
+            || self.state.is_near_limits(&self.config.limits)
+            || self
+                .state
+                .is_ip_near_endpoint_limit(address, self.config.limits.max_endpoints_per_ip)
+    }
+
+    fn rotate_secret_if_due(&mut self) {
+        let Some(interval) = self.config.secret_rotation_interval else {
+            return;
+        };
+        if self.secret_rotated_at.elapsed() < interval {
+            return;
+        }
+        let previous_grace = query_interval(self.config.general_query.query_interval_code) * 2;
+        if self
+            .previous_secret
+            .as_ref()
+            .is_some_and(|previous| previous.rotated_at.elapsed() <= previous_grace)
+        {
+            return;
+        }
+        let Ok(next_secret) = RelaySecret::try_generate() else {
+            return;
+        };
+        let now = Instant::now();
+        self.previous_secret = Some(PreviousSecret {
+            secret: std::mem::replace(&mut self.config.secret, next_secret),
+            rotated_at: now,
+        });
+        self.secret_rotated_at = now;
+    }
+}
+
+fn response_mac_with_secret(
+    secret: &RelaySecret,
+    gateway_ip: IpAddr,
+    gateway_port: u16,
+    request_nonce: u32,
+) -> ResponseMac {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.expose_bytes()).expect("HMAC accepts any key size");
+    mac.update(&GatewayAddress::from_ip_addr(gateway_ip).octets());
+    mac.update(&gateway_port.to_be_bytes());
+    mac.update(&request_nonce.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    ResponseMac::new([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
+    ])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +403,8 @@ pub enum RelayAction {
 pub enum RelayError {
     Decode(DecodeError),
     Membership(MembershipParseError),
+    ResourceLimit(StateLimitError),
+    ZeroNonce,
 }
 
 impl fmt::Display for RelayError {
@@ -255,6 +412,8 @@ impl fmt::Display for RelayError {
         match self {
             Self::Decode(error) => write!(f, "{error}"),
             Self::Membership(error) => write!(f, "{error}"),
+            Self::ResourceLimit(error) => write!(f, "{error}"),
+            Self::ZeroNonce => f.write_str("AMT nonce must not be zero"),
         }
     }
 }
@@ -270,6 +429,12 @@ impl From<DecodeError> for RelayError {
 impl From<MembershipParseError> for RelayError {
     fn from(value: MembershipParseError) -> Self {
         Self::Membership(value)
+    }
+}
+
+impl From<StateLimitError> for RelayError {
+    fn from(value: StateLimitError) -> Self {
+        Self::ResourceLimit(value)
     }
 }
 
@@ -424,6 +589,149 @@ mod tests {
     }
 
     #[test]
+    fn zero_nonce_request_is_rejected_without_reflection() {
+        let mut relay = relay();
+        let request = encode(&Message::Request {
+            request_nonce: 0,
+            protocol: MembershipProtocol::Igmpv3,
+        });
+
+        assert_eq!(
+            relay.handle_datagram(SocketAddr::from(([198, 51, 100, 8], 40_000)), &request),
+            Err(RelayError::ZeroNonce)
+        );
+    }
+
+    #[test]
+    fn resource_limit_rejection_does_not_commit_membership() {
+        let mut relay = relay();
+        relay.config.limits.max_groups_per_endpoint = 1;
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 42;
+        let report = crate::membership::MembershipReport {
+            protocol: MembershipProtocol::Igmpv3,
+            records: vec![
+                crate::membership::MembershipRecord {
+                    kind: crate::membership::MembershipRecordKind::ModeIsExclude,
+                    group: IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)),
+                    sources: Vec::new(),
+                },
+                crate::membership::MembershipRecord {
+                    kind: crate::membership::MembershipRecordKind::ModeIsExclude,
+                    group: IpAddr::V4(Ipv4Addr::new(239, 1, 2, 4)),
+                    sources: Vec::new(),
+                },
+            ],
+        };
+        let packet = crate::membership::build_membership_report(&report).unwrap();
+        let update = encode(&Message::MembershipUpdate {
+            response_mac: relay.response_mac(peer.ip(), peer.port(), nonce),
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+
+        assert!(matches!(
+            relay.handle_datagram(peer, &update),
+            Err(RelayError::ResourceLimit(_))
+        ));
+        assert_eq!(relay.state().endpoint_count(), 0);
+    }
+
+    #[test]
+    fn membership_query_sets_limit_flag_near_capacity() {
+        let mut relay = relay();
+        relay.config.limits.max_endpoints = 1;
+        let endpoint = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        relay.state.apply_report(
+            endpoint,
+            &crate::membership::MembershipReport {
+                protocol: MembershipProtocol::Igmpv3,
+                records: vec![crate::membership::MembershipRecord {
+                    kind: crate::membership::MembershipRecordKind::ModeIsExclude,
+                    group: IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)),
+                    sources: Vec::new(),
+                }],
+            },
+        );
+        let request = encode(&Message::Request {
+            request_nonce: 42,
+            protocol: MembershipProtocol::Igmpv3,
+        });
+
+        let RelayAction::Send(response) = relay
+            .handle_datagram(SocketAddr::from(([198, 51, 100, 9], 40_001)), &request)
+            .unwrap()
+        else {
+            panic!("expected Membership Query response");
+        };
+        assert!(matches!(
+            Message::decode(&response),
+            Ok(Message::MembershipQuery { limit: true, .. })
+        ));
+    }
+
+    #[test]
+    fn limit_flag_causes_new_endpoint_updates_to_be_ignored() {
+        let mut relay = relay();
+        relay.config.limit = true;
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 42;
+        let packet = igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
+        let update = encode(&Message::MembershipUpdate {
+            response_mac: relay.response_mac(peer.ip(), peer.port(), nonce),
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+
+        assert_eq!(
+            relay.handle_datagram(peer, &update),
+            Ok(RelayAction::Ignored)
+        );
+        assert_eq!(relay.state().endpoint_count(), 0);
+    }
+
+    #[test]
+    fn previous_secret_expires_after_two_query_intervals() {
+        let mut relay = relay();
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 42;
+        let previous = RelaySecret::new([3; 32]);
+        let mac = response_mac_with_secret(&previous, peer.ip(), peer.port(), nonce);
+
+        relay.previous_secret = Some(PreviousSecret {
+            secret: previous.clone(),
+            rotated_at: Instant::now(),
+        });
+        assert!(relay.valid_response_mac(mac, peer.ip(), peer.port(), nonce));
+
+        relay.previous_secret = Some(PreviousSecret {
+            secret: previous,
+            rotated_at: Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap(),
+        });
+        assert!(!relay.valid_response_mac(mac, peer.ip(), peer.port(), nonce));
+    }
+
+    #[test]
+    fn secret_rotation_waits_until_the_previous_secret_grace_expires() {
+        let mut relay = relay();
+        relay.config.secret_rotation_interval = Some(Duration::ZERO);
+        relay.secret_rotated_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        relay.previous_secret = Some(PreviousSecret {
+            secret: RelaySecret::new([3; 32]),
+            rotated_at: Instant::now(),
+        });
+        let current = relay.config.secret.clone();
+        let rotated_at = relay.secret_rotated_at;
+
+        relay.rotate_secret_if_due();
+
+        assert_eq!(relay.config.secret, current);
+        assert_eq!(relay.secret_rotated_at, rotated_at);
+    }
+
+    #[test]
     fn malformed_authenticated_membership_update_does_not_create_state() {
         let mut relay = relay();
         let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
@@ -482,6 +790,34 @@ mod tests {
     }
 
     #[test]
+    fn teardown_may_arrive_from_a_changed_nat_endpoint() {
+        let mut relay = relay();
+        let old_peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let new_peer = SocketAddr::from(([198, 51, 100, 8], 40_001));
+        let nonce = 0xaabb_ccdd;
+        let response_mac = relay.response_mac(old_peer.ip(), old_peer.port(), nonce);
+        let packet = igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
+        let update = encode(&Message::MembershipUpdate {
+            response_mac,
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+        relay.handle_datagram(old_peer, &update).unwrap();
+
+        let teardown = encode(&Message::Teardown {
+            response_mac,
+            request_nonce: nonce,
+            gateway: GatewayEndpoint::new(old_peer.port(), old_peer.ip()),
+        });
+
+        assert!(matches!(
+            relay.handle_datagram(new_peer, &teardown),
+            Ok(RelayAction::AcceptedTeardown { removed: true, .. })
+        ));
+        assert_eq!(relay.state().endpoint_count(), 0);
+    }
+
+    #[test]
     fn bad_teardown_mac_does_not_remove_endpoint_state() {
         let mut relay = relay();
         let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
@@ -527,18 +863,19 @@ mod tests {
         payload[10..12].copy_from_slice(&1u16.to_be_bytes());
         payload[12..16].copy_from_slice(&group.octets());
         payload[16..20].copy_from_slice(&source.octets());
-        let igmp_checksum = crate::membership::checksum(&payload);
+        let igmp_checksum = crate::checksum::checksum(&payload);
         payload[2..4].copy_from_slice(&igmp_checksum.to_be_bytes());
 
-        let total_len = 20 + payload.len();
-        let mut packet = vec![0; 20];
-        packet[0] = 0x45;
+        let total_len = 24 + payload.len();
+        let mut packet = vec![0; 24];
+        packet[0] = 0x46;
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         packet[8] = 1;
         packet[9] = 2;
         packet[12..16].copy_from_slice(&Ipv4Addr::new(198, 51, 100, 1).octets());
         packet[16..20].copy_from_slice(&Ipv4Addr::new(224, 0, 0, 22).octets());
-        let ip_checksum = crate::membership::checksum(&packet);
+        packet[20..24].copy_from_slice(&[0x94, 0x04, 0, 0]);
+        let ip_checksum = crate::checksum::checksum(&packet);
         packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
         packet.extend_from_slice(&payload);
         packet

@@ -72,13 +72,6 @@ fn linux_namespace_transparent_asm_forwarding() {
 
     receiver.wait_success(Duration::from_secs(15)).unwrap();
     source.wait_success(Duration::from_secs(8)).unwrap();
-
-    relay
-        .wait_for_log(Duration::from_secs(5), "accepted Igmpv3 membership update")
-        .unwrap();
-    gateway
-        .wait_for_log(Duration::from_secs(5), "forwarded downstream raw multicast")
-        .unwrap();
 }
 
 #[test]
@@ -140,13 +133,6 @@ fn linux_namespace_configured_ssm_forwarding() {
 
     receiver.wait_success(Duration::from_secs(15)).unwrap();
     source.wait_success(Duration::from_secs(8)).unwrap();
-
-    relay
-        .wait_for_log(Duration::from_secs(5), "accepted Igmpv3 membership update")
-        .unwrap();
-    gateway
-        .wait_for_log(Duration::from_secs(5), "forwarded downstream raw multicast")
-        .unwrap();
 }
 
 #[test]
@@ -180,7 +166,7 @@ fn linux_namespace_teardown_prune_and_metrics() {
         )
         .unwrap();
     relay
-        .wait_for_log(Duration::from_secs(5), "accepted Igmpv3 membership update")
+        .wait_for_log(Duration::from_secs(5), "upstream subscriptions changed: +1")
         .unwrap();
     let offset = relay.output().len();
     graceful_gateway.terminate().unwrap();
@@ -188,7 +174,11 @@ fn linux_namespace_teardown_prune_and_metrics() {
         .wait_success(Duration::from_secs(5))
         .unwrap();
     relay
-        .wait_for_log_after(Duration::from_secs(5), offset, "accepted teardown")
+        .wait_for_log_after(
+            Duration::from_secs(5),
+            offset,
+            "disconnected from AMT relay",
+        )
         .unwrap();
     relay
         .wait_for_log_after(Duration::from_secs(5), offset, "active=0")
@@ -216,7 +206,7 @@ fn linux_namespace_teardown_prune_and_metrics() {
         .wait_for_log_after(
             Duration::from_secs(5),
             offset,
-            "accepted Igmpv3 membership update",
+            "upstream subscriptions changed: +1",
         )
         .unwrap();
     let offset = relay.output().len();

@@ -25,6 +25,7 @@ pub struct MetricsConfig {
     pub output_dir: Option<PathBuf>,
     pub node_id: String,
     pub sample_interval: Duration,
+    pub max_file_bytes: Option<u64>,
 }
 
 impl Default for MetricsConfig {
@@ -33,6 +34,7 @@ impl Default for MetricsConfig {
             output_dir: None,
             node_id: "amt".to_string(),
             sample_interval: Duration::from_secs(1),
+            max_file_bytes: Some(64 * 1024 * 1024),
         }
     }
 }
@@ -45,6 +47,21 @@ impl MetricsConfig {
     pub fn is_enabled(&self) -> bool {
         cfg!(feature = "metrics") && self.requested()
     }
+
+    #[cfg(feature = "metrics")]
+    fn validate(&self) -> io::Result<()> {
+        if self.node_id.is_empty()
+            || self.node_id == "."
+            || self.node_id == ".."
+            || self.node_id.contains(['/', '\\', '\0'])
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metrics node_id must be a non-empty path component",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -52,6 +69,8 @@ pub struct AmtMetricsCounters {
     pub control_datagrams_received_total: u64,
     pub control_datagrams_invalid_total: u64,
     pub control_datagrams_ignored_total: u64,
+    pub control_datagrams_rate_limited_total: u64,
+    pub resource_limit_rejections_total: u64,
     pub control_responses_sent_total: u64,
     pub control_response_bytes_sent_total: u64,
     pub send_errors_total: u64,
@@ -62,12 +81,15 @@ pub struct AmtMetricsCounters {
     pub gateways_expired_total: u64,
     pub upstream_subscription_adds_total: u64,
     pub upstream_subscription_removes_total: u64,
+    pub upstream_reconcile_failures_total: u64,
     pub upstream_packets_received_total: u64,
     pub upstream_bytes_received_total: u64,
     pub upstream_packets_forwarded_total: u64,
     pub upstream_bytes_forwarded_total: u64,
     pub upstream_unmatched_packets_total: u64,
     pub upstream_forward_errors_total: u64,
+    pub upstream_mtu_drops_total: u64,
+    pub upstream_fragments_sent_total: u64,
     pub gateway_discoveries_sent_total: u64,
     pub gateway_membership_queries_received_total: u64,
     pub gateway_membership_updates_sent_total: u64,
@@ -97,6 +119,12 @@ impl AmtMetricsCounters {
             control_datagrams_ignored_total: self
                 .control_datagrams_ignored_total
                 .saturating_sub(earlier.control_datagrams_ignored_total),
+            control_datagrams_rate_limited_total: self
+                .control_datagrams_rate_limited_total
+                .saturating_sub(earlier.control_datagrams_rate_limited_total),
+            resource_limit_rejections_total: self
+                .resource_limit_rejections_total
+                .saturating_sub(earlier.resource_limit_rejections_total),
             control_responses_sent_total: self
                 .control_responses_sent_total
                 .saturating_sub(earlier.control_responses_sent_total),
@@ -127,6 +155,9 @@ impl AmtMetricsCounters {
             upstream_subscription_removes_total: self
                 .upstream_subscription_removes_total
                 .saturating_sub(earlier.upstream_subscription_removes_total),
+            upstream_reconcile_failures_total: self
+                .upstream_reconcile_failures_total
+                .saturating_sub(earlier.upstream_reconcile_failures_total),
             upstream_packets_received_total: self
                 .upstream_packets_received_total
                 .saturating_sub(earlier.upstream_packets_received_total),
@@ -145,6 +176,12 @@ impl AmtMetricsCounters {
             upstream_forward_errors_total: self
                 .upstream_forward_errors_total
                 .saturating_sub(earlier.upstream_forward_errors_total),
+            upstream_mtu_drops_total: self
+                .upstream_mtu_drops_total
+                .saturating_sub(earlier.upstream_mtu_drops_total),
+            upstream_fragments_sent_total: self
+                .upstream_fragments_sent_total
+                .saturating_sub(earlier.upstream_fragments_sent_total),
             gateway_discoveries_sent_total: self
                 .gateway_discoveries_sent_total
                 .saturating_sub(earlier.gateway_discoveries_sent_total),
@@ -228,6 +265,7 @@ struct MetricsWriter {
     sample_interval: Duration,
     next_emit_at: Instant,
     previous: Option<MetricsSnapshot>,
+    max_file_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -258,11 +296,14 @@ impl MetricsRecorder {
         file_name: &str,
         flags: MetricsFlags,
     ) -> io::Result<Self> {
+        config.validate()?;
         let writer = if config.is_enabled() {
-            let output_dir = config
-                .output_dir
-                .as_ref()
-                .expect("metrics output_dir exists when metrics are enabled");
+            let Some(output_dir) = config.output_dir.as_ref() else {
+                return Ok(Self {
+                    counters: AmtMetricsCounters::default(),
+                    writer: None,
+                });
+            };
             let path = output_dir.join(&config.node_id).join(file_name);
             let header = header_json(
                 artifact_type,
@@ -271,14 +312,20 @@ impl MetricsRecorder {
                 SystemTime::now(),
                 &flags,
             );
-            ensure_single_header(&path, &header)?;
-            Some(MetricsWriter {
-                path,
-                header,
-                sample_interval: config.sample_interval,
-                next_emit_at: Instant::now() + config.sample_interval,
-                previous: None,
-            })
+            match ensure_single_header(&path, &header) {
+                Ok(()) => Some(MetricsWriter {
+                    path,
+                    header,
+                    sample_interval: config.sample_interval,
+                    next_emit_at: Instant::now() + config.sample_interval,
+                    previous: None,
+                    max_file_bytes: config.max_file_bytes,
+                }),
+                Err(error) => {
+                    eprintln!("metrics disabled after output initialization failed: {error}");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -342,14 +389,12 @@ impl MetricsRecorder {
         };
 
         let now = Instant::now();
-        let snapshot = MetricsSnapshot {
-            captured_at: SystemTime::now(),
-            counters: self.counters.clone(),
-            gauges,
-        };
-
         if writer.previous.is_none() {
-            writer.previous = Some(snapshot);
+            writer.previous = Some(MetricsSnapshot {
+                captured_at: SystemTime::now(),
+                counters: self.counters.clone(),
+                gauges,
+            });
             writer.next_emit_at = now + writer.sample_interval;
             return Ok(false);
         }
@@ -358,25 +403,54 @@ impl MetricsRecorder {
             return Ok(false);
         }
 
-        let previous = writer
-            .previous
-            .as_ref()
-            .expect("previous snapshot exists before metrics emission");
+        let snapshot = MetricsSnapshot {
+            captured_at: SystemTime::now(),
+            counters: self.counters.clone(),
+            gauges,
+        };
+
+        let Some(previous) = writer.previous.as_ref() else {
+            return Ok(false);
+        };
         let sample = metrics_sample_json(previous, &snapshot);
-        let result = append_jsonl_sample_row(&writer.path, &writer.header, &sample);
+        let result = rotate_metrics_if_needed(writer)
+            .and_then(|()| append_jsonl_sample_row(&writer.path, &writer.header, &sample));
         writer.previous = Some(snapshot);
         writer.next_emit_at = now + writer.sample_interval;
 
         match result {
             Ok(()) => Ok(true),
             Err(error) => {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    self.writer = None;
-                }
+                self.writer = None;
                 Err(error)
             }
         }
     }
+}
+
+#[cfg(feature = "metrics")]
+fn rotate_metrics_if_needed(writer: &MetricsWriter) -> io::Result<()> {
+    let Some(max_file_bytes) = writer.max_file_bytes else {
+        return Ok(());
+    };
+    if max_file_bytes == 0 {
+        return Ok(());
+    }
+    let Ok(metadata) = std::fs::metadata(&writer.path) else {
+        return Ok(());
+    };
+    if metadata.len() < max_file_bytes {
+        return Ok(());
+    }
+
+    let rotated = writer.path.with_extension("jsonl.1");
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(&writer.path, rotated)?;
+    ensure_single_header(&writer.path, &writer.header)
 }
 
 #[cfg(feature = "metrics")]
@@ -473,6 +547,20 @@ fn extend_counters(
     );
     counter(
         sample,
+        "control_datagrams_rate_limited",
+        total.control_datagrams_rate_limited_total,
+        delta.control_datagrams_rate_limited_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "resource_limit_rejections",
+        total.resource_limit_rejections_total,
+        delta.resource_limit_rejections_total,
+        interval_secs,
+    );
+    counter(
+        sample,
         "control_responses_sent",
         total.control_responses_sent_total,
         delta.control_responses_sent_total,
@@ -543,6 +631,13 @@ fn extend_counters(
     );
     counter(
         sample,
+        "upstream_reconcile_failures",
+        total.upstream_reconcile_failures_total,
+        delta.upstream_reconcile_failures_total,
+        interval_secs,
+    );
+    counter(
+        sample,
         "upstream_packets_received",
         total.upstream_packets_received_total,
         delta.upstream_packets_received_total,
@@ -581,6 +676,20 @@ fn extend_counters(
         "upstream_forward_errors",
         total.upstream_forward_errors_total,
         delta.upstream_forward_errors_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_mtu_drops",
+        total.upstream_mtu_drops_total,
+        delta.upstream_mtu_drops_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_fragments_sent",
+        total.upstream_fragments_sent_total,
+        delta.upstream_fragments_sent_total,
         interval_secs,
     );
     counter(
@@ -752,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_sample_write_advances_next_emit_time() {
+    fn failed_sample_write_disables_metrics() {
         let now = Instant::now();
         let bad_parent = std::env::temp_dir().join(format!(
             "amt_metrics_bad_parent_{}",
@@ -781,6 +890,7 @@ mod tests {
                 sample_interval: Duration::from_secs(60),
                 next_emit_at: now - Duration::from_secs(1),
                 previous: Some(previous),
+                max_file_bytes: None,
             }),
         };
 
@@ -792,20 +902,27 @@ mod tests {
                 })
                 .is_err()
         );
+        assert!(recorder.writer.is_none());
         assert!(
-            recorder
-                .writer
-                .as_ref()
-                .is_some_and(|writer| writer.next_emit_at > now)
-        );
-        assert_eq!(
-            recorder
+            !recorder
                 .maybe_emit_relay(RelayMetricsGauges {
                     active_gateways: 1,
                     active_upstream_subscriptions: 1,
                 })
-                .unwrap(),
-            false
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_node_id_path_traversal() {
+        let config = MetricsConfig {
+            node_id: "../outside".to_string(),
+            ..MetricsConfig::default()
+        };
+
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
         );
     }
 }

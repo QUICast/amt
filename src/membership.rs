@@ -1,3 +1,5 @@
+use crate::checksum::{checksum, icmpv6_checksum, ones_complement_sum};
+use crate::ip::{has_ipv4_router_alert, has_ipv6_router_alert};
 use crate::protocol::MembershipProtocol;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -8,7 +10,6 @@ const IGMP_PROTOCOL: u8 = 2;
 const IPV6_HOP_BY_HOP: u8 = 0;
 const ICMPV6_PROTOCOL: u8 = 58;
 
-const IGMPV1_MEMBERSHIP_REPORT: u8 = 0x12;
 const IGMPV2_MEMBERSHIP_REPORT: u8 = 0x16;
 const IGMPV2_LEAVE_GROUP: u8 = 0x17;
 const IGMPV3_MEMBERSHIP_REPORT: u8 = 0x22;
@@ -18,7 +19,9 @@ const MLDV1_LISTENER_DONE: u8 = 132;
 const MLDV2_LISTENER_REPORT: u8 = 143;
 
 const IGMPV3_REPORT_DESTINATION: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 22);
+const IGMPV2_ALL_ROUTERS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 2);
 const MLDV2_REPORT_DESTINATION: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
+const MLDV1_ALL_ROUTERS: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
 const IPV4_ROUTER_ALERT_HEADER_LEN: usize = 24;
 const IPV6_HOP_BY_HOP_LEN: usize = 8;
 
@@ -33,6 +36,21 @@ pub struct MembershipRecord {
     pub kind: MembershipRecordKind,
     pub group: IpAddr,
     pub sources: Vec<IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipParseLimits {
+    pub max_records: usize,
+    pub max_sources_per_record: usize,
+}
+
+impl Default for MembershipParseLimits {
+    fn default() -> Self {
+        Self {
+            max_records: 512,
+            max_sources_per_record: 128,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +78,27 @@ pub enum MembershipParseError {
         total_length: usize,
         available: usize,
     },
+    InvalidMessageLength {
+        context: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     InvalidProtocol {
         expected: u8,
         actual: u8,
     },
     InvalidChecksum(&'static str),
+    InvalidHopLimit(u8),
+    FragmentedPacket,
+    MissingIpv4RouterAlert,
     MissingIpv6RouterAlert,
+    InvalidDestination(IpAddr),
+    InvalidSourceAddress(IpAddr),
+    ResourceLimit {
+        resource: &'static str,
+        requested: usize,
+        limit: usize,
+    },
     UnsupportedMembershipMessage(u8),
     UnknownRecordType(u8),
     InvalidMulticastGroup(IpAddr),
@@ -105,13 +138,43 @@ impl fmt::Display for MembershipParseError {
                 available,
             } => write!(
                 f,
-                "invalid IP total length {total_length}; only {available} bytes available"
+                "invalid IP total length {total_length}; packet contains {available} bytes"
+            ),
+            Self::InvalidMessageLength {
+                context,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "invalid {context} length: expected {expected} bytes, got {actual}"
             ),
             Self::InvalidProtocol { expected, actual } => {
                 write!(f, "invalid IP protocol {actual}; expected {expected}")
             }
             Self::InvalidChecksum(context) => write!(f, "invalid {context} checksum"),
+            Self::InvalidHopLimit(actual) => {
+                write!(
+                    f,
+                    "invalid membership packet hop limit {actual}; expected 1"
+                )
+            }
+            Self::FragmentedPacket => f.write_str("fragmented membership packet is not supported"),
+            Self::MissingIpv4RouterAlert => write!(f, "missing IPv4 Router Alert option"),
             Self::MissingIpv6RouterAlert => write!(f, "missing IPv6 Router Alert option"),
+            Self::InvalidDestination(destination) => {
+                write!(f, "invalid membership message destination {destination}")
+            }
+            Self::InvalidSourceAddress(source) => {
+                write!(f, "invalid membership source address {source}")
+            }
+            Self::ResourceLimit {
+                resource,
+                requested,
+                limit,
+            } => write!(
+                f,
+                "membership {resource} limit exceeded: requested {requested}, limit {limit}"
+            ),
             Self::UnsupportedMembershipMessage(kind) => {
                 write!(f, "unsupported membership message type {kind}")
             }
@@ -151,6 +214,13 @@ impl fmt::Display for MembershipBuildError {
 impl std::error::Error for MembershipBuildError {}
 
 pub fn parse_membership_report(packet: &[u8]) -> Result<MembershipReport, MembershipParseError> {
+    parse_membership_report_with_limits(packet, MembershipParseLimits::default())
+}
+
+pub fn parse_membership_report_with_limits(
+    packet: &[u8],
+    limits: MembershipParseLimits,
+) -> Result<MembershipReport, MembershipParseError> {
     let first = *packet.first().ok_or(MembershipParseError::Truncated {
         context: "IP packet",
         expected_at_least: 1,
@@ -158,8 +228,8 @@ pub fn parse_membership_report(packet: &[u8]) -> Result<MembershipReport, Member
     })?;
 
     match first >> 4 {
-        4 => parse_ipv4_membership_report(packet),
-        6 => parse_ipv6_membership_report(packet),
+        4 => parse_ipv4_membership_report(packet, limits),
+        6 => parse_ipv6_membership_report(packet, limits),
         version => Err(MembershipParseError::InvalidIpVersion(version)),
     }
 }
@@ -286,7 +356,10 @@ pub fn build_mldv2_membership_report(
     Ok(packet)
 }
 
-fn parse_ipv4_membership_report(packet: &[u8]) -> Result<MembershipReport, MembershipParseError> {
+fn parse_ipv4_membership_report(
+    packet: &[u8],
+    limits: MembershipParseLimits,
+) -> Result<MembershipReport, MembershipParseError> {
     require_len("IPv4 header", packet, IPV4_MIN_HEADER_LEN)?;
 
     let ihl = usize::from(packet[0] & 0x0f) * 4;
@@ -296,7 +369,7 @@ fn parse_ipv4_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
     require_len("IPv4 header", packet, ihl)?;
 
     let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if total_len < ihl || total_len > packet.len() {
+    if total_len < ihl || total_len != packet.len() {
         return Err(MembershipParseError::InvalidTotalLength {
             total_length: total_len,
             available: packet.len(),
@@ -309,6 +382,19 @@ fn parse_ipv4_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
             actual: packet[9],
         });
     }
+    if packet[8] != 1 {
+        return Err(MembershipParseError::InvalidHopLimit(packet[8]));
+    }
+    if u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff != 0 {
+        return Err(MembershipParseError::FragmentedPacket);
+    }
+    let source = read_ipv4(packet, 12);
+    if source.is_multicast() || source.is_broadcast() {
+        return Err(MembershipParseError::InvalidSourceAddress(source.into()));
+    }
+    if ihl == IPV4_MIN_HEADER_LEN || !has_ipv4_router_alert(&packet[IPV4_MIN_HEADER_LEN..ihl]) {
+        return Err(MembershipParseError::MissingIpv4RouterAlert);
+    }
 
     if ones_complement_sum(&packet[..ihl]) != 0xffff {
         return Err(MembershipParseError::InvalidChecksum("IPv4 header"));
@@ -320,20 +406,35 @@ fn parse_ipv4_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
         return Err(MembershipParseError::InvalidChecksum("IGMP"));
     }
 
+    let destination = read_ipv4(packet, 16);
     let records = match igmp[0] {
-        IGMPV1_MEMBERSHIP_REPORT | IGMPV2_MEMBERSHIP_REPORT => {
+        IGMPV2_MEMBERSHIP_REPORT => {
+            require_exact_len("IGMPv2 Membership Report", igmp, 8)?;
+            let group = read_ipv4(igmp, 4);
+            if destination != group {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
             vec![legacy_record(
                 MembershipRecordKind::LegacyReport,
-                IpAddr::V4(read_ipv4(igmp, 4)),
+                IpAddr::V4(group),
             )]
         }
         IGMPV2_LEAVE_GROUP => {
+            require_exact_len("IGMPv2 Leave Group", igmp, 8)?;
+            if destination != IGMPV2_ALL_ROUTERS {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
             vec![legacy_record(
                 MembershipRecordKind::LegacyLeave,
                 IpAddr::V4(read_ipv4(igmp, 4)),
             )]
         }
-        IGMPV3_MEMBERSHIP_REPORT => parse_igmpv3_records(igmp)?,
+        IGMPV3_MEMBERSHIP_REPORT => {
+            if destination != IGMPV3_REPORT_DESTINATION {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
+            parse_igmpv3_records(igmp, limits)?
+        }
         kind => return Err(MembershipParseError::UnsupportedMembershipMessage(kind)),
     };
     validate_records(&records)?;
@@ -344,12 +445,15 @@ fn parse_ipv4_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
     })
 }
 
-fn parse_ipv6_membership_report(packet: &[u8]) -> Result<MembershipReport, MembershipParseError> {
+fn parse_ipv6_membership_report(
+    packet: &[u8],
+    limits: MembershipParseLimits,
+) -> Result<MembershipReport, MembershipParseError> {
     require_len("IPv6 header", packet, IPV6_HEADER_LEN)?;
 
     let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
     let total_len = IPV6_HEADER_LEN + payload_len;
-    if total_len > packet.len() {
+    if total_len != packet.len() {
         return Err(MembershipParseError::InvalidTotalLength {
             total_length: total_len,
             available: packet.len(),
@@ -363,8 +467,13 @@ fn parse_ipv6_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
         });
     }
 
-    let src = read_ipv6(packet, 8).octets();
-    let dst = read_ipv6(packet, 24).octets();
+    let source = read_ipv6(packet, 8);
+    if source.is_multicast() {
+        return Err(MembershipParseError::InvalidSourceAddress(source.into()));
+    }
+    let destination = read_ipv6(packet, 24);
+    let src = source.octets();
+    let dst = destination.octets();
     let mut next_header = packet[6];
     let mut offset = IPV6_HEADER_LEN;
     let mut saw_router_alert = false;
@@ -378,7 +487,7 @@ fn parse_ipv6_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
             &packet[offset..total_len],
             extension_len,
         )?;
-        saw_router_alert = has_router_alert(&packet[offset + 2..offset + extension_len]);
+        saw_router_alert = has_ipv6_router_alert(&packet[offset + 2..offset + extension_len]);
         offset += extension_len;
     }
 
@@ -401,20 +510,32 @@ fn parse_ipv6_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
 
     let records = match icmp[0] {
         MLDV1_LISTENER_REPORT => {
-            require_len("MLDv1 Listener Report", icmp, 24)?;
+            require_exact_len("MLDv1 Listener Report", icmp, 24)?;
+            let group = read_ipv6(icmp, 8);
+            if destination != group {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
             vec![legacy_record(
                 MembershipRecordKind::LegacyReport,
-                IpAddr::V6(read_ipv6(icmp, 8)),
+                IpAddr::V6(group),
             )]
         }
         MLDV1_LISTENER_DONE => {
-            require_len("MLDv1 Listener Done", icmp, 24)?;
+            require_exact_len("MLDv1 Listener Done", icmp, 24)?;
+            if destination != MLDV1_ALL_ROUTERS {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
             vec![legacy_record(
                 MembershipRecordKind::LegacyLeave,
                 IpAddr::V6(read_ipv6(icmp, 8)),
             )]
         }
-        MLDV2_LISTENER_REPORT => parse_mldv2_records(icmp)?,
+        MLDV2_LISTENER_REPORT => {
+            if destination != MLDV2_REPORT_DESTINATION {
+                return Err(MembershipParseError::InvalidDestination(destination.into()));
+            }
+            parse_mldv2_records(icmp, limits)?
+        }
         kind => return Err(MembershipParseError::UnsupportedMembershipMessage(kind)),
     };
     validate_records(&records)?;
@@ -425,9 +546,20 @@ fn parse_ipv6_membership_report(packet: &[u8]) -> Result<MembershipReport, Membe
     })
 }
 
-fn parse_igmpv3_records(igmp: &[u8]) -> Result<Vec<MembershipRecord>, MembershipParseError> {
+fn parse_igmpv3_records(
+    igmp: &[u8],
+    limits: MembershipParseLimits,
+) -> Result<Vec<MembershipRecord>, MembershipParseError> {
     require_len("IGMPv3 Membership Report", igmp, 8)?;
     let count = usize::from(u16::from_be_bytes([igmp[6], igmp[7]]));
+    check_parse_limit("records", count, limits.max_records)?;
+    if count > igmp.len().saturating_sub(8) / 8 {
+        return Err(MembershipParseError::Truncated {
+            context: "IGMPv3 group records",
+            expected_at_least: 8 + count.saturating_mul(8),
+            actual: igmp.len(),
+        });
+    }
     let mut records = Vec::with_capacity(count);
     let mut offset = 8;
 
@@ -436,6 +568,11 @@ fn parse_igmpv3_records(igmp: &[u8]) -> Result<Vec<MembershipRecord>, Membership
         let kind = record_kind(igmp[offset])?;
         let aux_len = usize::from(igmp[offset + 1]) * 4;
         let source_count = usize::from(u16::from_be_bytes([igmp[offset + 2], igmp[offset + 3]]));
+        check_parse_limit(
+            "sources per record",
+            source_count,
+            limits.max_sources_per_record,
+        )?;
         let group = IpAddr::V4(read_ipv4(igmp, offset + 4));
         let sources_offset = offset + 8;
         let record_len = 8 + (source_count * 4) + aux_len;
@@ -454,12 +591,25 @@ fn parse_igmpv3_records(igmp: &[u8]) -> Result<Vec<MembershipRecord>, Membership
         offset += record_len;
     }
 
+    require_exact_len("IGMPv3 Membership Report", igmp, offset)?;
+
     Ok(records)
 }
 
-fn parse_mldv2_records(icmp: &[u8]) -> Result<Vec<MembershipRecord>, MembershipParseError> {
+fn parse_mldv2_records(
+    icmp: &[u8],
+    limits: MembershipParseLimits,
+) -> Result<Vec<MembershipRecord>, MembershipParseError> {
     require_len("MLDv2 Listener Report", icmp, 8)?;
     let count = usize::from(u16::from_be_bytes([icmp[6], icmp[7]]));
+    check_parse_limit("records", count, limits.max_records)?;
+    if count > icmp.len().saturating_sub(8) / 20 {
+        return Err(MembershipParseError::Truncated {
+            context: "MLDv2 multicast address records",
+            expected_at_least: 8 + count.saturating_mul(20),
+            actual: icmp.len(),
+        });
+    }
     let mut records = Vec::with_capacity(count);
     let mut offset = 8;
 
@@ -468,6 +618,11 @@ fn parse_mldv2_records(icmp: &[u8]) -> Result<Vec<MembershipRecord>, MembershipP
         let kind = record_kind(icmp[offset])?;
         let aux_len = usize::from(icmp[offset + 1]) * 4;
         let source_count = usize::from(u16::from_be_bytes([icmp[offset + 2], icmp[offset + 3]]));
+        check_parse_limit(
+            "sources per record",
+            source_count,
+            limits.max_sources_per_record,
+        )?;
         let group = IpAddr::V6(read_ipv6(icmp, offset + 4));
         let sources_offset = offset + 20;
         let record_len = 20 + (source_count * 16) + aux_len;
@@ -489,6 +644,8 @@ fn parse_mldv2_records(icmp: &[u8]) -> Result<Vec<MembershipRecord>, MembershipP
         });
         offset += record_len;
     }
+
+    require_exact_len("MLDv2 Listener Report", icmp, offset)?;
 
     Ok(records)
 }
@@ -520,8 +677,15 @@ fn validate_record(group: IpAddr, sources: &[IpAddr]) -> Result<(), MembershipPa
 
     if sources
         .iter()
-        .any(|source| !same_family(group, *source) || source.is_multicast())
+        .any(|source| !same_family(group, *source) || !is_valid_source(*source))
     {
+        if let Some(source) = sources
+            .iter()
+            .copied()
+            .find(|source| !is_valid_source(*source))
+        {
+            return Err(MembershipParseError::InvalidSourceAddress(source));
+        }
         return Err(MembershipParseError::MixedAddressFamilies);
     }
 
@@ -541,7 +705,7 @@ fn validate_build_records(
 
     for record in records {
         encode_record_kind(record.kind)?;
-        if !record.group.is_multicast() {
+        if !crate::ip::is_amt_forwardable_group(record.group) {
             return Err(MembershipBuildError::InvalidMulticastGroup(record.group));
         }
         match (protocol, record.group) {
@@ -560,7 +724,7 @@ fn validate_build_records(
         if record
             .sources
             .iter()
-            .any(|source| !same_family(record.group, *source) || source.is_multicast())
+            .any(|source| !same_family(record.group, *source) || !is_valid_source(*source))
         {
             return Err(MembershipBuildError::MixedAddressFamilies);
         }
@@ -609,30 +773,29 @@ fn same_family(left: IpAddr, right: IpAddr) -> bool {
     )
 }
 
-fn has_router_alert(options: &[u8]) -> bool {
-    let mut offset = 0;
-    while offset < options.len() {
-        match options[offset] {
-            0 => offset += 1,
-            5 => {
-                if offset + 4 > options.len() {
-                    return false;
-                }
-                if options[offset + 1] == 2 && options[offset + 2] == 0 && options[offset + 3] == 0
-                {
-                    return true;
-                }
-                offset += 2 + usize::from(options[offset + 1]);
-            }
-            _ => {
-                if offset + 2 > options.len() {
-                    return false;
-                }
-                offset += 2 + usize::from(options[offset + 1]);
-            }
+fn is_valid_source(source: IpAddr) -> bool {
+    match source {
+        IpAddr::V4(source) => {
+            !source.is_unspecified() && !source.is_multicast() && !source.is_broadcast()
         }
+        IpAddr::V6(source) => !source.is_unspecified() && !source.is_multicast(),
     }
-    false
+}
+
+fn check_parse_limit(
+    resource: &'static str,
+    requested: usize,
+    limit: usize,
+) -> Result<(), MembershipParseError> {
+    if requested <= limit {
+        Ok(())
+    } else {
+        Err(MembershipParseError::ResourceLimit {
+            resource,
+            requested,
+            limit,
+        })
+    }
 }
 
 fn require_len(
@@ -651,6 +814,22 @@ fn require_len(
     }
 }
 
+fn require_exact_len(
+    context: &'static str,
+    bytes: &[u8],
+    expected: usize,
+) -> Result<(), MembershipParseError> {
+    if bytes.len() == expected {
+        Ok(())
+    } else {
+        Err(MembershipParseError::InvalidMessageLength {
+            context,
+            expected,
+            actual: bytes.len(),
+        })
+    }
+}
+
 fn read_ipv4(bytes: &[u8], offset: usize) -> Ipv4Addr {
     Ipv4Addr::new(
         bytes[offset],
@@ -664,42 +843,6 @@ fn read_ipv6(bytes: &[u8], offset: usize) -> Ipv6Addr {
     let mut octets = [0; 16];
     octets.copy_from_slice(&bytes[offset..offset + 16]);
     Ipv6Addr::from(octets)
-}
-
-pub(crate) fn checksum(bytes: &[u8]) -> u16 {
-    !ones_complement_sum(bytes)
-}
-
-pub(crate) fn ones_complement_sum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if let [high, low] = chunk {
-            u16::from_be_bytes([*high, *low])
-        } else {
-            u16::from_be_bytes([chunk[0], 0])
-        };
-        sum += u32::from(word);
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-
-    sum as u16
-}
-
-pub(crate) fn icmpv6_checksum(
-    src: &[u8; 16],
-    dst: &[u8; 16],
-    next_header: u8,
-    payload: &[u8],
-) -> u16 {
-    let mut pseudo_header = Vec::with_capacity(40 + payload.len());
-    pseudo_header.extend_from_slice(src);
-    pseudo_header.extend_from_slice(dst);
-    pseudo_header.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    pseudo_header.extend_from_slice(&[0, 0, 0, next_header]);
-    pseudo_header.extend_from_slice(payload);
-    checksum(&pseudo_header)
 }
 
 #[cfg(test)]
@@ -768,12 +911,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_global_unicast_mld_report_source() {
+        let mut packet = ipv6_packet(mldv2_report(&[mldv2_record(
+            2,
+            "ff3e::8000:1234".parse().unwrap(),
+            &[],
+        )]));
+        let source = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        packet[8..24].copy_from_slice(&source);
+        let mld = &mut packet[IPV6_HEADER_LEN + IPV6_HOP_BY_HOP_LEN..];
+        mld[2..4].fill(0);
+        let checksum = icmpv6_checksum(
+            &source,
+            &MLDV2_REPORT_DESTINATION.octets(),
+            ICMPV6_PROTOCOL,
+            mld,
+        );
+        mld[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(parse_membership_report(&packet).is_ok());
+    }
+
+    #[test]
     fn rejects_bad_igmp_checksum() {
         let mut packet = ipv4_packet(igmpv2_message(
             IGMPV2_MEMBERSHIP_REPORT,
             Ipv4Addr::new(239, 1, 2, 3),
         ));
-        let offset = IPV4_MIN_HEADER_LEN + 2;
+        let offset = IPV4_ROUTER_ALERT_HEADER_LEN + 2;
         packet[offset] ^= 0xff;
 
         assert_eq!(
@@ -786,7 +951,7 @@ mod tests {
     fn rejects_truncated_igmpv3_record_after_checksum_validation() {
         let packet = ipv4_packet(igmpv3_report(&[]));
         let mut packet = packet;
-        let igmp_offset = IPV4_MIN_HEADER_LEN;
+        let igmp_offset = IPV4_ROUTER_ALERT_HEADER_LEN;
         packet[igmp_offset + 6..igmp_offset + 8].copy_from_slice(&1u16.to_be_bytes());
         packet[igmp_offset + 2..igmp_offset + 4].copy_from_slice(&[0, 0]);
         let checksum = checksum(&packet[igmp_offset..]);
@@ -795,10 +960,69 @@ mod tests {
         assert_eq!(
             parse_membership_report(&packet),
             Err(MembershipParseError::Truncated {
-                context: "IGMPv3 group record",
-                expected_at_least: 8,
-                actual: 0
+                context: "IGMPv3 group records",
+                expected_at_least: 16,
+                actual: 8
             })
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_inside_or_after_a_membership_packet() {
+        let mut packet = ipv4_packet(igmpv3_report(&[]));
+        packet.push(0);
+        assert!(matches!(
+            parse_membership_report(&packet),
+            Err(MembershipParseError::InvalidTotalLength { .. })
+        ));
+
+        let mut payload = igmpv3_report(&[]);
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        payload[2..4].fill(0);
+        let payload_checksum = checksum(&payload);
+        payload[2..4].copy_from_slice(&payload_checksum.to_be_bytes());
+        let packet = ipv4_packet(payload);
+
+        assert_eq!(
+            parse_membership_report(&packet),
+            Err(MembershipParseError::InvalidMessageLength {
+                context: "IGMPv3 Membership Report",
+                expected: 8,
+                actual: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_declared_record_count_before_allocating() {
+        let mut packet = ipv4_packet(igmpv3_report(&[]));
+        let igmp_offset = IPV4_ROUTER_ALERT_HEADER_LEN;
+        packet[igmp_offset + 6..igmp_offset + 8].copy_from_slice(&513u16.to_be_bytes());
+        packet[igmp_offset + 2..igmp_offset + 4].fill(0);
+        let checksum = checksum(&packet[igmp_offset..]);
+        packet[igmp_offset + 2..igmp_offset + 4].copy_from_slice(&checksum.to_be_bytes());
+
+        assert_eq!(
+            parse_membership_report(&packet),
+            Err(MembershipParseError::ResourceLimit {
+                resource: "records",
+                requested: 513,
+                limit: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_fragmented_membership_packet() {
+        let mut packet = ipv4_packet(igmpv3_report(&[]));
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        packet[10..12].fill(0);
+        let checksum = checksum(&packet[..IPV4_ROUTER_ALERT_HEADER_LEN]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        assert_eq!(
+            parse_membership_report(&packet),
+            Err(MembershipParseError::FragmentedPacket)
         );
     }
 
@@ -869,14 +1093,20 @@ mod tests {
     }
 
     pub(crate) fn ipv4_packet(mut payload: Vec<u8>) -> Vec<u8> {
-        let total_len = IPV4_MIN_HEADER_LEN + payload.len();
-        let mut packet = vec![0; IPV4_MIN_HEADER_LEN];
-        packet[0] = 0x45;
+        let total_len = IPV4_ROUTER_ALERT_HEADER_LEN + payload.len();
+        let mut packet = vec![0; IPV4_ROUTER_ALERT_HEADER_LEN];
+        packet[0] = 0x46;
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         packet[8] = 1;
         packet[9] = IGMP_PROTOCOL;
         packet[12..16].copy_from_slice(&Ipv4Addr::new(198, 51, 100, 1).octets());
-        packet[16..20].copy_from_slice(&Ipv4Addr::new(224, 0, 0, 22).octets());
+        let destination = match payload.first().copied() {
+            Some(IGMPV2_MEMBERSHIP_REPORT) => read_ipv4(&payload, 4),
+            Some(IGMPV2_LEAVE_GROUP) => IGMPV2_ALL_ROUTERS,
+            _ => IGMPV3_REPORT_DESTINATION,
+        };
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..24].copy_from_slice(&[0x94, 0x04, 0, 0]);
         let checksum = checksum(&packet);
         packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         packet.append(&mut payload);
@@ -923,8 +1153,13 @@ mod tests {
         packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
         packet[6] = IPV6_HOP_BY_HOP;
         packet[7] = 1;
-        let src = Ipv6Addr::LOCALHOST.octets();
-        let dst = "ff02::16".parse::<Ipv6Addr>().unwrap().octets();
+        let src = "fe80::1".parse::<Ipv6Addr>().unwrap().octets();
+        let destination = match icmp.first().copied() {
+            Some(MLDV1_LISTENER_REPORT) => read_ipv6(&icmp, 8),
+            Some(MLDV1_LISTENER_DONE) => MLDV1_ALL_ROUTERS,
+            _ => MLDV2_REPORT_DESTINATION,
+        };
+        let dst = destination.octets();
         packet[8..24].copy_from_slice(&src);
         packet[24..40].copy_from_slice(&dst);
         packet[40..48].copy_from_slice(&[ICMPV6_PROTOCOL, 0, 5, 2, 0, 0, 1, 0]);

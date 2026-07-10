@@ -1,6 +1,6 @@
 [package]
 name = "quicast-amt"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "Lightweight Automatic Multicast Tunneling (AMT) implementation."
@@ -16,19 +16,32 @@ path = "src/lib.rs"
 [[bin]]
 name = "amt"
 path = "src/main.rs"
+required-features = ["runtime"]
+
+[[test]]
+name = "system_linux"
+path = "tests/system_linux.rs"
+required-features = ["runtime"]
 
 [features]
-default = []
+default = ["runtime"]
+runtime = [
+    "dep:ctrlc",
+    "dep:mcrx-core",
+    "dep:mctx-core",
+    "dep:serde",
+    "dep:toml",
+]
 driad = []
-metrics = ["dep:serde_json", "mcrx-core/metrics"]
+metrics = ["runtime", "dep:serde_json", "mcrx-core/metrics"]
 
 [dependencies]
-ctrlc = { version = "3.5.2", features = ["termination"] }
+ctrlc = { version = "3.5.2", features = ["termination"], optional = true }
 getrandom = "0.3.4"
 hmac = "0.13.0"
-mcrx-core = { version = "0.2.5", features = ["raw-packets"] }
-mctx-core = { version = "0.2.3", features = ["raw-packets"] }
-serde = { version = "1.0.228", features = ["derive"] }
+mcrx-core = { version = "0.2.5", features = ["raw-packets"], optional = true }
+mctx-core = { version = "0.2.3", features = ["raw-packets"], optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.149", optional = true }
 sha2 = "0.11.0"
-toml = "1.1.2"
+toml = { version = "1.1.2", optional = true }

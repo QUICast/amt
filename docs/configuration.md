@@ -14,11 +14,30 @@ relay_address = "203.0.113.10"
 upstream_interface = "192.0.2.10"
 gateway_idle_timeout_secs = 260
 gateway_prune_interval_secs = 5
+secret_rotation_secs = 7200
+path_mtu = 1500
+
+[relay.limits]
+max_endpoints = 4096
+max_endpoints_per_ip = 256
+max_groups_per_endpoint = 128
+max_sources_per_group = 128
+max_total_endpoint_groups = 16384
+max_total_sources = 65536
+max_upstream_subscriptions = 256
+max_records_per_report = 512
+
+[relay.rate_limit]
+per_source_per_second = 10
+per_source_burst = 20
+global_per_second = 1000
+global_burst = 2000
 
 [metrics]
 output_dir = "/var/lib/heimdall/import"
 node_id = "linode-amt-relay"
 interval_ms = 1000
+max_file_bytes = 67108864
 ```
 
 Run it with:
@@ -33,6 +52,30 @@ Multiple advertised addresses can be written as:
 [relay]
 relay_addresses = ["203.0.113.10", "2001:db8::10"]
 ```
+
+Relay limits reject an authenticated update before changing live state. The
+`L` flag is also set in Membership Queries once endpoint or upstream capacity
+reaches 90 percent. Limit and rate values must be non-zero. A
+`secret_rotation_secs` value of `0` disables automatic secret rotation; the
+default retains the current and immediately previous secret during rotation.
+If a shorter rotation interval is configured, the relay delays the next
+rotation until the previous secret's two-query-interval grace period expires.
+The conservative 256-subscription default reflects `mcrx-core 0.2.5` using one
+raw socket per subscription; increase it only after accounting for file
+descriptor and linear polling costs.
+
+`path_mtu` is the fixed downstream AMT path MTU and defaults to 1500 bytes.
+Set it to 1280 for a conservative Internet-path assumption. The relay subtracts
+the outer IP, UDP, and AMT headers to derive the tunnel MTU. It fragments
+oversized IPv4 payloads when DF is clear and drops oversized IPv4 DF, IPv4
+packets with header options, or IPv6 payloads rather than creating outer
+fragments. ICMP Packet Too Big feedback requires raw unicast transmit support
+that `mctx-core` does not currently expose.
+
+The downstream interface belongs to the inner multicast family, not the AMT
+tunnel family. An IGMPv3 gateway therefore requires an IPv4 downstream
+interface and an MLDv2 gateway requires an IPv6 downstream interface, even when
+the relay connection uses the other IP family.
 
 ## Gateway Config
 
@@ -53,12 +96,17 @@ loopback = true
 
 [gateway.local_membership]
 query_interval_secs = 30
+reporter_timeout_secs = 260
 
 [metrics]
 output_dir = "/var/lib/heimdall/import"
 node_id = "local-amt-gateway"
 interval_ms = 1000
 ```
+
+`reporter_timeout_secs` must be at least twice `query_interval_secs` plus 10
+seconds. Setting the query interval to zero disables both General Queries and
+reporter aging.
 
 Configured ASM/SSM joins:
 
@@ -90,7 +138,7 @@ protocol = "igmpv3"
 membership_refresh_interval_secs = 60
 
 [gateway.driad]
-resolver = "192.0.2.53:53"
+resolver = "127.0.0.53:53"
 timeout_ms = 1000
 attempts = 2
 
@@ -104,6 +152,11 @@ Build the binary with `--features driad` to enable DRIAD. In `static` mode,
 the gateway performs DRIAD for the configured SSM source. The current DRIAD
 path intentionally supports one source address per gateway session and does not
 yet perform transparent-mode per-source relay selection.
+
+DRIAD accepts loopback resolvers by default so DNS trust can be supplied by a
+local validating resolver. To use plaintext DNS to a remote resolver, set
+`allow_insecure_dns = true` or pass `--driad-allow-insecure-dns`. This weakens
+relay-selection security and should be limited to trusted networks.
 
 CLI overrides are applied after the file:
 
@@ -133,6 +186,9 @@ If a config requests metrics but the binary was built without `--features
 metrics`, the daemon starts normally and logs that metrics are unavailable in
 that build.
 
+Metrics files rotate at 64 MiB by default, retaining one `.jsonl.1` backup.
+Set `max_file_bytes = 0` to disable rotation.
+
 The header uses Heimdall's canonical JSONL schema:
 
 ```json
@@ -156,7 +212,9 @@ Gateway gauges:
 
 Counter families include:
 
-- AMT control datagrams, invalid datagrams, ignored datagrams, responses, and send errors.
+- AMT control datagrams, invalid/ignored/rate-limited datagrams, responses, and send errors.
+- Relay resource-limit rejections, upstream reconciliation failures, tunnel
+  MTU drops, and generated IPv4 fragments.
 - Relay membership updates, applied records, teardowns, authentication rejections, and gateway expiry.
 - Relay upstream subscription changes, native multicast receive, unmatched packets, forwarded packets, and forward errors.
 - Gateway discovery, membership queries, membership updates, refreshes, and teardown.

@@ -136,7 +136,7 @@ fn gateway_can_refresh_membership_query_after_relay_restart() {
     );
     assert!(restarted_relay.state().upstream_subscriptions().is_empty());
 
-    send_gateway_action(&gateway_socket, gateway.request().unwrap());
+    send_gateway_action(&gateway_socket, gateway.begin_query_cycle().unwrap());
     relay_recv_and_respond(&relay_socket, &mut restarted_relay);
     assert!(matches!(
         gateway_recv(&gateway_socket, &mut gateway),
@@ -224,5 +224,23 @@ fn ipv4_udp_multicast_packet(
     packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
     packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
+    let checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
     packet
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in bytes.chunks(2) {
+        let word = match chunk {
+            [high, low] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            _ => unreachable!(),
+        };
+        sum += u32::from(word);
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    !(sum as u16)
 }

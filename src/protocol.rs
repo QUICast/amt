@@ -70,6 +70,14 @@ impl ResponseMac {
     pub const fn as_bytes(self) -> [u8; RESPONSE_MAC_LEN] {
         self.0
     }
+
+    pub fn constant_time_eq(self, other: Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+    }
 }
 
 /// A 16-byte gateway address field from Membership Query and Teardown messages.
@@ -234,6 +242,8 @@ impl<'a> Message<'a> {
                 protocol,
             } => {
                 out.push(header(MessageType::Request));
+                // RFC 9601 E remains clear: this implementation uses safe
+                // non-ECN compatibility mode.
                 out.push(u8::from(protocol.p_flag()));
                 out.extend_from_slice(&[0, 0]);
                 put_u32(out, *request_nonce);

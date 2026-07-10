@@ -1,11 +1,17 @@
 use amt::AMT_PORT;
-use amt::config::{DriadFileConfig, FileConfig, MetricsFileConfig, load_file_config};
+use amt::config::{
+    DriadFileConfig, FileConfig, MetricsFileConfig, RelayLimitsFileConfig, load_file_config,
+};
 use amt::daemon::{
-    self, DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
-    DEFAULT_MEMBERSHIP_REFRESH_INTERVAL, GatewayDaemonConfig, GatewayJoin, RelayDaemonConfig,
+    self, DEFAULT_CONTROL_RATE_BURST, DEFAULT_CONTROL_RATE_PER_SECOND,
+    DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
+    DEFAULT_GLOBAL_CONTROL_RATE_BURST, DEFAULT_GLOBAL_CONTROL_RATE_PER_SECOND,
+    DEFAULT_MEMBERSHIP_REFRESH_INTERVAL, DEFAULT_RELAY_PATH_MTU, GatewayDaemonConfig, GatewayJoin,
+    RelayDaemonConfig,
 };
 use amt::metrics::MetricsConfig;
 use amt::relay::RelayConfig;
+use amt::state::RelayLimits;
 use amt::{DownstreamConfig, GatewayConfig, LocalMembershipConfig, MembershipProtocol};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -25,6 +31,7 @@ struct GatewayDriadOptions {
     resolvers: Vec<SocketAddr>,
     timeout: Duration,
     attempts: usize,
+    allow_insecure_dns: bool,
 }
 
 impl Default for GatewayDriadOptions {
@@ -33,6 +40,7 @@ impl Default for GatewayDriadOptions {
             resolvers: Vec::new(),
             timeout: Duration::from_secs(2),
             attempts: 2,
+            allow_insecure_dns: false,
         }
     }
 }
@@ -85,9 +93,7 @@ fn parse_relay_config(
         .as_ref()
         .and_then(|config| config.relay.as_ref());
 
-    let mut bind = relay_file
-        .and_then(|config| config.bind)
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], AMT_PORT)));
+    let mut bind = relay_file.and_then(|config| config.bind);
     let mut relay_addresses = relay_file
         .and_then(|config| config.relay_address.clone())
         .map(|addresses| addresses.into_vec())
@@ -107,7 +113,34 @@ fn parse_relay_config(
             Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_GATEWAY_PRUNE_INTERVAL,
         };
+    let mut path_mtu = relay_file
+        .and_then(|config| config.path_mtu)
+        .unwrap_or(DEFAULT_RELAY_PATH_MTU);
+    validate_path_mtu(path_mtu)?;
     let mut metrics = metrics_config_from_file(file_config.as_ref())?;
+    let rate_file = relay_file.and_then(|config| config.rate_limit.as_ref());
+    let control_rate_per_second = rate_file
+        .and_then(|config| config.per_source_per_second)
+        .unwrap_or(DEFAULT_CONTROL_RATE_PER_SECOND);
+    let control_rate_burst = rate_file
+        .and_then(|config| config.per_source_burst)
+        .unwrap_or(DEFAULT_CONTROL_RATE_BURST);
+    let global_control_rate_per_second = rate_file
+        .and_then(|config| config.global_per_second)
+        .unwrap_or(DEFAULT_GLOBAL_CONTROL_RATE_PER_SECOND);
+    let global_control_rate_burst = rate_file
+        .and_then(|config| config.global_burst)
+        .unwrap_or(DEFAULT_GLOBAL_CONTROL_RATE_BURST);
+    if [
+        control_rate_per_second,
+        control_rate_burst,
+        global_control_rate_per_second,
+        global_control_rate_burst,
+    ]
+    .contains(&0)
+    {
+        return Err("relay rate-limit values must all be greater than 0".to_string());
+    }
     let mut args = remaining_args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -116,9 +149,11 @@ fn parse_relay_config(
                 let value = args
                     .next()
                     .ok_or_else(|| "--bind requires an address like 0.0.0.0:2268".to_string())?;
-                bind = value
-                    .parse()
-                    .map_err(|_| format!("invalid --bind address '{value}'"))?;
+                bind = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --bind address '{value}'"))?,
+                );
             }
             "--relay-address" | "--advertise" => {
                 let value = args
@@ -127,6 +162,7 @@ fn parse_relay_config(
                 let addr: IpAddr = value
                     .parse()
                     .map_err(|_| format!("invalid --relay-address '{value}'"))?;
+                validate_relay_address(addr, "--relay-address")?;
                 relay_addresses.push(addr);
             }
             "--upstream-interface" => {
@@ -172,6 +208,15 @@ fn parse_relay_config(
                 }
                 gateway_prune_interval = Duration::from_secs(seconds);
             }
+            "--path-mtu" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--path-mtu requires bytes".to_string())?;
+                path_mtu = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --path-mtu '{value}'"))?;
+                validate_path_mtu(path_mtu)?;
+            }
             "--metrics-dir" => {
                 let value = args
                     .next()
@@ -200,9 +245,27 @@ fn parse_relay_config(
         }
     }
 
+    for address in &relay_addresses {
+        validate_relay_address(*address, "relay.relay_address")?;
+    }
+    let bind = bind.unwrap_or_else(|| {
+        if relay_addresses.iter().any(IpAddr::is_ipv6)
+            && !relay_addresses.iter().any(IpAddr::is_ipv4)
+        {
+            SocketAddr::from(([0u16; 8], AMT_PORT))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], AMT_PORT))
+        }
+    });
     let mut config = RelayConfig::for_bind(bind);
     for addr in relay_addresses {
         config = config.with_advertise_addr(addr);
+    }
+    if let Some(seconds) = relay_file.and_then(|config| config.secret_rotation_secs) {
+        config.secret_rotation_interval = (seconds != 0).then_some(Duration::from_secs(seconds));
+    }
+    if let Some(limits) = relay_file.and_then(|config| config.limits.as_ref()) {
+        apply_relay_limits(&mut config.limits, limits)?;
     }
 
     let mut relay_daemon = RelayDaemonConfig::new(config);
@@ -210,6 +273,11 @@ fn parse_relay_config(
     relay_daemon.upstream.interface_index = upstream_interface_index;
     relay_daemon.gateway_idle_timeout = gateway_idle_timeout;
     relay_daemon.gateway_prune_interval = gateway_prune_interval;
+    relay_daemon.path_mtu = path_mtu;
+    relay_daemon.control_rate_per_second = control_rate_per_second;
+    relay_daemon.control_rate_burst = control_rate_burst;
+    relay_daemon.global_control_rate_per_second = global_control_rate_per_second;
+    relay_daemon.global_control_rate_burst = global_control_rate_burst;
     relay_daemon.metrics = metrics;
 
     Ok(Some(relay_daemon))
@@ -224,9 +292,7 @@ fn parse_gateway_config(
         .as_ref()
         .and_then(|config| config.gateway.as_ref());
 
-    let mut bind = gateway_file
-        .and_then(|config| config.bind)
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let mut bind = gateway_file.and_then(|config| config.bind);
     let mut relay = gateway_file.and_then(|config| config.relay);
     let mut relay_discovery = gateway_file
         .and_then(|config| config.relay_discovery.as_deref())
@@ -291,6 +357,14 @@ fn parse_gateway_config(
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => Some(Duration::from_secs(30)),
     };
+    let mut local_reporter_timeout = Duration::from_secs(
+        local_file
+            .and_then(|config| config.reporter_timeout_secs)
+            .unwrap_or(260),
+    );
+    if local_reporter_timeout.is_zero() {
+        return Err("gateway.local_membership.reporter_timeout_secs must not be 0".to_string());
+    }
     let mut membership_refresh_interval =
         match gateway_file.and_then(|config| config.membership_refresh_interval_secs) {
             Some(0) => None,
@@ -306,9 +380,11 @@ fn parse_gateway_config(
                 let value = args
                     .next()
                     .ok_or_else(|| "--bind requires an address like 0.0.0.0:0".to_string())?;
-                bind = value
-                    .parse()
-                    .map_err(|_| format!("invalid --bind address '{value}'"))?;
+                bind = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --bind address '{value}'"))?,
+                );
             }
             "--relay" => {
                 let value = args.next().ok_or_else(|| {
@@ -356,6 +432,7 @@ fn parse_gateway_config(
                 }
                 driad_options.attempts = attempts;
             }
+            "--driad-allow-insecure-dns" => driad_options.allow_insecure_dns = true,
             "--protocol" => {
                 let value = args
                     .next()
@@ -413,6 +490,18 @@ fn parse_gateway_config(
                     .parse::<u64>()
                     .map_err(|_| format!("invalid --local-query-interval '{value}'"))?;
                 local_query_interval = (seconds != 0).then_some(Duration::from_secs(seconds));
+            }
+            "--local-reporter-timeout" => {
+                let value = args.next().ok_or_else(|| {
+                    "--local-reporter-timeout requires a positive number of seconds".to_string()
+                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --local-reporter-timeout '{value}'"))?;
+                if seconds == 0 {
+                    return Err("--local-reporter-timeout must not be 0".to_string());
+                }
+                local_reporter_timeout = Duration::from_secs(seconds);
             }
             "--membership-refresh-interval" => {
                 let value = args.next().ok_or_else(|| {
@@ -499,22 +588,25 @@ fn parse_gateway_config(
     if source.is_some() && group.is_none() {
         return Err("--source requires --group".to_string());
     }
+    if transparent
+        && let Some(interval) = local_query_interval
+        && local_reporter_timeout
+            < interval
+                .saturating_mul(2)
+                .saturating_add(Duration::from_secs(10))
+    {
+        return Err(
+            "local reporter timeout must be at least (2 * local query interval) + 10 seconds"
+                .to_string(),
+        );
+    }
 
     if let Some(group) = group {
-        if !group.is_multicast() {
-            return Err("--group must be multicast".to_string());
-        }
-        if let Some(source) = source
-            && (!same_family(group, source) || source.is_multicast())
-        {
-            return Err(
-                "--source must be a unicast address in the same family as --group".to_string(),
-            );
-        }
+        validate_gateway_join(group, source)?;
     }
 
     let inferred_group = group.or_else(|| configured_joins.first().map(|join| join.group));
-    let protocol = protocol.unwrap_or_else(|| match inferred_group {
+    let protocol = protocol.unwrap_or(match inferred_group {
         Some(IpAddr::V6(_)) => MembershipProtocol::Mldv2,
         Some(IpAddr::V4(_)) | None => MembershipProtocol::Igmpv3,
     });
@@ -532,6 +624,13 @@ fn parse_gateway_config(
             "--local-membership-interface address family must match --protocol".to_string(),
         );
     }
+    if let Some(interface) = downstream
+        .as_ref()
+        .and_then(|downstream| downstream.interface)
+        && !protocol_matches_address(protocol, interface)
+    {
+        return Err("--downstream-interface address family must match --protocol".to_string());
+    }
     for join in &configured_joins {
         validate_gateway_join(join.group, join.source)?;
         match (protocol, join.group) {
@@ -546,8 +645,25 @@ fn parse_gateway_config(
         joins.push(GatewayJoin { group, source });
     }
 
-    let relay = resolve_gateway_relay(relay, relay_discovery, &joins, &driad_options, transparent)?;
-    let mut config = GatewayDaemonConfig::new(bind, GatewayConfig::new(relay, protocol));
+    let relays =
+        resolve_gateway_relays(relay, relay_discovery, &joins, &driad_options, transparent)?;
+    for relay in &relays {
+        validate_relay_address(relay.ip(), "gateway relay")?;
+        if relay.port() == 0 {
+            return Err("gateway relay port must not be 0".to_string());
+        }
+    }
+    let relay = relays[0];
+    let bind = bind.unwrap_or_else(|| match relay {
+        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+    });
+    if !same_family(bind.ip(), relay.ip()) {
+        return Err("gateway bind and relay must use the same outer address family".to_string());
+    }
+    let gateway =
+        GatewayConfig::new(relay, protocol).with_fallback_relays(relays.into_iter().skip(1));
+    let mut config = GatewayDaemonConfig::new(bind, gateway);
     config.joins = joins;
     config.downstream = downstream;
     config.membership_refresh_interval = membership_refresh_interval;
@@ -567,6 +683,7 @@ fn parse_gateway_config(
                 .and_then(|downstream| downstream.interface_index)
         });
         local.query_interval = local_query_interval;
+        local.reporter_timeout = local_reporter_timeout;
         config.local_membership = Some(local);
     }
     Ok(Some(config))
@@ -632,6 +749,9 @@ fn apply_metrics_file_config(
     if let Some(millis) = config.interval_ms {
         metrics.sample_interval = Duration::from_millis(millis);
     }
+    if let Some(bytes) = config.max_file_bytes {
+        metrics.max_file_bytes = (bytes != 0).then_some(bytes);
+    }
     Ok(())
 }
 
@@ -643,6 +763,42 @@ fn parse_relay_discovery(value: &str) -> Result<GatewayRelayDiscovery, String> {
         _ => Err(format!(
             "invalid relay discovery mode '{value}'; expected static, driad, or auto"
         )),
+    }
+}
+
+fn apply_relay_limits(
+    limits: &mut RelayLimits,
+    configured: &RelayLimitsFileConfig,
+) -> Result<(), String> {
+    macro_rules! apply_limit {
+        ($field:ident) => {
+            if let Some(value) = configured.$field {
+                if value == 0 {
+                    return Err(
+                        concat!("relay.limits.", stringify!($field), " must not be 0").to_string(),
+                    );
+                }
+                limits.$field = value;
+            }
+        };
+    }
+
+    apply_limit!(max_endpoints);
+    apply_limit!(max_endpoints_per_ip);
+    apply_limit!(max_groups_per_endpoint);
+    apply_limit!(max_sources_per_group);
+    apply_limit!(max_total_endpoint_groups);
+    apply_limit!(max_total_sources);
+    apply_limit!(max_upstream_subscriptions);
+    apply_limit!(max_records_per_report);
+    Ok(())
+}
+
+fn validate_path_mtu(path_mtu: usize) -> Result<(), String> {
+    if (1_280..=usize::from(u16::MAX)).contains(&path_mtu) {
+        Ok(())
+    } else {
+        Err("relay path MTU must be between 1280 and 65535 bytes".to_string())
     }
 }
 
@@ -674,6 +830,9 @@ fn driad_options_from_file(
         }
         options.attempts = attempts;
     }
+    if let Some(allow) = config.allow_insecure_dns {
+        options.allow_insecure_dns = allow;
+    }
 
     Ok(options)
 }
@@ -688,30 +847,30 @@ fn parse_driad_resolver(value: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("invalid DRIAD resolver '{value}'; expected IP or IP:PORT"))
 }
 
-fn resolve_gateway_relay(
+fn resolve_gateway_relays(
     relay: Option<SocketAddr>,
     discovery: GatewayRelayDiscovery,
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
-) -> Result<SocketAddr, String> {
+) -> Result<Vec<SocketAddr>, String> {
     match discovery {
-        GatewayRelayDiscovery::Static => {
-            relay.ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string())
-        }
+        GatewayRelayDiscovery::Static => relay
+            .map(|relay| vec![relay])
+            .ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string()),
         GatewayRelayDiscovery::Auto => match relay {
-            Some(relay) => Ok(relay),
-            None => resolve_driad_relay(joins, driad_options, transparent),
+            Some(relay) => Ok(vec![relay]),
+            None => resolve_driad_relays(joins, driad_options, transparent),
         },
-        GatewayRelayDiscovery::Driad => resolve_driad_relay(joins, driad_options, transparent),
+        GatewayRelayDiscovery::Driad => resolve_driad_relays(joins, driad_options, transparent),
     }
 }
 
-fn resolve_driad_relay(
+fn resolve_driad_relays(
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
-) -> Result<SocketAddr, String> {
+) -> Result<Vec<SocketAddr>, String> {
     if transparent {
         return Err(
             "DRIAD transparent membership learning is not implemented yet; use configured SSM --group/--source joins for now"
@@ -731,10 +890,14 @@ fn resolve_driad_relay(
         };
         resolver_config.timeout = driad_options.timeout;
         resolver_config.attempts = driad_options.attempts;
+        resolver_config.allow_insecure_dns = driad_options.allow_insecure_dns;
         let resolver = amt::driad::DriadResolver::new(resolver_config);
-        let selection = resolver.resolve_source(source).map_err(|error| {
-            format!("DRIAD relay discovery failed for source {source}: {error}")
-        })?;
+        let selections = resolver
+            .resolve_source_candidates(source)
+            .map_err(|error| {
+                format!("DRIAD relay discovery failed for source {source}: {error}")
+            })?;
+        let selection = &selections[0];
         println!(
             "DRIAD selected AMT relay {} for source {} using {} (precedence {}, discovery_optional={})",
             selection.relay,
@@ -743,7 +906,10 @@ fn resolve_driad_relay(
             selection.record.precedence,
             selection.record.discovery_optional
         );
-        Ok(selection.relay)
+        Ok(selections
+            .into_iter()
+            .map(|selection| selection.relay)
+            .collect())
     }
 
     #[cfg(not(feature = "driad"))]
@@ -764,6 +930,9 @@ fn driad_source_for_joins(joins: &[GatewayJoin]) -> Result<IpAddr, String> {
     }
 
     for join in joins {
+        if !is_ssm_group(join.group) {
+            return Err("DRIAD requires groups in the IPv4 or IPv6 SSM range".to_string());
+        }
         let Some(source) = join.source else {
             return Err(
                 "DRIAD relay discovery requires all configured joins to be SSM joins with a source"
@@ -783,6 +952,13 @@ fn driad_source_for_joins(joins: &[GatewayJoin]) -> Result<IpAddr, String> {
     }
 
     selected.ok_or_else(|| "DRIAD relay discovery requires an SSM source".to_string())
+}
+
+fn is_ssm_group(group: IpAddr) -> bool {
+    match group {
+        IpAddr::V4(group) => group.octets()[0] == 232,
+        IpAddr::V6(group) => group.segments()[0] & 0xfff0 == 0xff30,
+    }
 }
 
 fn parse_protocol(value: &str) -> Result<MembershipProtocol, String> {
@@ -808,17 +984,34 @@ fn protocol_matches_address(protocol: MembershipProtocol, address: IpAddr) -> bo
 }
 
 fn validate_gateway_join(group: IpAddr, source: Option<IpAddr>) -> Result<(), String> {
-    if !group.is_multicast() {
-        return Err("gateway join group must be multicast".to_string());
+    if !amt::is_amt_forwardable_group(group) {
+        return Err("gateway join group must be non-link-local multicast".to_string());
     }
     if let Some(source) = source
-        && (!same_family(group, source) || source.is_multicast())
+        && (!same_family(group, source) || !is_valid_source(source))
     {
         return Err(
             "gateway join source must be a unicast address in the same family as group".to_string(),
         );
     }
     Ok(())
+}
+
+fn validate_relay_address(address: IpAddr, field: &str) -> Result<(), String> {
+    if is_valid_source(address) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be a unicast address"))
+    }
+}
+
+fn is_valid_source(source: IpAddr) -> bool {
+    match source {
+        IpAddr::V4(source) => {
+            !source.is_unspecified() && !source.is_multicast() && !source.is_broadcast()
+        }
+        IpAddr::V6(source) => !source.is_unspecified() && !source.is_multicast(),
+    }
 }
 
 fn print_usage() {
@@ -830,21 +1023,23 @@ fn usage() -> &'static str {
         "Usage:\n",
         "  amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] ",
         "[--upstream-interface IP] [--upstream-ifindex INDEX] ",
-        "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] ",
+        "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] ",
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n",
         "  amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] ",
         "[--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] ",
         "[--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] ",
+        "[--driad-allow-insecure-dns] ",
         "[--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] ",
         "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
         "[--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] ",
+        "[--local-reporter-timeout SECONDS] ",
         "[--no-downstream-loopback] [--no-downstream] ",
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n\n",
         "Relay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\n",
         "Relay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\n",
         "Gateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\n",
         "Gateway static relay discovery requires --relay; DRIAD discovery requires a configured SSM --source and the driad Cargo feature.\n",
-        "Gateway refreshes memberships every 60 seconds by default; pass --membership-refresh-interval 0 to disable refreshes.\n",
+        "Gateway refreshes memberships every 60 seconds by default; 0 retains the 60-second liveness probe.\n",
         "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
         "Use --metrics-dir to write Heimdall JSONL metrics under DIR/node-id/.\n",
         "Raw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms.",
@@ -868,6 +1063,7 @@ mod tests {
             relay_address = "203.0.113.10"
             upstream_interface = "192.0.2.10"
             gateway_idle_timeout_secs = 120
+            path_mtu = 1500
 
             [metrics]
             output_dir = "/tmp/heimdall"
@@ -891,6 +1087,7 @@ mod tests {
             Some("192.0.2.10".parse().unwrap())
         );
         assert_eq!(config.gateway_idle_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(config.path_mtu, 1500);
         assert_eq!(
             config.metrics.output_dir.as_deref(),
             Some(Path::new("/tmp/heimdall"))
@@ -957,12 +1154,106 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_gateway_infers_ipv6_unspecified_bind() {
+        let config = parse_gateway_config([
+            "--relay".to_string(),
+            "[2001:db8::10]:2268".to_string(),
+            "--group".to_string(),
+            "ff3e::1234".to_string(),
+            "--source".to_string(),
+            "2001:db8::20".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.bind, "[::]:0".parse().unwrap());
+        assert_eq!(config.gateway.protocol, MembershipProtocol::Mldv2);
+    }
+
+    #[test]
+    fn mld_over_ipv4_infers_bind_from_outer_relay_family() {
+        let config = parse_gateway_config([
+            "--relay".to_string(),
+            "203.0.113.10:2268".to_string(),
+            "--group".to_string(),
+            "ff3e::1234".to_string(),
+            "--source".to_string(),
+            "2001:db8::20".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.bind, "0.0.0.0:0".parse().unwrap());
+        assert_eq!(config.gateway.protocol, MembershipProtocol::Mldv2);
+    }
+
+    #[test]
+    fn gateway_rejects_explicit_outer_address_family_mismatch() {
+        let error = parse_gateway_config([
+            "--bind".to_string(),
+            "[::]:0".to_string(),
+            "--relay".to_string(),
+            "203.0.113.10:2268".to_string(),
+            "--group".to_string(),
+            "239.1.2.3".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("same outer address family"));
+    }
+
+    #[test]
+    fn gateway_rejects_downstream_interface_for_wrong_inner_family() {
+        let error = parse_gateway_config([
+            "--relay".to_string(),
+            "203.0.113.10:2268".to_string(),
+            "--group".to_string(),
+            "ff3e::1234".to_string(),
+            "--source".to_string(),
+            "2001:db8::20".to_string(),
+            "--downstream-interface".to_string(),
+            "192.0.2.20".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("downstream-interface address family"));
+    }
+
+    #[test]
+    fn relay_path_mtu_defaults_to_common_ethernet_mtu() {
+        let config = parse_relay_config(std::iter::empty()).unwrap().unwrap();
+
+        assert_eq!(config.path_mtu, 1_500);
+    }
+
+    #[test]
+    fn ipv6_only_relay_address_infers_ipv6_bind() {
+        let config =
+            parse_relay_config(["--relay-address".to_string(), "2001:db8::10".to_string()])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(config.relay.bind, "[::]:2268".parse().unwrap());
+        assert_eq!(
+            config.relay.advertise_ipv6,
+            "2001:db8::10".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
     fn driad_source_selection_rejects_asm_or_multiple_sources() {
         assert!(driad_source_for_joins(&[]).is_err());
         assert!(
             driad_source_for_joins(&[GatewayJoin {
                 group: "239.1.2.3".parse().unwrap(),
                 source: None,
+            }])
+            .is_err()
+        );
+        assert!(
+            driad_source_for_joins(&[GatewayJoin {
+                group: "239.1.2.3".parse().unwrap(),
+                source: Some("192.0.2.10".parse().unwrap()),
             }])
             .is_err()
         );

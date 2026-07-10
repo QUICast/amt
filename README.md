@@ -28,9 +28,10 @@ The crate currently includes:
 
 ## Status
 
-This is still an early implementation. It is useful for protocol development,
-local integration tests, and first network tests, but it is not yet a hardened
-production service.
+This is an early production-oriented implementation. Relay membership changes
+are authenticated and peer-bound, and the public control plane is rate-limited
+and resource-bounded. Deployments should still use firewall source restrictions
+and operational monitoring.
 
 Implemented:
 
@@ -48,6 +49,13 @@ Implemented:
 - Config-file loading with CLI overrides.
 - Role-level daemon metrics counters and gauges written as Heimdall JSONL.
 - Localhost socket-level relay/gateway roundtrip test.
+- Gateway peer/session validation and reception-state filtering for tunneled data.
+- Configurable relay state limits, control-plane rate limits, and rotating
+  authentication secrets.
+- Transactional upstream joins: a failed native join rejects the update without
+  terminating the relay or replacing working state.
+- Fixed-PMTU tunnel filtering with inner IPv4 fragmentation and MTU drop
+  metrics.
 
 Current limitations:
 
@@ -55,6 +63,11 @@ Current limitations:
   small and easy to inspect, not yet optimized.
 - Relay raw upstream receive may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform.
+- `mcrx-core 0.2.5` currently owns one raw capture socket per upstream
+  subscription and polls those sockets linearly. The relay therefore defaults
+  to at most 256 unique upstream subscriptions. Raising that limit is possible,
+  but efficient large-scale relays need shared capture and packet demultiplexing
+  support in `mcrx-core`.
 - Gateway raw downstream transmit may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform. `mctx-core` raw IPv6 transmit is
   not supported on Windows yet.
@@ -65,11 +78,25 @@ Current limitations:
 - Transparent mode filters LAN-local multicast groups from AMT Membership
   Updates, including IPv4 `224.0.0.0/24`, SSDP/SLP discovery groups, and IPv6
   link-local multicast (`ff02::/16`).
-- Transparent mode does not yet age out silent local receivers with full
-  IGMP/MLD listener timers; leave/state-change reports update the learned state.
+- Transparent mode expires silent local reporters after 260 seconds by default.
+  This is deliberately simpler than a complete multicast-router listener state
+  machine.
 - DRIAD is currently limited to explicitly configured SSM joins with one source
   address per gateway session. Transparent-mode DRIAD and multi-source
   multi-relay sessions are planned follow-ups.
+- DRIAD candidates are resolved when the daemon starts; DNS TTL refresh and
+  live relay-set replacement are not implemented yet.
+- One gateway session uses one outer address family. DRIAD failover candidates
+  from the other family are ignored; run a separate gateway instance for
+  independent IPv4 and IPv6 outer tunnels.
+- DRIAD requires a loopback validating resolver by default. Plain DNS to a
+  remote resolver requires an explicit insecure override.
+- The relay does not yet generate ICMPv4 Fragmentation Needed or ICMPv6 Packet
+  Too Big feedback toward oversized SSM sources; that needs a portable raw
+  unicast transmit path in addition to the multicast-only mctx API.
+- RFC 9601 ECN propagation is disabled in safe compatibility mode: Request E
+  bits and outer ECN fields remain zero rather than advertising unsupported ECN
+  decapsulation.
 - AMT metrics use Heimdall's JSONL container format with `amt-relay` and
   `amt-gateway` artifact types. The current local Heimdall tree needs matching
   ingestors before those new artifact types are queryable there.
@@ -78,6 +105,7 @@ Current limitations:
 
 ```bash
 cargo build
+cargo check --no-default-features
 cargo build --features driad
 cargo build --features metrics
 cargo build --features driad,metrics
@@ -85,6 +113,10 @@ cargo test
 cargo run -- --help
 cargo install quicast-amt
 ```
+
+The default `runtime` feature builds the daemon and raw mcrx/mctx integration.
+`--no-default-features` builds only the portable protocol, query, membership,
+gateway, relay, and state-machine core.
 
 The crate depends on crates.io releases:
 
@@ -94,8 +126,8 @@ The crate depends on crates.io releases:
 ## CLI
 
 ```text
-amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
-amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] [--driad-allow-insecure-dns] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--local-reporter-timeout SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
 ```
 
 ### Relay
@@ -113,6 +145,9 @@ cargo run --release --features metrics -- relay \
 
 `--relay-address` is the IP address advertised to gateways. It is important
 when binding to `0.0.0.0`; otherwise the default advertised address is loopback.
+An IPv6-only `--relay-address` infers `[::]:2268`; AMT uses UDP port `2268` for
+both address families. Use explicit binds or separate service instances when
+the operating system's dual-stack socket behavior is unsuitable.
 
 `--upstream-interface` selects the native multicast receive interface for
 `mcrx-core` raw receive.
@@ -121,6 +156,14 @@ The relay daemon prunes idle gateways after 260 seconds by default and checks
 for expired gateways every 5 seconds. Use `--gateway-idle-timeout 0` to disable
 pruning, or tune `--gateway-idle-timeout` and `--gateway-prune-interval` for
 test setups.
+
+The fixed relay path MTU defaults to 1500 bytes and can be changed with
+`--path-mtu` or `relay.path_mtu`; use 1280 when a conservative Internet-path
+assumption is preferable. Oversized IPv4 packets with DF clear are fragmented
+inside AMT; DF-set IPv4, IPv4 packets with header options, and IPv6 packets are
+dropped rather than relying on outer tunnel fragmentation. The drop counters
+make these cases observable, but generating ICMP Packet Too Big feedback still
+requires a portable raw-unicast transmit API from `mctx-core`.
 
 ### Gateway
 
@@ -144,6 +187,11 @@ cargo run --release -- gateway \
   --downstream-interface 192.168.1.20
 ```
 
+The `--bind` and `--relay` addresses select the outer AMT tunnel family, while
+`--downstream-interface` selects the inner multicast family. The downstream
+interface must be IPv4 for IGMPv3 and IPv6 for MLDv2; IPv6 multicast over an
+IPv4 AMT tunnel, and the reverse, are both supported.
+
 The gateway uses raw downstream transmit, so local SSM receivers can join the
 original `(S,G)` carried inside AMT Multicast Data. Raw transmit may require
 elevated privileges.
@@ -161,7 +209,9 @@ cargo run --release --features driad -- gateway \
 
 `--relay-discovery static` is the default and requires `--relay`.
 `--relay-discovery auto` uses `--relay` when present, otherwise it tries DRIAD.
-Use `--driad-resolver IP[:PORT]` to override `/etc/resolv.conf`.
+Use `--driad-resolver IP[:PORT]` to override `/etc/resolv.conf`. The resolver
+must be loopback unless `--driad-allow-insecure-dns` is supplied. That override
+permits spoofable plaintext DNS and should be used only on a trusted network.
 
 The first DRIAD implementation intentionally supports one configured SSM source
 per gateway session. It does not yet choose separate relays for different
@@ -169,7 +219,8 @@ sources learned in transparent mode.
 
 The gateway daemon refreshes its current Membership Update state every 60
 seconds by default, which keeps relay-side idle pruning from removing healthy
-gateways. Use `--membership-refresh-interval 0` to disable refreshes.
+gateways and detects relay restarts. A configured value of `0` disables the
+custom interval but retains the 60-second safety/liveness probe.
 
 On Ctrl-C/SIGTERM, the gateway daemon attempts to send AMT Teardown before
 exiting. If the process is killed abruptly, relay-side idle pruning is the
@@ -192,7 +243,11 @@ The transparent gateway sends periodic local General Queries by default and
 listens for receiver reports on the same interface. Use
 `--local-query-interval 0` to disable those local queries, or
 `--local-membership-interface` if the report listener must use a different
-interface address than downstream raw transmit.
+interface address than downstream raw transmit. Silent reporters expire after
+260 seconds; tune this with `--local-reporter-timeout`. The timeout must be at
+least twice the query interval plus 10 seconds. Disabling local queries also
+disables reporter aging, because the gateway can no longer verify continued
+receiver presence.
 
 ## Configuration
 
@@ -207,11 +262,24 @@ bind = "0.0.0.0:2268"
 relay_address = "203.0.113.10"
 upstream_interface = "192.0.2.10"
 gateway_idle_timeout_secs = 260
+path_mtu = 1500
+
+[relay.limits]
+max_endpoints = 4096
+max_endpoints_per_ip = 256
+max_groups_per_endpoint = 128
+max_sources_per_group = 128
+max_upstream_subscriptions = 256
+
+[relay.rate_limit]
+per_source_per_second = 10
+per_source_burst = 20
 
 [metrics]
 output_dir = "./heimdall-import"
 node_id = "linode-amt-relay"
 interval_ms = 1000
+max_file_bytes = 67108864
 ```
 
 Minimal transparent gateway config:
@@ -229,11 +297,13 @@ ttl = 16
 
 [gateway.local_membership]
 query_interval_secs = 30
+reporter_timeout_secs = 260
 
 [metrics]
 output_dir = "./heimdall-import"
 node_id = "local-amt-gateway"
 interval_ms = 1000
+max_file_bytes = 67108864
 ```
 
 Configured joins can also be expressed in TOML:
@@ -256,7 +326,7 @@ protocol = "igmpv3"
 membership_refresh_interval_secs = 60
 
 [gateway.driad]
-resolver = "192.0.2.53:53"
+resolver = "127.0.0.53:53"
 timeout_ms = 1000
 attempts = 2
 
@@ -287,6 +357,9 @@ traffic, authentication rejections, teardowns, and pruning. The gateway reports
 relay connectivity, configured joins, discovery/update traffic, AMT Multicast
 Data receive, downstream forwarding, local query, and transparent membership
 activity.
+
+Metric files rotate to a single `.jsonl.1` backup at 64 MiB by default. Set
+`metrics.max_file_bytes = 0` to disable rotation.
 
 ## Tests
 
