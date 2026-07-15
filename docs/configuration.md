@@ -17,6 +17,7 @@ gateway_idle_timeout_secs = 260
 gateway_prune_interval_secs = 5
 secret_rotation_secs = 7200
 path_mtu = 1500
+pmtu_feedback = true
 
 [relay.limits]
 max_endpoints = 4096
@@ -61,17 +62,31 @@ reaches 90 percent. Limit and rate values must be non-zero. A
 default retains the current and immediately previous secret during rotation.
 If a shorter rotation interval is configured, the relay delays the next
 rotation until the previous secret's two-query-interval grace period expires.
-The conservative 256-subscription default reflects `mcrx-core 0.2.5` using one
-raw socket per subscription; increase it only after accounting for file
-descriptor and linear polling costs.
+`gateway_idle_timeout_secs` must be `0` to disable endpoint aging or greater
+than the relay's advertised query interval, which is 125 seconds by default.
+The conservative 256-subscription default remains suitable for the portable
+per-subscription backend. A Linux build with `--features shared-upstream` uses
+`mcrx-core 0.3.0` shared capture sockets and can safely configure a larger
+limit after accounting for kernel multicast-membership limits and userspace
+queue bounds.
 
 `path_mtu` is the fixed downstream AMT path MTU and defaults to 1500 bytes.
 Set it to 1280 for a conservative Internet-path assumption. The relay subtracts
 the outer IP, UDP, and AMT headers to derive the tunnel MTU. It fragments
 oversized IPv4 payloads when DF is clear and drops oversized IPv4 DF, IPv4
 packets with header options, or IPv6 payloads rather than creating outer
-fragments. ICMP Packet Too Big feedback requires raw unicast transmit support
-that `mctx-core` does not currently expose.
+fragments. The AMT UDP socket enforces IPv4 DF and IPv6 no-fragment semantics
+for both ECN and compatibility modes; daemon startup fails if the target cannot
+provide them.
+
+`pmtu_feedback = true` enables RFC 7450 feedback for oversized SSM packets and
+requires a binary built with `--features pmtu-feedback`. The relay sends a
+rate-limited ICMPv4 Fragmentation Needed response for DF-set IPv4 or ICMPv6
+Packet Too Big for IPv6, advertising the smallest affected tunnel MTU. An
+explicit `upstream_interface` address is mandatory because it supplies the
+local ICMP source and raw-IP egress selector. The address family must match the
+inner SSM source family; Windows raw IPv6 feedback is unsupported by
+`mctx-core 0.3.0`.
 
 `ecn = true` enables RFC 9601 support. The relay records the Request `E` bit
 per gateway and copies inner ECN into the outer AMT IP header only for capable
@@ -157,6 +172,17 @@ membership_refresh_interval_secs = 60
 resolver = "127.0.0.53:53"
 timeout_ms = 1000
 attempts = 2
+max_candidates = 64
+max_queries_per_window = 10
+query_rate_window_ms = 100
+happy_eyeballs_delay_ms = 250
+relay_hold_down_secs = 600
+traffic_hold_down_secs = 300
+initial_traffic_timeout_secs = 4
+maximum_traffic_timeout_secs = 120
+max_source_tunnels = 256
+max_concurrent_probes = 4
+max_dns_workers = 8
 
 [[gateway.joins]]
 group = "232.1.2.3"
@@ -164,10 +190,17 @@ source = "192.0.2.10"
 ```
 
 Build the binary with `--features driad` to enable DRIAD. In `static` mode,
-`relay` is required. In `auto` mode, a configured `relay` wins; without one,
-the gateway performs DRIAD for the configured SSM source. The current DRIAD
-path intentionally supports one source address per gateway session and does not
-yet perform transparent-mode per-source relay selection.
+`relay` is required. `driad` uses the source's AMTRELAY records directly as an
+administrative override. In `auto`, a configured `relay` wins; without one,
+the gateway probes RFC 7450 anycast before DRIAD. DNS-SD `_amt._udp` discovery
+is not implemented yet.
+
+DRIAD supports multiple configured SSM sources and SSM INCLUDE records learned
+in transparent mode. Each source owns an independent socket, DNS lifecycle,
+candidate set, hold-down state, and AMT tunnel; groups sharing a source share
+that tunnel. ASM and non-SSM transparent records are ignored with a warning.
+An explicit DRIAD `bind` must use port zero and restricts only the outer tunnel
+family, which is independent of the inner multicast family.
 
 The effective minimum TTL across AMTRELAY, CNAME/DNAME, and A/AAAA answers
 drives asynchronous refreshes, bounded to 1 second through 24 hours. Refresh
@@ -175,7 +208,18 @@ failure retains the current relay set and uses randomized exponential backoff.
 Successful refreshes replace the failover candidates immediately, while a
 healthy active tunnel stays in place until normal rediscovery to avoid packet
 loss or duplication from an unnecessary RPF-tree change. An explicit AMTRELAY
-`NoRelay` result withdraws the tunnel and stops the daemon.
+`NoRelay` result sends Teardown and suppresses every relay candidate for that
+source until a later valid DNS result appears.
+
+Candidates are ordered by discovery tier and AMTRELAY precedence, ties are
+randomized, and IPv4/IPv6 addresses are interleaved. Only a candidate that
+returns a valid Membership Query with L clear receives a Membership Update.
+The defaults stagger probes by 250 ms, hold an L response for 10 minutes, use a
+random 4-to-120-second exponential traffic timeout, and hold a no-traffic relay
+for 5 minutes. DNS queries are limited to 10 per 100 ms. Resource defaults are
+64 candidates per source, 256 source tunnels, four probes per source, and eight
+blocking DNS workers. Every value is configurable in `[gateway.driad]` or with
+the corresponding `--driad-*` CLI option shown by `amt gateway --help`.
 
 DRIAD accepts loopback resolvers by default so DNS trust can be supplied by a
 local validating resolver. To use plaintext DNS to a remote resolver, set
@@ -226,6 +270,7 @@ Relay gauges:
 
 - `active_gateways`
 - `active_upstream_subscriptions`
+- `upstream_capture_sockets`
 
 Gateway gauges:
 
@@ -233,17 +278,24 @@ Gateway gauges:
 - `downstream_enabled`
 - `transparent_enabled`
 - `configured_joins`
+- `driad_source_tunnels`
+- `driad_active_tunnels`
+- `driad_candidate_probes`
+- `driad_held_down_relays`
 
 Counter families include:
 
 - AMT control datagrams, invalid/ignored/rate-limited datagrams, responses, and send errors.
 - Relay resource-limit rejections, upstream reconciliation failures, tunnel
-  MTU drops, generated IPv4 fragments, and RFC 6040 normal-mode sends.
+  MTU drops, generated IPv4 fragments, SSM PMTU feedback outcomes, and RFC
+  6040 normal-mode sends.
 - Relay membership updates, applied records, teardowns, authentication rejections, and gateway expiry.
 - Relay upstream subscription changes, native multicast receive, unmatched packets, forwarded packets, and forward errors.
 - Gateway discovery, membership queries, membership updates, refreshes, and teardown.
 - Gateway AMT Multicast Data receive, downstream forwarding, non-multicast packets, and forwarding errors.
-- DRIAD refresh starts, successes, failures, and relay-candidate changes.
+- DRIAD refreshes, NoRelay withdrawals, candidate changes, probe starts,
+  probe timeouts/errors, established tunnels, L/no-traffic hold-downs, and
+  active-query timeouts.
 - Gateway ECN CE reception/propagation, currently-unused combinations, and
   invalid Not-ECT/CE drops.
 - Transparent gateway local queries, local membership reports, and parse errors.

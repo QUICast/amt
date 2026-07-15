@@ -6,7 +6,8 @@ use amt::config::{
 use amt::daemon::GatewayDriadConfig;
 use amt::daemon::{
     self, DEFAULT_CONTROL_RATE_BURST, DEFAULT_CONTROL_RATE_PER_SECOND,
-    DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
+    DEFAULT_DRIAD_MAX_CONCURRENT_PROBES, DEFAULT_DRIAD_MAX_DNS_WORKERS,
+    DEFAULT_DRIAD_MAX_SOURCE_TUNNELS, DEFAULT_GATEWAY_IDLE_TIMEOUT, DEFAULT_GATEWAY_PRUNE_INTERVAL,
     DEFAULT_GLOBAL_CONTROL_RATE_BURST, DEFAULT_GLOBAL_CONTROL_RATE_PER_SECOND,
     DEFAULT_MEMBERSHIP_REFRESH_INTERVAL, DEFAULT_RELAY_PATH_MTU, GatewayDaemonConfig, GatewayJoin,
     RelayDaemonConfig,
@@ -15,6 +16,7 @@ use amt::metrics::MetricsConfig;
 use amt::relay::RelayConfig;
 use amt::state::RelayLimits;
 use amt::{DownstreamConfig, GatewayConfig, LocalMembershipConfig, MembershipProtocol};
+use std::collections::BTreeSet;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -34,15 +36,37 @@ struct GatewayDriadOptions {
     timeout: Duration,
     attempts: usize,
     allow_insecure_dns: bool,
+    max_candidates: usize,
+    max_queries_per_window: usize,
+    query_rate_window: Duration,
+    happy_eyeballs_delay: Duration,
+    relay_hold_down: Duration,
+    traffic_hold_down: Duration,
+    initial_traffic_timeout: Duration,
+    maximum_traffic_timeout: Duration,
+    max_source_tunnels: usize,
+    max_concurrent_probes: usize,
+    max_dns_workers: usize,
 }
 
 impl Default for GatewayDriadOptions {
     fn default() -> Self {
         Self {
             resolvers: Vec::new(),
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(1),
             attempts: 2,
             allow_insecure_dns: false,
+            max_candidates: 64,
+            max_queries_per_window: 10,
+            query_rate_window: Duration::from_millis(100),
+            happy_eyeballs_delay: Duration::from_millis(250),
+            relay_hold_down: Duration::from_secs(10 * 60),
+            traffic_hold_down: Duration::from_secs(5 * 60),
+            initial_traffic_timeout: Duration::from_secs(4),
+            maximum_traffic_timeout: Duration::from_secs(120),
+            max_source_tunnels: DEFAULT_DRIAD_MAX_SOURCE_TUNNELS,
+            max_concurrent_probes: DEFAULT_DRIAD_MAX_CONCURRENT_PROBES,
+            max_dns_workers: DEFAULT_DRIAD_MAX_DNS_WORKERS,
         }
     }
 }
@@ -136,6 +160,9 @@ fn parse_relay_config(
     let mut path_mtu = relay_file
         .and_then(|config| config.path_mtu)
         .unwrap_or(DEFAULT_RELAY_PATH_MTU);
+    let mut pmtu_feedback = relay_file
+        .and_then(|config| config.pmtu_feedback)
+        .unwrap_or(false);
     validate_path_mtu(path_mtu)?;
     let mut metrics = metrics_config_from_file(file_config.as_ref())?;
     let rate_file = relay_file.and_then(|config| config.rate_limit.as_ref());
@@ -237,6 +264,8 @@ fn parse_relay_config(
                     .map_err(|_| format!("invalid --path-mtu '{value}'"))?;
                 validate_path_mtu(path_mtu)?;
             }
+            "--pmtu-feedback" => pmtu_feedback = true,
+            "--no-pmtu-feedback" => pmtu_feedback = false,
             "--ecn" => ecn = true,
             "--no-ecn" => ecn = false,
             "--metrics-dir" => {
@@ -270,6 +299,14 @@ fn parse_relay_config(
     for address in &relay_addresses {
         validate_relay_address(*address, "relay.relay_address")?;
     }
+    if pmtu_feedback && !cfg!(feature = "pmtu-feedback") {
+        return Err(
+            "PMTU feedback requires building quicast-amt with --features pmtu-feedback".to_string(),
+        );
+    }
+    if pmtu_feedback && upstream_interface.is_none() {
+        return Err("PMTU feedback requires --upstream-interface IP".to_string());
+    }
     let bind = bind.unwrap_or_else(|| {
         if relay_addresses.iter().any(IpAddr::is_ipv6)
             && !relay_addresses.iter().any(IpAddr::is_ipv4)
@@ -297,11 +334,13 @@ fn parse_relay_config(
     relay_daemon.gateway_idle_timeout = gateway_idle_timeout;
     relay_daemon.gateway_prune_interval = gateway_prune_interval;
     relay_daemon.path_mtu = path_mtu;
+    relay_daemon.pmtu_feedback = pmtu_feedback;
     relay_daemon.control_rate_per_second = control_rate_per_second;
     relay_daemon.control_rate_burst = control_rate_burst;
     relay_daemon.global_control_rate_per_second = global_control_rate_per_second;
     relay_daemon.global_control_rate_burst = global_control_rate_burst;
     relay_daemon.metrics = metrics;
+    relay_daemon.validate().map_err(|error| error.to_string())?;
 
     Ok(Some(relay_daemon))
 }
@@ -457,6 +496,60 @@ fn parse_gateway_config(
                 driad_options.attempts = attempts;
             }
             "--driad-allow-insecure-dns" => driad_options.allow_insecure_dns = true,
+            "--driad-max-candidates" => {
+                driad_options.max_candidates =
+                    parse_nonzero_usize(args.next(), "--driad-max-candidates")?;
+            }
+            "--driad-max-queries" => {
+                driad_options.max_queries_per_window =
+                    parse_nonzero_usize(args.next(), "--driad-max-queries")?;
+            }
+            "--driad-query-window-ms" => {
+                driad_options.query_rate_window = Duration::from_millis(parse_nonzero_u64(
+                    args.next(),
+                    "--driad-query-window-ms",
+                )?);
+            }
+            "--driad-happy-eyeballs-delay-ms" => {
+                driad_options.happy_eyeballs_delay = Duration::from_millis(parse_nonzero_u64(
+                    args.next(),
+                    "--driad-happy-eyeballs-delay-ms",
+                )?);
+            }
+            "--driad-relay-hold-down" => {
+                driad_options.relay_hold_down =
+                    Duration::from_secs(parse_nonzero_u64(args.next(), "--driad-relay-hold-down")?);
+            }
+            "--driad-traffic-hold-down" => {
+                driad_options.traffic_hold_down = Duration::from_secs(parse_nonzero_u64(
+                    args.next(),
+                    "--driad-traffic-hold-down",
+                )?);
+            }
+            "--driad-initial-traffic-timeout" => {
+                driad_options.initial_traffic_timeout = Duration::from_secs(parse_nonzero_u64(
+                    args.next(),
+                    "--driad-initial-traffic-timeout",
+                )?);
+            }
+            "--driad-maximum-traffic-timeout" => {
+                driad_options.maximum_traffic_timeout = Duration::from_secs(parse_nonzero_u64(
+                    args.next(),
+                    "--driad-maximum-traffic-timeout",
+                )?);
+            }
+            "--driad-max-source-tunnels" => {
+                driad_options.max_source_tunnels =
+                    parse_nonzero_usize(args.next(), "--driad-max-source-tunnels")?;
+            }
+            "--driad-max-concurrent-probes" => {
+                driad_options.max_concurrent_probes =
+                    parse_nonzero_usize(args.next(), "--driad-max-concurrent-probes")?;
+            }
+            "--driad-max-dns-workers" => {
+                driad_options.max_dns_workers =
+                    parse_nonzero_usize(args.next(), "--driad-max-dns-workers")?;
+            }
             "--ecn" => ecn = true,
             "--no-ecn" => ecn = false,
             "--protocol" => {
@@ -608,6 +701,8 @@ fn parse_gateway_config(
         }
     }
 
+    validate_driad_options(&driad_options)?;
+
     if group.is_none() && configured_joins.is_empty() && !transparent {
         return Err("gateway requires --group IP unless --transparent is set".to_string());
     }
@@ -671,8 +766,14 @@ fn parse_gateway_config(
         joins.push(GatewayJoin { group, source });
     }
 
-    let resolved =
-        resolve_gateway_relays(relay, relay_discovery, &joins, &driad_options, transparent)?;
+    let resolved = resolve_gateway_relays(
+        relay,
+        relay_discovery,
+        &joins,
+        &driad_options,
+        transparent,
+        bind,
+    )?;
     let mut relays = resolved.relays;
     if relays.len() > 1
         && let Some(bind) = bind
@@ -876,8 +977,103 @@ fn driad_options_from_file(
     if let Some(allow) = config.allow_insecure_dns {
         options.allow_insecure_dns = allow;
     }
+    if let Some(value) = config.max_candidates {
+        options.max_candidates = value;
+    }
+    if let Some(value) = config.max_queries_per_window {
+        options.max_queries_per_window = value;
+    }
+    if let Some(value) = config.query_rate_window_ms {
+        options.query_rate_window = Duration::from_millis(value);
+    }
+    if let Some(value) = config.happy_eyeballs_delay_ms {
+        options.happy_eyeballs_delay = Duration::from_millis(value);
+    }
+    if let Some(value) = config.relay_hold_down_secs {
+        options.relay_hold_down = Duration::from_secs(value);
+    }
+    if let Some(value) = config.traffic_hold_down_secs {
+        options.traffic_hold_down = Duration::from_secs(value);
+    }
+    if let Some(value) = config.initial_traffic_timeout_secs {
+        options.initial_traffic_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = config.maximum_traffic_timeout_secs {
+        options.maximum_traffic_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = config.max_source_tunnels {
+        options.max_source_tunnels = value;
+    }
+    if let Some(value) = config.max_concurrent_probes {
+        options.max_concurrent_probes = value;
+    }
+    if let Some(value) = config.max_dns_workers {
+        options.max_dns_workers = value;
+    }
 
     Ok(options)
+}
+
+fn parse_nonzero_u64(value: Option<String>, option: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{option} requires a positive integer"))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {option} value '{value}'"))?;
+    (parsed != 0)
+        .then_some(parsed)
+        .ok_or_else(|| format!("{option} must not be 0"))
+}
+
+fn parse_nonzero_usize(value: Option<String>, option: &str) -> Result<usize, String> {
+    let value = value.ok_or_else(|| format!("{option} requires a positive integer"))?;
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {option} value '{value}'"))?;
+    (parsed != 0)
+        .then_some(parsed)
+        .ok_or_else(|| format!("{option} must not be 0"))
+}
+
+fn validate_driad_options(options: &GatewayDriadOptions) -> Result<(), String> {
+    let positive_counts = [
+        ("max_candidates", options.max_candidates),
+        ("max_queries_per_window", options.max_queries_per_window),
+        ("attempts", options.attempts),
+        ("max_source_tunnels", options.max_source_tunnels),
+        ("max_concurrent_probes", options.max_concurrent_probes),
+        ("max_dns_workers", options.max_dns_workers),
+    ];
+    if let Some((name, _)) = positive_counts.iter().find(|(_, value)| *value == 0) {
+        return Err(format!("gateway.driad.{name} must not be 0"));
+    }
+    let positive_durations = [
+        ("timeout_ms", options.timeout),
+        ("query_rate_window_ms", options.query_rate_window),
+        ("happy_eyeballs_delay_ms", options.happy_eyeballs_delay),
+        ("relay_hold_down_secs", options.relay_hold_down),
+        ("traffic_hold_down_secs", options.traffic_hold_down),
+        (
+            "initial_traffic_timeout_secs",
+            options.initial_traffic_timeout,
+        ),
+        (
+            "maximum_traffic_timeout_secs",
+            options.maximum_traffic_timeout,
+        ),
+    ];
+    if let Some((name, _)) = positive_durations
+        .iter()
+        .find(|(_, duration)| duration.is_zero())
+    {
+        return Err(format!("gateway.driad.{name} must not be 0"));
+    }
+    if options.maximum_traffic_timeout < options.initial_traffic_timeout {
+        return Err(
+            "gateway.driad.maximum_traffic_timeout_secs must be at least initial_traffic_timeout_secs"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_driad_resolver(value: &str) -> Result<SocketAddr, String> {
@@ -896,6 +1092,7 @@ fn resolve_gateway_relays(
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
+    bind: Option<SocketAddr>,
 ) -> Result<ResolvedGatewayRelays, String> {
     match discovery {
         GatewayRelayDiscovery::Static => relay
@@ -903,9 +1100,11 @@ fn resolve_gateway_relays(
             .ok_or_else(|| "gateway requires --relay ADDRESS:PORT".to_string()),
         GatewayRelayDiscovery::Auto => match relay {
             Some(relay) => Ok(ResolvedGatewayRelays::static_relay(relay)),
-            None => resolve_driad_relays(joins, driad_options, transparent),
+            None => resolve_driad_relays(joins, driad_options, transparent, bind, true),
         },
-        GatewayRelayDiscovery::Driad => resolve_driad_relays(joins, driad_options, transparent),
+        GatewayRelayDiscovery::Driad => {
+            resolve_driad_relays(joins, driad_options, transparent, bind, false)
+        }
     }
 }
 
@@ -913,17 +1112,20 @@ fn resolve_driad_relays(
     joins: &[GatewayJoin],
     driad_options: &GatewayDriadOptions,
     transparent: bool,
+    bind: Option<SocketAddr>,
+    use_anycast: bool,
 ) -> Result<ResolvedGatewayRelays, String> {
-    if transparent {
+    if bind.is_some_and(|bind| bind.port() != 0) {
         return Err(
-            "DRIAD transparent membership learning is not implemented yet; use configured SSM --group/--source joins for now"
+            "DRIAD requires an ephemeral --bind port because each source owns an independent AMT tunnel"
                 .to_string(),
         );
     }
-    let source = driad_source_for_joins(joins)?;
+    let sources = driad_sources_for_joins(joins, transparent)?;
 
     #[cfg(feature = "driad")]
     {
+        let _ = sources;
         let mut resolver_config = if driad_options.resolvers.is_empty() {
             amt::driad::DriadResolverConfig::system().map_err(|error| {
                 format!("failed to load system DNS resolvers for DRIAD: {error}")
@@ -934,54 +1136,55 @@ fn resolve_driad_relays(
         resolver_config.timeout = driad_options.timeout;
         resolver_config.attempts = driad_options.attempts;
         resolver_config.allow_insecure_dns = driad_options.allow_insecure_dns;
+        resolver_config.max_candidates = driad_options.max_candidates;
+        resolver_config.max_queries_per_window = driad_options.max_queries_per_window;
+        resolver_config.query_rate_window = driad_options.query_rate_window;
         let resolver = amt::driad::DriadResolver::new(resolver_config);
-        let selections = resolver
-            .resolve_source_candidates(source)
-            .map_err(|error| {
-                format!("DRIAD relay discovery failed for source {source}: {error}")
-            })?;
-        let selection = &selections[0];
-        println!(
-            "DRIAD selected AMT relay {} for source {} using {} (precedence {}, discovery_optional={}, ttl={}s)",
-            selection.relay,
-            selection.source,
-            selection.query_name,
-            selection.record.precedence,
-            selection.record.discovery_optional,
-            selection.ttl.as_secs()
-        );
-        let initial_ttl = selections
-            .iter()
-            .map(|selection| selection.ttl)
-            .min()
-            .unwrap_or(Duration::from_secs(1));
-        let relays = selections
-            .into_iter()
-            .map(|selection| selection.relay)
-            .collect();
+        resolver
+            .validate()
+            .map_err(|error| format!("invalid DRIAD resolver configuration: {error}"))?;
+        let relays = vec![match bind.map(|bind| bind.ip()) {
+            Some(IpAddr::V6(_)) => SocketAddr::new(amt::AMT_ANYCAST_IPV6.into(), AMT_PORT),
+            Some(IpAddr::V4(_)) | None => SocketAddr::new(amt::AMT_ANYCAST_IPV4.into(), AMT_PORT),
+        }];
+        let mut driad = GatewayDriadConfig::new(resolver);
+        driad.bind = bind;
+        driad.use_anycast = use_anycast;
+        driad.happy_eyeballs_delay = driad_options.happy_eyeballs_delay;
+        driad.relay_hold_down = driad_options.relay_hold_down;
+        driad.traffic_hold_down = driad_options.traffic_hold_down;
+        driad.initial_traffic_timeout = driad_options.initial_traffic_timeout;
+        driad.maximum_traffic_timeout = driad_options.maximum_traffic_timeout;
+        driad.max_source_tunnels = driad_options.max_source_tunnels;
+        driad.max_concurrent_probes = driad_options.max_concurrent_probes;
+        driad.max_dns_workers = driad_options.max_dns_workers;
         Ok(ResolvedGatewayRelays {
             relays,
-            driad: Some(GatewayDriadConfig::new(source, resolver, initial_ttl)),
+            driad: Some(driad),
         })
     }
 
     #[cfg(not(feature = "driad"))]
     {
-        let _ = source;
+        let _ = sources;
         let _ = driad_options;
+        let _ = bind;
+        let _ = use_anycast;
         Err("DRIAD relay discovery requires building with --features driad".to_string())
     }
 }
 
-fn driad_source_for_joins(joins: &[GatewayJoin]) -> Result<IpAddr, String> {
-    let mut selected = None;
-
-    if joins.is_empty() {
+fn driad_sources_for_joins(
+    joins: &[GatewayJoin],
+    transparent: bool,
+) -> Result<BTreeSet<IpAddr>, String> {
+    if joins.is_empty() && !transparent {
         return Err(
             "DRIAD relay discovery requires a configured SSM --group and --source".to_string(),
         );
     }
 
+    let mut sources = BTreeSet::new();
     for join in joins {
         if !is_ssm_group(join.group) {
             return Err("DRIAD requires groups in the IPv4 or IPv6 SSM range".to_string());
@@ -992,19 +1195,18 @@ fn driad_source_for_joins(joins: &[GatewayJoin]) -> Result<IpAddr, String> {
                     .to_string(),
             );
         };
-        if let Some(existing) = selected {
-            if existing != source {
-                return Err(
-                    "this DRIAD implementation currently supports one source address per gateway session"
-                        .to_string(),
-                );
-            }
-        } else {
-            selected = Some(source);
+        if !same_family(join.group, source) {
+            return Err(
+                "DRIAD SSM groups and sources must use the same address family".to_string(),
+            );
         }
+        if source.is_unspecified() || source.is_multicast() {
+            return Err("DRIAD sources must be unicast addresses".to_string());
+        }
+        sources.insert(source);
     }
 
-    selected.ok_or_else(|| "DRIAD relay discovery requires an SSM source".to_string())
+    Ok(sources)
 }
 
 fn is_ssm_group(group: IpAddr) -> bool {
@@ -1077,12 +1279,18 @@ fn usage() -> &'static str {
         "  amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] ",
         "[--upstream-interface IP] [--upstream-ifindex INDEX] ",
         "[--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] ",
+        "[--pmtu-feedback|--no-pmtu-feedback] ",
         "[--ecn|--no-ecn] ",
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n",
         "  amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] ",
         "[--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] ",
         "[--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] ",
-        "[--driad-allow-insecure-dns] ",
+        "[--driad-allow-insecure-dns] [--driad-max-candidates COUNT] ",
+        "[--driad-max-queries COUNT] [--driad-query-window-ms MS] ",
+        "[--driad-happy-eyeballs-delay-ms MS] [--driad-relay-hold-down SECONDS] ",
+        "[--driad-traffic-hold-down SECONDS] [--driad-initial-traffic-timeout SECONDS] ",
+        "[--driad-maximum-traffic-timeout SECONDS] [--driad-max-source-tunnels COUNT] ",
+        "[--driad-max-concurrent-probes COUNT] [--driad-max-dns-workers COUNT] ",
         "[--ecn|--no-ecn] ",
         "[--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] ",
         "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
@@ -1092,8 +1300,11 @@ fn usage() -> &'static str {
         "[--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]\n\n",
         "Relay defaults to 0.0.0.0:2268 and advertises loopback unless --bind uses a concrete IP.\n",
         "Relay prunes idle gateways after 260 seconds by default; pass --gateway-idle-timeout 0 to disable pruning.\n",
+        "A non-zero relay gateway idle timeout must exceed the advertised 125-second query interval.\n",
+        "Relay SSM PMTU feedback is opt-in and requires the pmtu-feedback Cargo feature plus --upstream-interface.\n",
         "Gateway defaults to an ephemeral local port and forwards raw multicast IP datagrams downstream with mctx-core unless --no-downstream is set.\n",
-        "Gateway static relay discovery requires --relay; DRIAD discovery requires a configured SSM --source and the driad Cargo feature.\n",
+        "Gateway static relay discovery requires --relay; DRIAD requires SSM interest from configured joins or transparent IGMPv3/MLDv2 and the driad Cargo feature.\n",
+        "Gateway auto discovery probes RFC 7450 anycast before source-owned DRIAD candidates when no static relay is configured.\n",
         "Gateway refreshes memberships every 60 seconds by default; 0 retains the 60-second liveness probe.\n",
         "RFC 9601 ECN propagation is opt-in with --ecn; compatibility mode is the default.\n",
         "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
@@ -1119,7 +1330,7 @@ mod tests {
             ecn = true
             relay_address = "203.0.113.10"
             upstream_interface = "192.0.2.10"
-            gateway_idle_timeout_secs = 120
+            gateway_idle_timeout_secs = 260
             path_mtu = 1500
 
             [metrics]
@@ -1144,7 +1355,7 @@ mod tests {
             config.upstream.interface,
             Some("192.0.2.10".parse().unwrap())
         );
-        assert_eq!(config.gateway_idle_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(config.gateway_idle_timeout, Some(Duration::from_secs(260)));
         assert_eq!(config.path_mtu, 1500);
         assert!(!config.relay.ecn);
         assert_eq!(
@@ -1285,6 +1496,48 @@ mod tests {
         let config = parse_relay_config(std::iter::empty()).unwrap().unwrap();
 
         assert_eq!(config.path_mtu, 1_500);
+        assert!(!config.pmtu_feedback);
+    }
+
+    #[test]
+    fn relay_rejects_idle_timeout_not_above_the_query_interval() {
+        let error = parse_relay_config(["--gateway-idle-timeout".to_string(), "125".to_string()])
+            .unwrap_err();
+        assert!(error.contains("must be greater than"));
+
+        let disabled = parse_relay_config(["--gateway-idle-timeout".to_string(), "0".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(disabled.gateway_idle_timeout, None);
+    }
+
+    #[cfg(feature = "pmtu-feedback")]
+    #[test]
+    fn relay_pmtu_feedback_requires_and_uses_upstream_interface() {
+        let missing = parse_relay_config(["--pmtu-feedback".to_string()]).unwrap_err();
+        assert!(missing.contains("upstream-interface"));
+
+        let config = parse_relay_config([
+            "--upstream-interface".to_string(),
+            "192.0.2.10".to_string(),
+            "--pmtu-feedback".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(config.pmtu_feedback);
+    }
+
+    #[cfg(not(feature = "pmtu-feedback"))]
+    #[test]
+    fn relay_pmtu_feedback_rejects_a_binary_without_support() {
+        let error = parse_relay_config([
+            "--upstream-interface".to_string(),
+            "192.0.2.10".to_string(),
+            "--pmtu-feedback".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("--features pmtu-feedback"));
     }
 
     #[test]
@@ -1302,24 +1555,42 @@ mod tests {
     }
 
     #[test]
-    fn driad_source_selection_rejects_asm_or_multiple_sources() {
-        assert!(driad_source_for_joins(&[]).is_err());
+    fn driad_source_selection_supports_transparent_and_multiple_sources() {
+        assert!(driad_sources_for_joins(&[], false).is_err());
+        assert!(driad_sources_for_joins(&[], true).unwrap().is_empty());
         assert!(
-            driad_source_for_joins(&[GatewayJoin {
-                group: "239.1.2.3".parse().unwrap(),
-                source: None,
-            }])
+            driad_sources_for_joins(
+                &[GatewayJoin {
+                    group: "239.1.2.3".parse().unwrap(),
+                    source: None,
+                }],
+                false,
+            )
             .is_err()
         );
         assert!(
-            driad_source_for_joins(&[GatewayJoin {
-                group: "239.1.2.3".parse().unwrap(),
-                source: Some("192.0.2.10".parse().unwrap()),
-            }])
+            driad_sources_for_joins(
+                &[GatewayJoin {
+                    group: "239.1.2.3".parse().unwrap(),
+                    source: Some("192.0.2.10".parse().unwrap()),
+                }],
+                false,
+            )
             .is_err()
         );
         assert!(
-            driad_source_for_joins(&[
+            driad_sources_for_joins(
+                &[GatewayJoin {
+                    group: "ff3e::1234".parse().unwrap(),
+                    source: Some("192.0.2.10".parse().unwrap()),
+                }],
+                false,
+            )
+            .is_err()
+        );
+
+        let sources = driad_sources_for_joins(
+            &[
                 GatewayJoin {
                     group: "232.1.2.3".parse().unwrap(),
                     source: Some("192.0.2.10".parse().unwrap()),
@@ -1328,9 +1599,148 @@ mod tests {
                     group: "232.1.2.4".parse().unwrap(),
                     source: Some("192.0.2.11".parse().unwrap()),
                 },
-            ])
+                GatewayJoin {
+                    group: "232.1.2.5".parse().unwrap(),
+                    source: Some("192.0.2.10".parse().unwrap()),
+                },
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            sources,
+            BTreeSet::from(["192.0.2.10".parse().unwrap(), "192.0.2.11".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn driad_source_selection_rejects_non_unicast_sources() {
+        assert!(
+            driad_sources_for_joins(
+                &[GatewayJoin {
+                    group: "232.1.2.3".parse().unwrap(),
+                    source: Some("0.0.0.0".parse().unwrap()),
+                }],
+                false
+            )
             .is_err()
         );
+        assert!(
+            driad_sources_for_joins(
+                &[GatewayJoin {
+                    group: "232.1.2.3".parse().unwrap(),
+                    source: Some("232.2.3.4".parse().unwrap()),
+                }],
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "driad")]
+    #[test]
+    fn driad_cli_applies_runtime_and_resource_controls() {
+        let config = parse_gateway_config([
+            "--relay-discovery".to_string(),
+            "driad".to_string(),
+            "--driad-resolver".to_string(),
+            "127.0.0.1:53".to_string(),
+            "--group".to_string(),
+            "232.1.2.3".to_string(),
+            "--source".to_string(),
+            "192.0.2.10".to_string(),
+            "--driad-max-candidates".to_string(),
+            "12".to_string(),
+            "--driad-max-queries".to_string(),
+            "7".to_string(),
+            "--driad-query-window-ms".to_string(),
+            "150".to_string(),
+            "--driad-happy-eyeballs-delay-ms".to_string(),
+            "200".to_string(),
+            "--driad-relay-hold-down".to_string(),
+            "500".to_string(),
+            "--driad-traffic-hold-down".to_string(),
+            "240".to_string(),
+            "--driad-initial-traffic-timeout".to_string(),
+            "5".to_string(),
+            "--driad-maximum-traffic-timeout".to_string(),
+            "90".to_string(),
+            "--driad-max-source-tunnels".to_string(),
+            "64".to_string(),
+            "--driad-max-concurrent-probes".to_string(),
+            "3".to_string(),
+            "--driad-max-dns-workers".to_string(),
+            "4".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        let driad = config.driad.unwrap();
+        assert_eq!(driad.resolver.config().max_candidates, 12);
+        assert_eq!(driad.resolver.config().max_queries_per_window, 7);
+        assert_eq!(
+            driad.resolver.config().query_rate_window,
+            Duration::from_millis(150)
+        );
+        assert_eq!(driad.happy_eyeballs_delay, Duration::from_millis(200));
+        assert_eq!(driad.relay_hold_down, Duration::from_secs(500));
+        assert_eq!(driad.traffic_hold_down, Duration::from_secs(240));
+        assert_eq!(driad.initial_traffic_timeout, Duration::from_secs(5));
+        assert_eq!(driad.maximum_traffic_timeout, Duration::from_secs(90));
+        assert_eq!(driad.max_source_tunnels, 64);
+        assert_eq!(driad.max_concurrent_probes, 3);
+        assert_eq!(driad.max_dns_workers, 4);
+    }
+
+    #[cfg(feature = "driad")]
+    #[test]
+    fn transparent_driad_does_not_require_a_seed_source() {
+        let config = parse_gateway_config([
+            "--relay-discovery".to_string(),
+            "auto".to_string(),
+            "--driad-resolver".to_string(),
+            "127.0.0.1:53".to_string(),
+            "--transparent".to_string(),
+            "--protocol".to_string(),
+            "igmpv3".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(config.joins.is_empty());
+        assert!(config.local_membership.is_some());
+        assert!(config.driad.as_ref().unwrap().use_anycast);
+    }
+
+    #[test]
+    fn driad_rejects_invalid_advanced_limits() {
+        let zero = parse_gateway_config([
+            "--relay-discovery".to_string(),
+            "driad".to_string(),
+            "--group".to_string(),
+            "232.1.2.3".to_string(),
+            "--source".to_string(),
+            "192.0.2.10".to_string(),
+            "--driad-max-dns-workers".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap_err();
+        assert!(zero.contains("must not be 0"));
+
+        let inverted = parse_gateway_config([
+            "--relay-discovery".to_string(),
+            "driad".to_string(),
+            "--group".to_string(),
+            "232.1.2.3".to_string(),
+            "--source".to_string(),
+            "192.0.2.10".to_string(),
+            "--driad-initial-traffic-timeout".to_string(),
+            "30".to_string(),
+            "--driad-maximum-traffic-timeout".to_string(),
+            "10".to_string(),
+        ])
+        .unwrap_err();
+        assert!(inverted.contains("must be at least"));
     }
 
     #[cfg(not(feature = "driad"))]

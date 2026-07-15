@@ -90,6 +90,12 @@ pub struct AmtMetricsCounters {
     pub upstream_forward_errors_total: u64,
     pub upstream_mtu_drops_total: u64,
     pub upstream_fragments_sent_total: u64,
+    pub upstream_pmtu_feedback_sent_total: u64,
+    pub upstream_pmtu_feedback_bytes_sent_total: u64,
+    pub upstream_pmtu_feedback_rate_limited_total: u64,
+    pub upstream_pmtu_feedback_suppressed_total: u64,
+    pub upstream_pmtu_feedback_unavailable_total: u64,
+    pub upstream_pmtu_feedback_errors_total: u64,
     pub relay_ecn_normal_mode_datagrams_sent_total: u64,
     pub gateway_discoveries_sent_total: u64,
     pub gateway_membership_queries_received_total: u64,
@@ -100,6 +106,14 @@ pub struct AmtMetricsCounters {
     pub driad_refreshes_succeeded_total: u64,
     pub driad_refreshes_failed_total: u64,
     pub driad_candidate_changes_total: u64,
+    pub driad_no_relay_withdrawals_total: u64,
+    pub driad_probes_started_total: u64,
+    pub driad_probe_timeouts_total: u64,
+    pub driad_probe_errors_total: u64,
+    pub driad_connections_established_total: u64,
+    pub driad_loaded_hold_downs_total: u64,
+    pub driad_no_traffic_hold_downs_total: u64,
+    pub driad_query_timeouts_total: u64,
     pub multicast_data_received_total: u64,
     pub multicast_data_bytes_received_total: u64,
     pub gateway_ecn_ce_received_total: u64,
@@ -191,6 +205,24 @@ impl AmtMetricsCounters {
             upstream_fragments_sent_total: self
                 .upstream_fragments_sent_total
                 .saturating_sub(earlier.upstream_fragments_sent_total),
+            upstream_pmtu_feedback_sent_total: self
+                .upstream_pmtu_feedback_sent_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_sent_total),
+            upstream_pmtu_feedback_bytes_sent_total: self
+                .upstream_pmtu_feedback_bytes_sent_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_bytes_sent_total),
+            upstream_pmtu_feedback_rate_limited_total: self
+                .upstream_pmtu_feedback_rate_limited_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_rate_limited_total),
+            upstream_pmtu_feedback_suppressed_total: self
+                .upstream_pmtu_feedback_suppressed_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_suppressed_total),
+            upstream_pmtu_feedback_unavailable_total: self
+                .upstream_pmtu_feedback_unavailable_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_unavailable_total),
+            upstream_pmtu_feedback_errors_total: self
+                .upstream_pmtu_feedback_errors_total
+                .saturating_sub(earlier.upstream_pmtu_feedback_errors_total),
             relay_ecn_normal_mode_datagrams_sent_total: self
                 .relay_ecn_normal_mode_datagrams_sent_total
                 .saturating_sub(earlier.relay_ecn_normal_mode_datagrams_sent_total),
@@ -221,6 +253,30 @@ impl AmtMetricsCounters {
             driad_candidate_changes_total: self
                 .driad_candidate_changes_total
                 .saturating_sub(earlier.driad_candidate_changes_total),
+            driad_no_relay_withdrawals_total: self
+                .driad_no_relay_withdrawals_total
+                .saturating_sub(earlier.driad_no_relay_withdrawals_total),
+            driad_probes_started_total: self
+                .driad_probes_started_total
+                .saturating_sub(earlier.driad_probes_started_total),
+            driad_probe_timeouts_total: self
+                .driad_probe_timeouts_total
+                .saturating_sub(earlier.driad_probe_timeouts_total),
+            driad_probe_errors_total: self
+                .driad_probe_errors_total
+                .saturating_sub(earlier.driad_probe_errors_total),
+            driad_connections_established_total: self
+                .driad_connections_established_total
+                .saturating_sub(earlier.driad_connections_established_total),
+            driad_loaded_hold_downs_total: self
+                .driad_loaded_hold_downs_total
+                .saturating_sub(earlier.driad_loaded_hold_downs_total),
+            driad_no_traffic_hold_downs_total: self
+                .driad_no_traffic_hold_downs_total
+                .saturating_sub(earlier.driad_no_traffic_hold_downs_total),
+            driad_query_timeouts_total: self
+                .driad_query_timeouts_total
+                .saturating_sub(earlier.driad_query_timeouts_total),
             multicast_data_received_total: self
                 .multicast_data_received_total
                 .saturating_sub(earlier.multicast_data_received_total),
@@ -268,6 +324,7 @@ impl AmtMetricsCounters {
 pub struct RelayMetricsGauges {
     pub active_gateways: u64,
     pub active_upstream_subscriptions: u64,
+    pub upstream_capture_sockets: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +333,10 @@ pub struct GatewayMetricsGauges {
     pub downstream_enabled: bool,
     pub transparent_enabled: bool,
     pub configured_joins: u64,
+    pub driad_source_tunnels: u64,
+    pub driad_active_tunnels: u64,
+    pub driad_candidate_probes: u64,
+    pub driad_held_down_relays: u64,
 }
 
 #[cfg(feature = "metrics")]
@@ -396,6 +457,10 @@ impl MetricsRecorder {
 
     pub fn counters_mut(&mut self) -> &mut AmtMetricsCounters {
         &mut self.counters
+    }
+
+    pub fn counters(&self) -> &AmtMetricsCounters {
+        &self.counters
     }
 
     #[cfg(feature = "metrics")]
@@ -531,6 +596,10 @@ fn extend_gauges(sample: &mut Map<String, Value>, gauges: MetricsGauges) {
                 "active_upstream_subscriptions".to_string(),
                 gauges.active_upstream_subscriptions.into(),
             );
+            sample.insert(
+                "upstream_capture_sockets".to_string(),
+                gauges.upstream_capture_sockets.into(),
+            );
         }
         MetricsGauges::Gateway(gauges) => {
             sample.insert(
@@ -548,6 +617,22 @@ fn extend_gauges(sample: &mut Map<String, Value>, gauges: MetricsGauges) {
             sample.insert(
                 "configured_joins".to_string(),
                 gauges.configured_joins.into(),
+            );
+            sample.insert(
+                "driad_source_tunnels".to_string(),
+                gauges.driad_source_tunnels.into(),
+            );
+            sample.insert(
+                "driad_active_tunnels".to_string(),
+                gauges.driad_active_tunnels.into(),
+            );
+            sample.insert(
+                "driad_candidate_probes".to_string(),
+                gauges.driad_candidate_probes.into(),
+            );
+            sample.insert(
+                "driad_held_down_relays".to_string(),
+                gauges.driad_held_down_relays.into(),
             );
         }
     }
@@ -730,6 +815,48 @@ fn extend_counters(
     );
     counter(
         sample,
+        "upstream_pmtu_feedback_sent",
+        total.upstream_pmtu_feedback_sent_total,
+        delta.upstream_pmtu_feedback_sent_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_pmtu_feedback_bytes_sent",
+        total.upstream_pmtu_feedback_bytes_sent_total,
+        delta.upstream_pmtu_feedback_bytes_sent_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_pmtu_feedback_rate_limited",
+        total.upstream_pmtu_feedback_rate_limited_total,
+        delta.upstream_pmtu_feedback_rate_limited_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_pmtu_feedback_suppressed",
+        total.upstream_pmtu_feedback_suppressed_total,
+        delta.upstream_pmtu_feedback_suppressed_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_pmtu_feedback_unavailable",
+        total.upstream_pmtu_feedback_unavailable_total,
+        delta.upstream_pmtu_feedback_unavailable_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_pmtu_feedback_errors",
+        total.upstream_pmtu_feedback_errors_total,
+        delta.upstream_pmtu_feedback_errors_total,
+        interval_secs,
+    );
+    counter(
+        sample,
         "relay_ecn_normal_mode_datagrams_sent",
         total.relay_ecn_normal_mode_datagrams_sent_total,
         delta.relay_ecn_normal_mode_datagrams_sent_total,
@@ -796,6 +923,62 @@ fn extend_counters(
         "driad_candidate_changes",
         total.driad_candidate_changes_total,
         delta.driad_candidate_changes_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_no_relay_withdrawals",
+        total.driad_no_relay_withdrawals_total,
+        delta.driad_no_relay_withdrawals_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_probes_started",
+        total.driad_probes_started_total,
+        delta.driad_probes_started_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_probe_timeouts",
+        total.driad_probe_timeouts_total,
+        delta.driad_probe_timeouts_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_probe_errors",
+        total.driad_probe_errors_total,
+        delta.driad_probe_errors_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_connections_established",
+        total.driad_connections_established_total,
+        delta.driad_connections_established_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_loaded_hold_downs",
+        total.driad_loaded_hold_downs_total,
+        delta.driad_loaded_hold_downs_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_no_traffic_hold_downs",
+        total.driad_no_traffic_hold_downs_total,
+        delta.driad_no_traffic_hold_downs_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "driad_query_timeouts",
+        total.driad_query_timeouts_total,
+        delta.driad_query_timeouts_total,
         interval_secs,
     );
     counter(
@@ -929,6 +1112,7 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 10,
                 upstream_bytes_received_total: 1000,
+                upstream_pmtu_feedback_sent_total: 1,
                 driad_refreshes_succeeded_total: 1,
                 gateway_ecn_ce_propagated_total: 2,
                 ..AmtMetricsCounters::default()
@@ -936,6 +1120,7 @@ mod tests {
             gauges: MetricsGauges::Relay(RelayMetricsGauges {
                 active_gateways: 1,
                 active_upstream_subscriptions: 1,
+                upstream_capture_sockets: 1,
             }),
         };
         let current = MetricsSnapshot {
@@ -943,6 +1128,7 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 14,
                 upstream_bytes_received_total: 1400,
+                upstream_pmtu_feedback_sent_total: 3,
                 driad_refreshes_succeeded_total: 3,
                 gateway_ecn_ce_propagated_total: 5,
                 ..AmtMetricsCounters::default()
@@ -950,6 +1136,7 @@ mod tests {
             gauges: MetricsGauges::Relay(RelayMetricsGauges {
                 active_gateways: 2,
                 active_upstream_subscriptions: 3,
+                upstream_capture_sockets: 1,
             }),
         };
 
@@ -957,12 +1144,66 @@ mod tests {
 
         assert_eq!(sample["active_gateways"], 2);
         assert_eq!(sample["active_upstream_subscriptions"], 3);
+        assert_eq!(sample["upstream_capture_sockets"], 1);
         assert_eq!(sample["upstream_packets_received_total"], 14);
         assert_eq!(sample["upstream_packets_received_delta"], 4);
         assert_eq!(sample["upstream_packets_received_per_sec"], 2.0);
         assert_eq!(sample["upstream_bytes_received_per_sec"], 200.0);
+        assert_eq!(sample["upstream_pmtu_feedback_sent_delta"], 2);
         assert_eq!(sample["driad_refreshes_succeeded_delta"], 2);
         assert_eq!(sample["gateway_ecn_ce_propagated_delta"], 3);
+    }
+
+    #[test]
+    fn gateway_sample_reports_driad_runtime_state() {
+        let previous = MetricsSnapshot {
+            captured_at: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            counters: AmtMetricsCounters {
+                driad_probes_started_total: 2,
+                driad_loaded_hold_downs_total: 1,
+                ..AmtMetricsCounters::default()
+            },
+            gauges: MetricsGauges::Gateway(GatewayMetricsGauges {
+                relay_connected: false,
+                downstream_enabled: true,
+                transparent_enabled: true,
+                configured_joins: 0,
+                driad_source_tunnels: 1,
+                driad_active_tunnels: 0,
+                driad_candidate_probes: 2,
+                driad_held_down_relays: 1,
+            }),
+        };
+        let current = MetricsSnapshot {
+            captured_at: SystemTime::UNIX_EPOCH + Duration::from_secs(12),
+            counters: AmtMetricsCounters {
+                driad_probes_started_total: 5,
+                driad_loaded_hold_downs_total: 2,
+                driad_connections_established_total: 1,
+                ..AmtMetricsCounters::default()
+            },
+            gauges: MetricsGauges::Gateway(GatewayMetricsGauges {
+                relay_connected: true,
+                downstream_enabled: true,
+                transparent_enabled: true,
+                configured_joins: 0,
+                driad_source_tunnels: 3,
+                driad_active_tunnels: 2,
+                driad_candidate_probes: 1,
+                driad_held_down_relays: 2,
+            }),
+        };
+
+        let sample = metrics_sample_json(&previous, &current);
+
+        assert_eq!(sample["relay_connected"], 1);
+        assert_eq!(sample["driad_source_tunnels"], 3);
+        assert_eq!(sample["driad_active_tunnels"], 2);
+        assert_eq!(sample["driad_candidate_probes"], 1);
+        assert_eq!(sample["driad_held_down_relays"], 2);
+        assert_eq!(sample["driad_probes_started_delta"], 3);
+        assert_eq!(sample["driad_loaded_hold_downs_delta"], 1);
+        assert_eq!(sample["driad_connections_established_total"], 1);
     }
 
     #[test]
@@ -982,6 +1223,7 @@ mod tests {
             gauges: MetricsGauges::Relay(RelayMetricsGauges {
                 active_gateways: 1,
                 active_upstream_subscriptions: 1,
+                upstream_capture_sockets: 1,
             }),
         };
         let mut recorder = MetricsRecorder {
@@ -1004,6 +1246,7 @@ mod tests {
                 .maybe_emit_relay(RelayMetricsGauges {
                     active_gateways: 1,
                     active_upstream_subscriptions: 1,
+                    upstream_capture_sockets: 1,
                 })
                 .is_err()
         );
@@ -1013,6 +1256,7 @@ mod tests {
                 .maybe_emit_relay(RelayMetricsGauges {
                     active_gateways: 1,
                     active_upstream_subscriptions: 1,
+                    upstream_capture_sockets: 1,
                 })
                 .unwrap()
         );

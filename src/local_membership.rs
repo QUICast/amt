@@ -176,7 +176,7 @@ impl LocalMembershipManager {
     }
 
     fn query_config(&self) -> GeneralQueryConfig {
-        let mut config = GeneralQueryConfig::default();
+        let mut config = GeneralQueryConfig::for_local_network();
         if let Some(interval) = self.config.query_interval {
             config.query_interval_code = encode_query_interval(interval);
         }

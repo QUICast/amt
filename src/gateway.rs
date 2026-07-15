@@ -7,7 +7,7 @@ use crate::membership::{
 use crate::protocol::{
     DecodeError, GatewayEndpoint, MembershipProtocol, Message, ResponseMac, encode,
 };
-use crate::query::{QueryValidationError, general_query_interval};
+use crate::query::{QueryValidationError, validated_general_query};
 use crate::state::RelayState;
 use getrandom::fill as fill_random;
 use std::collections::BTreeSet;
@@ -300,7 +300,8 @@ impl Gateway {
                         actual: request_nonce,
                     });
                 }
-                let query_interval = general_query_interval(self.config.protocol, general_query)?;
+                let (query_interval, general_query) =
+                    validated_general_query(self.config.protocol, general_query)?;
 
                 let previous_session = self.session;
                 let previous_teardown = previous_session
@@ -1097,6 +1098,40 @@ mod tests {
             Err(GatewayError::InvalidGeneralQuery(_))
         ));
         assert!(!gateway.is_established());
+    }
+
+    #[test]
+    fn membership_query_trims_padding_before_gateway_fields() {
+        let relay = SocketAddr::from(([192, 0, 2, 10], 2268));
+        let mut gateway =
+            Gateway::new(GatewayConfig::new(relay, MembershipProtocol::Igmpv3).with_nonces(1, 2));
+        await_query(&mut gateway, relay);
+        let general_query =
+            build_general_query(MembershipProtocol::Igmpv3, &GeneralQueryConfig::default());
+        let expected_len = general_query.len();
+        let mut padded_query = general_query;
+        padded_query.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let endpoint = GatewayEndpoint::new(40_000, Ipv4Addr::new(198, 51, 100, 8));
+        let query = encode(&Message::MembershipQuery {
+            response_mac: ResponseMac::new([1; 6]),
+            request_nonce: 2,
+            limit: false,
+            gateway: Some(endpoint),
+            general_query: &padded_query,
+        });
+
+        let GatewayAction::MembershipQuery {
+            gateway: returned_endpoint,
+            general_query,
+            ..
+        } = gateway.handle_datagram(relay, &query).unwrap()
+        else {
+            panic!("expected Membership Query action");
+        };
+
+        assert_eq!(returned_endpoint, Some(endpoint));
+        assert_eq!(general_query.len(), expected_len);
+        assert_eq!(general_query, padded_query[..expected_len]);
     }
 
     #[test]

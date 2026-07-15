@@ -315,6 +315,17 @@ impl RelayState {
         self.subscriptions.iter().cloned().collect()
     }
 
+    pub fn has_ssm_interest(&self, source: IpAddr, group: IpAddr) -> bool {
+        self.forwarding.get(&group).is_some_and(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                self.endpoint_interest(*endpoint, group)
+                    .is_some_and(|interest| {
+                        interest.mode == FilterMode::Include && interest.sources.contains(&source)
+                    })
+            })
+        })
+    }
+
     pub fn aggregate_interests(&self) -> BTreeMap<IpAddr, GroupInterest> {
         self.aggregate.clone()
     }
@@ -542,6 +553,7 @@ mod tests {
             state.upstream_subscriptions(),
             vec![UpstreamSubscription::ssm(group, source)]
         );
+        assert!(state.has_ssm_interest(source, group));
         assert_eq!(state.endpoints_for_packet(source, group), vec![endpoint]);
     }
 
@@ -566,11 +578,44 @@ mod tests {
             state.upstream_subscriptions(),
             vec![UpstreamSubscription::asm(group)]
         );
+        assert!(!state.has_ssm_interest(allowed, group));
         assert_eq!(
             state.endpoints_for_packet(blocked, group),
             Vec::<SocketAddr>::new()
         );
         assert_eq!(state.endpoints_for_packet(allowed, group), vec![endpoint]);
+    }
+
+    #[test]
+    fn ssm_interest_survives_asm_upstream_aggregation() {
+        let asm_endpoint = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let ssm_endpoint = SocketAddr::from(([198, 51, 100, 9], 40_001));
+        let group = IpAddr::V4(Ipv4Addr::new(232, 1, 2, 3));
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut state = RelayState::default();
+
+        state.apply_report(
+            asm_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::ModeIsExclude,
+                group,
+                vec![],
+            )]),
+        );
+        state.apply_report(
+            ssm_endpoint,
+            &report(vec![record(
+                MembershipRecordKind::ModeIsInclude,
+                group,
+                vec![source],
+            )]),
+        );
+
+        assert_eq!(
+            state.upstream_subscriptions(),
+            vec![UpstreamSubscription::asm(group)]
+        );
+        assert!(state.has_ssm_interest(source, group));
     }
 
     #[test]

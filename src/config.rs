@@ -24,6 +24,7 @@ pub struct RelayFileConfig {
     pub gateway_prune_interval_secs: Option<u64>,
     pub secret_rotation_secs: Option<u64>,
     pub path_mtu: Option<usize>,
+    pub pmtu_feedback: Option<bool>,
     pub limits: Option<RelayLimitsFileConfig>,
     pub rate_limit: Option<RateLimitFileConfig>,
 }
@@ -79,6 +80,17 @@ pub struct DriadFileConfig {
     pub timeout_ms: Option<u64>,
     pub attempts: Option<usize>,
     pub allow_insecure_dns: Option<bool>,
+    pub max_candidates: Option<usize>,
+    pub max_queries_per_window: Option<usize>,
+    pub query_rate_window_ms: Option<u64>,
+    pub happy_eyeballs_delay_ms: Option<u64>,
+    pub relay_hold_down_secs: Option<u64>,
+    pub traffic_hold_down_secs: Option<u64>,
+    pub initial_traffic_timeout_secs: Option<u64>,
+    pub maximum_traffic_timeout_secs: Option<u64>,
+    pub max_source_tunnels: Option<usize>,
+    pub max_concurrent_probes: Option<usize>,
+    pub max_dns_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -159,6 +171,7 @@ mod tests {
             upstream_ifindex = 7
             gateway_idle_timeout_secs = 120
             path_mtu = 1500
+            pmtu_feedback = true
 
             [relay.limits]
             max_endpoints = 100
@@ -181,6 +194,7 @@ mod tests {
         assert_eq!(relay.relay_address.unwrap().into_vec().len(), 2);
         assert_eq!(relay.upstream_interface_index, Some(7));
         assert_eq!(relay.path_mtu, Some(1500));
+        assert_eq!(relay.pmtu_feedback, Some(true));
         let limits = relay.limits.unwrap();
         assert_eq!(limits.max_endpoints, Some(100));
         assert_eq!(limits.max_endpoints_per_ip, Some(25));
@@ -204,6 +218,17 @@ mod tests {
             resolver = ["192.0.2.53:53"]
             timeout_ms = 500
             attempts = 2
+            max_candidates = 32
+            max_queries_per_window = 8
+            query_rate_window_ms = 100
+            happy_eyeballs_delay_ms = 200
+            relay_hold_down_secs = 600
+            traffic_hold_down_secs = 300
+            initial_traffic_timeout_secs = 4
+            maximum_traffic_timeout_secs = 120
+            max_source_tunnels = 128
+            max_concurrent_probes = 3
+            max_dns_workers = 6
 
             [gateway.downstream]
             interface = "192.168.1.20"
@@ -224,7 +249,11 @@ mod tests {
         assert_eq!(gateway.relay.unwrap(), "203.0.113.10:2268".parse().unwrap());
         assert_eq!(gateway.ecn, Some(true));
         assert_eq!(gateway.relay_discovery.as_deref(), Some("static"));
-        assert_eq!(gateway.driad.unwrap().attempts, Some(2));
+        let driad = gateway.driad.unwrap();
+        assert_eq!(driad.attempts, Some(2));
+        assert_eq!(driad.max_source_tunnels, Some(128));
+        assert_eq!(driad.max_concurrent_probes, Some(3));
+        assert_eq!(driad.max_dns_workers, Some(6));
         assert_eq!(gateway.joins.len(), 1);
         assert_eq!(gateway.downstream.unwrap().ttl, Some(16));
         assert_eq!(gateway.local_membership.unwrap().interface_index, Some(4));

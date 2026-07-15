@@ -369,7 +369,7 @@ fn parse_ipv4_membership_report(
     require_len("IPv4 header", packet, ihl)?;
 
     let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if total_len < ihl || total_len != packet.len() {
+    if total_len < ihl || total_len > packet.len() {
         return Err(MembershipParseError::InvalidTotalLength {
             total_length: total_len,
             available: packet.len(),
@@ -453,7 +453,7 @@ fn parse_ipv6_membership_report(
 
     let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
     let total_len = IPV6_HEADER_LEN + payload_len;
-    if total_len != packet.len() {
+    if total_len > packet.len() {
         return Err(MembershipParseError::InvalidTotalLength {
             total_length: total_len,
             available: packet.len(),
@@ -968,14 +968,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_bytes_inside_or_after_a_membership_packet() {
+    fn accepts_trailing_bytes_after_a_membership_packet() {
         let mut packet = ipv4_packet(igmpv3_report(&[]));
         packet.push(0);
-        assert!(matches!(
-            parse_membership_report(&packet),
-            Err(MembershipParseError::InvalidTotalLength { .. })
-        ));
 
+        assert_eq!(
+            parse_membership_report(&packet),
+            Ok(MembershipReport {
+                protocol: MembershipProtocol::Igmpv3,
+                records: Vec::new(),
+            })
+        );
+
+        let mut packet = ipv6_packet(mldv2_report(&[]));
+        packet.extend_from_slice(&[0xaa, 0xbb]);
+
+        assert_eq!(
+            parse_membership_report(&packet),
+            Ok(MembershipReport {
+                protocol: MembershipProtocol::Mldv2,
+                records: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_declared_inside_a_membership_packet() {
         let mut payload = igmpv3_report(&[]);
         payload.extend_from_slice(&[0, 0, 0, 0]);
         payload[2..4].fill(0);

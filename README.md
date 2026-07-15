@@ -14,14 +14,17 @@ The crate currently includes:
 - IGMPv3 and MLDv2 query/report packet helpers.
 - Simple blocking relay and gateway runners.
 - TOML configuration for the relay and gateway daemons.
-- Optional DRIAD DNS relay discovery for configured SSM sources.
+- Optional RFC 8777 DRIAD discovery with independent configured or transparent
+  SSM source sessions, Happy Eyeballs probing, and relay hold-downs.
 - Optional [RFC 9601][rfc9601]/[RFC 6040][rfc6040] ECN propagation across the
   AMT tunnel.
 - Heimdall-style single-header JSONL metrics output.
 - Raw relay upstream receive through `mcrx-core` with its `raw-packets`
   feature.
+- Optional Linux shared upstream capture through `mcrx-core/raw-shared-capture`.
 - Raw gateway downstream transmit through `mctx-core` with its `raw-packets`
   feature.
+- Optional RFC 7450 SSM Path MTU feedback through `mctx-core/raw-ip`.
 - Transparent gateway mode that listens for local IGMPv3/MLDv2 receiver reports
   and turns them into AMT Membership Updates.
 
@@ -46,8 +49,9 @@ Implemented:
 - AMT Teardown.
 - Relay upstream subscription reconciliation for ASM/SSM interests.
 - Gateway joins for a configured group and optional source.
-- Gateway DRIAD relay discovery for a configured SSM source.
-- DRIAD DNS TTL refresh with asynchronous live candidate-set replacement.
+- Gateway DRIAD relay discovery with an independent tunnel per SSM source.
+- Asynchronous DRIAD DNS TTL refresh, multi-relay probing, L-flag handling,
+  traffic-health failover, and authoritative NoRelay withdrawal.
 - RFC 9601 ECN capability signaling and RFC 6040 encapsulation/decapsulation.
 - Gateway local membership learning for transparent IGMPv3/MLDv2 operation.
 - Relay idle gateway pruning and gateway membership refreshes.
@@ -62,6 +66,10 @@ Implemented:
   terminating the relay or replacing working state.
 - Fixed-PMTU tunnel filtering with inner IPv4 fragmentation and MTU drop
   metrics.
+- Rate-limited ICMPv4 Fragmentation Needed and ICMPv6 Packet Too Big feedback
+  toward oversized SSM sources.
+- Linux shared raw capture with indexed `(S,G)` demultiplexing for large relay
+  subscription sets.
 
 Current limitations:
 
@@ -69,11 +77,10 @@ Current limitations:
   small and easy to inspect, not yet optimized.
 - Relay raw upstream receive may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform.
-- `mcrx-core 0.2.5` currently owns one raw capture socket per upstream
-  subscription and polls those sockets linearly. The relay therefore defaults
-  to at most 256 unique upstream subscriptions. Raising that limit is possible,
-  but efficient large-scale relays need shared capture and packet demultiplexing
-  support in `mcrx-core`.
+- The relay retains a conservative default of 256 unique upstream
+  subscriptions. Linux builds with `shared-upstream` can raise that limit while
+  using approximately one capture socket per family/interface instead of one
+  socket per subscription. Other platforms retain the existing raw backend.
 - Gateway raw downstream transmit may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform. `mctx-core` raw IPv6 transmit is
   not supported on Windows yet.
@@ -87,21 +94,24 @@ Current limitations:
 - Transparent mode expires silent local reporters after 260 seconds by default.
   This is deliberately simpler than a complete multicast-router listener state
   machine.
-- DRIAD is currently limited to explicitly configured SSM joins with one source
-  address per gateway session. Transparent-mode DRIAD and multi-source
-  multi-relay sessions are planned follow-ups.
-- One gateway session uses one outer address family. DRIAD failover candidates
-  from the other family are ignored; run a separate gateway instance for
-  independent IPv4 and IPv6 outer tunnels. Cross-family Happy Eyeballs is a
-  recommended future optimization, not a requirement for DRIAD operation.
+- DRIAD applies only to SSM. In transparent DRIAD mode, ASM and non-SSM reports
+  are ignored with an operator warning; use a static relay session for those
+  interests.
+- `auto` implements static configuration, RFC 7450 anycast, and DRIAD ordering.
+  DNS-SD `_amt._udp` discovery, which RFC 8777 recommends ahead of anycast, is
+  not implemented yet.
+- DRIAD can probe IPv4 and IPv6 outer relays for either inner multicast family.
+  An explicit `--bind` restricts candidates to that outer family and must use
+  port zero because each source owns an independent socket.
 - The gateway always performs Relay Discovery. An AMTRELAY `D=1` record permits
   a direct Request as an optimization, but does not require one; `D=0` is fully
   honored by the current flow.
 - DRIAD requires a loopback validating resolver by default. Plain DNS to a
   remote resolver requires an explicit insecure override.
-- The relay does not yet generate ICMPv4 Fragmentation Needed or ICMPv6 Packet
-  Too Big feedback toward oversized SSM sources; that needs a portable raw
-  unicast transmit path in addition to the multicast-only mctx API.
+- PMTU feedback is opt-in, requires `pmtu-feedback`, an explicit local
+  `--upstream-interface`, and raw-socket privileges. One relay instance emits
+  feedback for the inner IP family matching that interface address; use
+  separate instances or addresses for independent IPv4 and IPv6 sources.
 - ECN is opt-in with `--ecn` or `ecn = true`; compatibility mode remains the
   default. Enabling ECN requires operating-system support for per-datagram ECN
   metadata and may fail at startup when that support is unavailable.
@@ -116,7 +126,7 @@ cargo build
 cargo check --no-default-features
 cargo build --features driad
 cargo build --features metrics
-cargo build --features driad,metrics
+cargo build --features driad,metrics,shared-upstream,pmtu-feedback
 cargo test
 cargo run -- --help
 cargo install quicast-amt
@@ -126,20 +136,34 @@ The default `runtime` feature builds the daemon and raw mcrx/mctx integration.
 `--no-default-features` builds only the portable protocol, query, membership,
 gateway, relay, and state-machine core.
 
-The crate depends on crates.io releases:
+The supported daemon targets are Linux, macOS, and Windows. iOS is deliberately
+rejected at compile time, including core-only builds, because this project does
+not provide or claim an iOS-supported AMT product surface. Other targets are
+unsupported unless documented explicitly.
 
-- `mcrx-core = 0.2.5` with `raw-packets`
-- `mctx-core = 0.2.3` with `raw-packets`
+The registry manifest targets these sibling-crate releases:
 
-Copy/paste-ready requests for the next sibling-crate capabilities live in
-[`docs/sibling-crate-prompts.md`](docs/sibling-crate-prompts.md).
+- `mcrx-core = 0.3.0` with `raw-packets` and optional `raw-shared-capture`
+- `mctx-core = 0.3.0` with `raw-packets` and optional `raw-ip`
+
+The `0.3.0` sibling versions must be published before a registry-only build or
+package verification can succeed. Local development can use Cargo's
+`[patch.crates-io]` mechanism without introducing path dependencies into this
+manifest.
+
+The completed sibling-crate implementation requests are retained in
+[`docs/sibling-crate-prompts.md`](docs/sibling-crate-prompts.md) for design
+history and acceptance criteria.
 
 ## CLI
 
 ```text
-amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] [--ecn|--no-ecn] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
-amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [--driad-resolver IP[:PORT]] [--driad-timeout-ms MS] [--driad-attempts COUNT] [--driad-allow-insecure-dns] [--ecn|--no-ecn] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--local-reporter-timeout SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] [--pmtu-feedback|--no-pmtu-feedback] [--ecn|--no-ecn] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [DRIAD OPTIONS] [--ecn|--no-ecn] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--local-reporter-timeout SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
 ```
+
+Run `amt gateway --help` for the complete DRIAD timer, DNS-rate, candidate,
+source-tunnel, probe, and resolver-worker controls.
 
 ### Relay
 
@@ -166,15 +190,29 @@ the operating system's dual-stack socket behavior is unsuitable.
 The relay daemon prunes idle gateways after 260 seconds by default and checks
 for expired gateways every 5 seconds. Use `--gateway-idle-timeout 0` to disable
 pruning, or tune `--gateway-idle-timeout` and `--gateway-prune-interval` for
-test setups.
+test setups. A non-zero idle timeout must be greater than the advertised query
+interval, which is 125 seconds by default.
 
 The fixed relay path MTU defaults to 1500 bytes and can be changed with
 `--path-mtu` or `relay.path_mtu`; use 1280 when a conservative Internet-path
 assumption is preferable. Oversized IPv4 packets with DF clear are fragmented
 inside AMT; DF-set IPv4, IPv4 packets with header options, and IPv6 packets are
-dropped rather than relying on outer tunnel fragmentation. The drop counters
-make these cases observable, but generating ICMP Packet Too Big feedback still
-requires a portable raw-unicast transmit API from `mctx-core`.
+dropped rather than relying on outer tunnel fragmentation. AMT UDP sockets also
+enforce non-fragmenting outer transmission; startup fails on a platform that
+cannot provide that guarantee, and an oversized send is reported by the OS
+instead of being fragmented in transit.
+
+Build with `--features pmtu-feedback` and pass `--pmtu-feedback` to send the
+RFC 7450-required ICMPv4 Fragmentation Needed or ICMPv6 Packet Too Big response
+toward an SSM source when DF-set IPv4 or IPv6 traffic exceeds a tunnel MTU. The
+relay sends one rate-limited response containing the smallest affected TMTU.
+The explicit `--upstream-interface` address supplies the ICMP source and must
+match the inner traffic family.
+
+On Linux, `--features shared-upstream` replaces per-subscription receive
+sockets with shared family/interface capture sockets and indexed userspace
+demultiplexing. The CLI is unchanged; raise
+`relay.limits.max_upstream_subscriptions` only after enabling that feature.
 
 Pass `--ecn` (or set `relay.ecn = true`) to let the relay use RFC 6040 normal
 mode for gateways that declare ECN support in their AMT Request. Gateways that
@@ -222,15 +260,30 @@ cargo run --release --features driad -- gateway \
   --downstream-interface 192.168.1.20
 ```
 
+Transparent DRIAD learns independent SSM sources from the LAN:
+
+```bash
+cargo run --release --features driad -- gateway \
+  --relay-discovery auto \
+  --transparent \
+  --protocol igmpv3 \
+  --downstream-interface 192.168.1.20
+```
+
 `--relay-discovery static` is the default and requires `--relay`.
-`--relay-discovery auto` uses `--relay` when present, otherwise it tries DRIAD.
+`--relay-discovery driad` is an administrative override that uses source-owned
+AMTRELAY records directly. `auto` uses a configured relay when present;
+otherwise, each source probes the RFC 7450 anycast addresses before its DRIAD
+candidates. DNS-SD is not implemented yet.
 Use `--driad-resolver IP[:PORT]` to override `/etc/resolv.conf`. The resolver
 must be loopback unless `--driad-allow-insecure-dns` is supplied. That override
 permits spoofable plaintext DNS and should be used only on a trusted network.
 
-The first DRIAD implementation intentionally supports one configured SSM source
-per gateway session. It does not yet choose separate relays for different
-sources learned in transparent mode.
+Configured joins and transparent IGMPv3/MLDv2 INCLUDE records are partitioned
+by source. Each source gets an independent UDP tunnel, DNS lifecycle, relay
+candidate set, hold-down table, and rediscovery state. Multiple groups for one
+source share that source's tunnel. Only the chosen non-L connection receives a
+Membership Update.
 
 The daemon refreshes DRIAD asynchronously using the minimum TTL across the
 AMTRELAY, CNAME/DNAME, and A/AAAA records involved in a selection. Refreshes are
@@ -238,8 +291,17 @@ bounded to 1 second through 24 hours. Resolver failures retain the last usable
 candidate set and retry with randomized exponential backoff. A healthy active
 tunnel is retained when DNS changes; the refreshed set is used on the next
 rediscovery so routine DNS maintenance does not interrupt multicast traffic.
-An explicit AMTRELAY `NoRelay` record is treated as a withdrawal: the gateway
-sends Teardown when possible and stops instead of continuing with stale state.
+An explicit AMTRELAY `NoRelay` record withdraws that source: the gateway sends
+Teardown when possible and suppresses both anycast and DNS candidates until a
+later valid AMTRELAY result appears.
+
+Equal-precedence candidates are randomized and address families are
+interleaved. Probes are staggered by 250 ms, with four concurrent probes per
+source by default. A valid Membership Query without L wins. L responses are
+held down for 10 minutes. If subscribed traffic does not arrive, the timeout
+backs off randomly from 4 to 120 seconds and the relay is held down for 5
+minutes. Defaults also cap the gateway at 256 source tunnels and eight blocking
+DNS workers, while DNS queries are limited to 10 per 100 ms.
 
 Pass `--ecn` (or set `gateway.ecn = true`) to advertise RFC 9601 capability and
 apply RFC 6040 decapsulation. In particular, outer CE is propagated into an
@@ -362,6 +424,17 @@ membership_refresh_interval_secs = 60
 resolver = "127.0.0.53:53"
 timeout_ms = 1000
 attempts = 2
+max_candidates = 64
+max_queries_per_window = 10
+query_rate_window_ms = 100
+happy_eyeballs_delay_ms = 250
+relay_hold_down_secs = 600
+traffic_hold_down_secs = 300
+initial_traffic_timeout_secs = 4
+maximum_traffic_timeout_secs = 120
+max_source_tunnels = 256
+max_concurrent_probes = 4
+max_dns_workers = 8
 
 [[gateway.joins]]
 group = "232.1.2.3"
@@ -389,7 +462,9 @@ upstream subscription counts, upstream receive/forward totals, AMT control
 traffic, authentication rejections, teardowns, and pruning. The gateway reports
 relay connectivity, configured joins, discovery/update traffic, AMT Multicast
 Data receive, downstream forwarding, local query, and transparent membership
-activity.
+activity. DRIAD gateways additionally report source/active tunnel, live probe,
+and held-down relay gauges plus DNS, selection, L, no-traffic, and timeout
+counters.
 
 Metric files rotate to a single `.jsonl.1` backup at 64 MiB by default. Set
 `metrics.max_file_bytes = 0` to disable rotation.
@@ -402,8 +477,7 @@ Run all tests:
 cargo test
 ```
 
-The integration test in `tests/amt_roundtrip.rs` binds localhost UDP sockets and
-verifies:
+The socket-level tests bind localhost UDP sockets and verify:
 
 - gateway discovery to relay
 - relay advertisement
@@ -413,6 +487,10 @@ verifies:
 - relay state update
 - AMT multicast data delivery
 - teardown
+- DRIAD fallback around an unresponsive candidate
+- L-flag hold-down and selection of another relay
+- Membership Update only after a valid non-L Membership Query
+- no-traffic hold-down, NoRelay withdrawal, and an idle non-spinning tunnel
 
 Some sandboxed environments block UDP socket binds. In those environments the
 test must be run with appropriate socket permissions.
@@ -423,10 +501,11 @@ pruning, and optional metrics checks end-to-end. It requires Linux, `iproute2`,
 and root privileges or equivalent `CAP_NET_ADMIN`/`CAP_NET_RAW` capability:
 
 ```bash
-sudo -E cargo test --features metrics --test system_linux -- --ignored --test-threads=1 --nocapture
+sudo -E cargo test --features metrics,shared-upstream --test system_linux -- --ignored --test-threads=1 --nocapture
 ```
 
-For a no-metrics build, omit `--features metrics`. The tests are ignored by
+For the portable per-subscription upstream backend, omit `shared-upstream`.
+For a no-metrics build, omit `metrics`. The tests are ignored by
 default and skip themselves on non-Linux hosts or without sufficient privileges.
 
 ## Documentation

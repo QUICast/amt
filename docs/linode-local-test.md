@@ -66,7 +66,7 @@ curl https://sh.rustup.rs -sSf | sh
 Build the relay and sender:
 
 ```bash
-cargo install quicast-amt --features metrics
+cargo install quicast-amt --features metrics,shared-upstream,pmtu-feedback
 cargo install mctx-core --bin mctx_send
 ```
 
@@ -74,7 +74,7 @@ If using this repository checkout instead of crates.io:
 
 ```bash
 cd ~/multicast/amt
-cargo build --release --features metrics
+cargo build --release --features metrics,shared-upstream,pmtu-feedback
 
 cd ~/multicast/mctx-core
 cargo build --release --bin mctx_send
@@ -169,6 +169,7 @@ amt relay \
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
   --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --pmtu-feedback \
   --ecn \
   --metrics-dir "$HEIMDALL_IMPORT_DIR" \
   --node-id linode-amt-relay
@@ -181,6 +182,7 @@ For a repository build:
   --bind 0.0.0.0:2268 \
   --relay-address "$LINODE_PUBLIC_IP" \
   --upstream-interface "$LINODE_UPSTREAM_IF" \
+  --pmtu-feedback \
   --ecn \
   --metrics-dir "$HEIMDALL_IMPORT_DIR" \
   --node-id linode-amt-relay
@@ -188,6 +190,9 @@ For a repository build:
 
 `--relay-address` must be the public address reachable by the gateway. When
 binding to `0.0.0.0`, omitting it would advertise loopback by default.
+`--pmtu-feedback` is optional for the basic fire test; it requires the matching
+Cargo feature and uses `$LINODE_UPSTREAM_IF` as the source of ICMP feedback to
+oversized SSM senders.
 
 ## Start The Transparent Local Gateway
 
@@ -275,7 +280,9 @@ rather than logged once per packet.
 The gateway refreshes its membership state every 60 seconds by default, and the
 relay expires idle gateways after 260 seconds by default. That means a crashed
 gateway should eventually disappear from the relay's active gateway count and
-upstream subscription set.
+upstream subscription set. If you tune the relay timeout, it must remain greater
+than the advertised 125-second query interval, or the relay will reject the
+configuration at startup.
 
 Stop the gateway with Ctrl-C for a graceful AMT Teardown. The relay should log
 that the gateway disconnected and then reconcile upstream subscriptions down if

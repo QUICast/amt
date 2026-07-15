@@ -17,13 +17,11 @@ enum SocketBackend {
 impl AmtUdpSocket {
     pub(crate) fn bind(address: SocketAddr, require_ecn: bool) -> io::Result<Self> {
         let socket = UdpSocket::bind(address)?;
+        let state = configure_tunnel_socket(&socket)?;
         let backend = if require_ecn {
-            let state = UdpSocketState::new(UdpSockRef::from(&socket))?;
             verify_ecn_receive(&socket)?;
-            disable_receive_coalescing(&socket, &state)?;
             SocketBackend::Ecn(state)
         } else {
-            socket.set_nonblocking(true)?;
             SocketBackend::Standard
         };
         Ok(Self { socket, backend })
@@ -93,6 +91,18 @@ impl AmtUdpSocket {
             }
         }
     }
+}
+
+fn configure_tunnel_socket(socket: &UdpSocket) -> io::Result<UdpSocketState> {
+    let state = UdpSocketState::new(UdpSockRef::from(socket))?;
+    if state.may_fragment() {
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "the operating system cannot enforce non-fragmenting AMT UDP transmission",
+        ));
+    }
+    disable_receive_coalescing(socket, &state)?;
+    Ok(state)
 }
 
 #[cfg(unix)]
@@ -255,6 +265,14 @@ mod tests {
                 .kind(),
             ErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    fn supported_ipv4_socket_enforces_no_outer_fragmentation() {
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let state = configure_tunnel_socket(&socket).unwrap();
+
+        assert!(!state.may_fragment());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

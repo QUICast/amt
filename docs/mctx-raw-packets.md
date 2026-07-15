@@ -1,7 +1,9 @@
 # Raw mctx-core Transmit Integration
 
-`mctx-core` supports raw multicast transmit as of `0.2.3` behind its
-`raw-packets` feature.
+`mctx-core 0.3.0` provides two independent raw transmit features used by AMT:
+
+- `raw-packets` forwards complete multicast datagrams downstream.
+- `raw-ip` sends complete unicast ICMP PMTU feedback toward SSM sources.
 
 This crate uses that API in the AMT gateway downstream path:
 
@@ -70,3 +72,18 @@ target/release/amt gateway \
 
 Use a downstream SSM receiver that joins the source address carried inside the
 multicast IP datagram.
+
+## Relay PMTU Feedback
+
+Build AMT with `--features pmtu-feedback` and enable `--pmtu-feedback` on the
+relay. When an oversized DF-set IPv4 or IPv6 packet arrived through a native
+SSM subscription, AMT constructs the complete ICMPv4 Fragmentation Needed or
+ICMPv6 Packet Too Big datagram and sends it through `mctx_core::RawIpContext`.
+The advertised value is the smallest TMTU among affected gateways, and replies
+are rate-limited per `(source, group)`.
+
+The relay's explicit `--upstream-interface` address is both the ICMP source and
+the raw-IP interface selector. IPv4 and IPv6 feedback therefore require local
+addresses of the matching family; run separate relay instances when both are
+needed. Linux and macOS support both families, Windows supports IPv4 only, and
+all paths normally require raw-socket privileges.

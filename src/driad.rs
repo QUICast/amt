@@ -6,13 +6,17 @@
 
 use crate::AMT_PORT;
 use getrandom::fill as fill_random;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const AMTRELAY_RRTYPE: u16 = 260;
+pub const AMT_ANYCAST_IPV4: Ipv4Addr = Ipv4Addr::new(192, 52, 193, 1);
+pub const AMT_ANYCAST_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 1);
 
 const DNS_CLASS_IN: u16 = 1;
 const DNS_TYPE_A: u16 = 1;
@@ -22,8 +26,11 @@ const DNS_TYPE_DNAME: u16 = 39;
 const DNS_HEADER_LEN: usize = 12;
 const MAX_DNS_DATAGRAM: usize = 4096;
 const MAX_ALIAS_DEPTH: usize = 8;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_ATTEMPTS: usize = 2;
+const DEFAULT_MAX_CANDIDATES: usize = 64;
+const DEFAULT_DNS_QUERIES_PER_WINDOW: usize = 10;
+const DEFAULT_DNS_QUERY_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmtRelayRecord {
@@ -56,6 +63,9 @@ pub struct DriadResolverConfig {
     pub timeout: Duration,
     pub attempts: usize,
     pub allow_insecure_dns: bool,
+    pub max_candidates: usize,
+    pub max_queries_per_window: usize,
+    pub query_rate_window: Duration,
 }
 
 impl DriadResolverConfig {
@@ -65,6 +75,9 @@ impl DriadResolverConfig {
             timeout: DEFAULT_TIMEOUT,
             attempts: DEFAULT_ATTEMPTS,
             allow_insecure_dns: false,
+            max_candidates: DEFAULT_MAX_CANDIDATES,
+            max_queries_per_window: DEFAULT_DNS_QUERIES_PER_WINDOW,
+            query_rate_window: DEFAULT_DNS_QUERY_WINDOW,
         }
     }
 
@@ -74,18 +87,63 @@ impl DriadResolverConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DriadResolver {
     config: DriadResolverConfig,
+    query_limiter: Arc<Mutex<DnsQueryLimiter>>,
 }
 
 impl DriadResolver {
     pub fn new(config: DriadResolverConfig) -> Self {
-        Self { config }
+        let query_limiter = DnsQueryLimiter::new(
+            config.max_queries_per_window.max(1),
+            config.query_rate_window.max(Duration::from_millis(1)),
+        );
+        Self {
+            config,
+            query_limiter: Arc::new(Mutex::new(query_limiter)),
+        }
     }
 
     pub fn config(&self) -> &DriadResolverConfig {
         &self.config
+    }
+
+    pub fn validate(&self) -> Result<(), DriadError> {
+        if self.config.resolvers.is_empty() {
+            return Err(DriadError::NoResolvers);
+        }
+        if !self.config.allow_insecure_dns
+            && let Some(resolver) = self
+                .config
+                .resolvers
+                .iter()
+                .find(|resolver| !resolver.ip().is_loopback())
+        {
+            return Err(DriadError::InsecureResolver(*resolver));
+        }
+        if self.config.timeout.is_zero() {
+            return Err(DriadError::InvalidConfig("timeout must not be zero"));
+        }
+        if self.config.attempts == 0 {
+            return Err(DriadError::InvalidConfig("attempts must not be zero"));
+        }
+        if self.config.max_candidates == 0 {
+            return Err(DriadError::InvalidConfig(
+                "maximum candidate count must not be zero",
+            ));
+        }
+        if self.config.max_queries_per_window == 0 {
+            return Err(DriadError::InvalidConfig(
+                "DNS query limit must not be zero",
+            ));
+        }
+        if self.config.query_rate_window.is_zero() {
+            return Err(DriadError::InvalidConfig(
+                "DNS query-rate window must not be zero",
+            ));
+        }
+        Ok(())
     }
 
     pub fn resolve_source(&self, source: IpAddr) -> Result<DriadRelaySelection, DriadError> {
@@ -99,18 +157,7 @@ impl DriadResolver {
         &self,
         source: IpAddr,
     ) -> Result<Vec<DriadRelaySelection>, DriadError> {
-        if self.config.resolvers.is_empty() {
-            return Err(DriadError::NoResolvers);
-        }
-        if !self.config.allow_insecure_dns
-            && let Some(resolver) = self
-                .config
-                .resolvers
-                .iter()
-                .find(|resolver| !resolver.ip().is_loopback())
-        {
-            return Err(DriadError::InsecureResolver(*resolver));
-        }
+        self.validate()?;
 
         let query_name = reverse_source_name(source);
         let mut records = self.lookup_amtrelay_following_aliases(&query_name)?;
@@ -122,7 +169,7 @@ impl DriadResolver {
         }
         records.sort_by_key(|record| record.value.precedence);
         let mut selections = Vec::new();
-        for record in records {
+        for record in records.into_iter().take(self.config.max_candidates.max(1)) {
             let Ok(relays) = self.relay_socket_addrs(&record.value.target) else {
                 continue;
             };
@@ -143,11 +190,18 @@ impl DriadResolver {
                     relay: relay.value,
                     ttl: record.ttl.min(relay.ttl),
                 });
+                if selections.len() >= self.config.max_candidates.max(1) {
+                    break;
+                }
+            }
+            if selections.len() >= self.config.max_candidates.max(1) {
+                break;
             }
         }
         if selections.is_empty() {
             Err(DriadError::NoUsableRelay)
         } else {
+            order_relay_candidates(&mut selections);
             Ok(selections)
         }
     }
@@ -220,6 +274,7 @@ impl DriadResolver {
         query_type: u16,
         timeout: Duration,
     ) -> Result<(u16, Vec<u8>), DriadError> {
+        self.wait_for_query_budget()?;
         let id = random_dns_id()?;
         let query = build_dns_query(id, name, query_type)?;
         let bind = match resolver {
@@ -259,6 +314,7 @@ impl DriadResolver {
         query: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, DriadError> {
+        self.wait_for_query_budget()?;
         let mut stream = TcpStream::connect_timeout(&resolver, timeout).map_err(|error| {
             DriadError::Io(format!("failed to connect DNS TCP socket: {error}"))
         })?;
@@ -300,6 +356,20 @@ impl DriadResolver {
             .unwrap_or(maximum)
             .min(maximum);
         randomized_duration(self.config.timeout.min(upper), upper)
+    }
+
+    fn wait_for_query_budget(&self) -> Result<(), DriadError> {
+        loop {
+            let wait = self
+                .query_limiter
+                .lock()
+                .map_err(|_| DriadError::Io("DRIAD DNS query limiter is poisoned".to_string()))?
+                .reserve_at(Instant::now());
+            let Some(wait) = wait else {
+                return Ok(());
+            };
+            thread::sleep(wait);
+        }
     }
 
     fn relay_socket_addrs(
@@ -410,12 +480,121 @@ impl DriadResolver {
     }
 }
 
+impl PartialEq for DriadResolver {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+    }
+}
+
+impl Eq for DriadResolver {}
+
+#[derive(Debug)]
+struct DnsQueryLimiter {
+    maximum: usize,
+    window: Duration,
+    queries: VecDeque<Instant>,
+}
+
+impl DnsQueryLimiter {
+    fn new(maximum: usize, window: Duration) -> Self {
+        Self {
+            maximum,
+            window,
+            queries: VecDeque::with_capacity(maximum),
+        }
+    }
+
+    fn reserve_at(&mut self, now: Instant) -> Option<Duration> {
+        while self
+            .queries
+            .front()
+            .is_some_and(|query| now.saturating_duration_since(*query) >= self.window)
+        {
+            self.queries.pop_front();
+        }
+        if self.queries.len() < self.maximum {
+            self.queries.push_back(now);
+            return None;
+        }
+        self.queries.front().map(|query| {
+            self.window
+                .saturating_sub(now.saturating_duration_since(*query))
+        })
+    }
+}
+
+fn order_relay_candidates(selections: &mut [DriadRelaySelection]) {
+    selections.sort_by_key(|selection| selection.record.precedence);
+    let mut start = 0;
+    while start < selections.len() {
+        let precedence = selections[start].record.precedence;
+        let end = selections[start..]
+            .iter()
+            .position(|selection| selection.record.precedence != precedence)
+            .map_or(selections.len(), |offset| start + offset);
+        shuffle_and_interleave_families(&mut selections[start..end]);
+        start = end;
+    }
+}
+
+fn shuffle_and_interleave_families(selections: &mut [DriadRelaySelection]) {
+    if selections.len() < 2 {
+        return;
+    }
+    let mut random = random_u64_best_effort();
+    for index in (1..selections.len()).rev() {
+        random = xorshift64(random);
+        selections.swap(index, random as usize % (index + 1));
+    }
+
+    let prefer_ipv6 = selections[0].relay.is_ipv6();
+    let mut ipv4 = selections
+        .iter()
+        .filter(|selection| selection.relay.is_ipv4())
+        .cloned()
+        .collect::<VecDeque<_>>();
+    let mut ipv6 = selections
+        .iter()
+        .filter(|selection| selection.relay.is_ipv6())
+        .cloned()
+        .collect::<VecDeque<_>>();
+    for (index, selection) in selections.iter_mut().enumerate() {
+        let take_ipv6 = (index % 2 == 0) == prefer_ipv6;
+        *selection = if take_ipv6 {
+            ipv6.pop_front().or_else(|| ipv4.pop_front())
+        } else {
+            ipv4.pop_front().or_else(|| ipv6.pop_front())
+        }
+        .expect("one ordered DRIAD candidate remains");
+    }
+}
+
+fn random_u64_best_effort() -> u64 {
+    let mut bytes = [0u8; 8];
+    if fill_random(&mut bytes).is_ok() {
+        u64::from_ne_bytes(bytes)
+    } else {
+        0x9e37_79b9_7f4a_7c15
+    }
+}
+
+const fn xorshift64(mut value: u64) -> u64 {
+    if value == 0 {
+        value = 0x2545_f491_4f6c_dd1d;
+    }
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^ (value << 17)
+}
+
 fn is_usable_relay_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
         }
-        IpAddr::V6(address) => !address.is_unspecified() && !address.is_multicast(),
+        IpAddr::V6(address) => {
+            !address.is_unspecified() && !address.is_multicast() && !address.is_unicast_link_local()
+        }
     }
 }
 
@@ -463,6 +642,7 @@ pub enum DriadError {
         actual: usize,
     },
     InvalidRelayName,
+    InvalidConfig(&'static str),
     Randomness(String),
     Io(String),
 }
@@ -504,6 +684,7 @@ impl fmt::Display for DriadError {
                 "invalid AMTRELAY target type {relay_type} length {actual}; expected {expected}"
             ),
             Self::InvalidRelayName => write!(f, "invalid AMTRELAY domain-name target"),
+            Self::InvalidConfig(error) => write!(f, "invalid DRIAD configuration: {error}"),
             Self::Randomness(error) => write!(f, "failed to generate DNS query ID: {error}"),
             Self::Io(error) => f.write_str(error),
         }
@@ -594,8 +775,8 @@ pub fn parse_amtrelay_rdata(rdata: &[u8]) -> Result<AmtRelayRecord, DriadError> 
             AmtRelayTarget::Ipv6(Ipv6Addr::from(octets))
         }
         3 => {
-            let (name, consumed) = parse_dns_name(rdata, 2)?;
-            if consumed != rdata.len() || name.is_empty() {
+            let (name, consumed) = parse_uncompressed_dns_name(relay)?;
+            if consumed != relay.len() || name.is_empty() {
                 return Err(DriadError::InvalidRelayName);
             }
             AmtRelayTarget::Name(name)
@@ -608,6 +789,42 @@ pub fn parse_amtrelay_rdata(rdata: &[u8]) -> Result<AmtRelayRecord, DriadError> 
         discovery_optional,
         target,
     })
+}
+
+fn parse_uncompressed_dns_name(input: &[u8]) -> Result<(String, usize), DriadError> {
+    let mut labels = Vec::new();
+    let mut cursor = 0;
+    for _ in 0..128 {
+        let len = *input
+            .get(cursor)
+            .ok_or(DriadError::Truncated("AMTRELAY domain name"))?;
+        if len & 0xc0 != 0 {
+            return Err(DriadError::InvalidRelayName);
+        }
+        cursor += 1;
+        if len == 0 {
+            if cursor > 255 {
+                return Err(DriadError::InvalidRelayName);
+            }
+            return Ok((labels.join("."), cursor));
+        }
+        let label_end = cursor
+            .checked_add(usize::from(len))
+            .ok_or(DriadError::InvalidRelayName)?;
+        let label = input
+            .get(cursor..label_end)
+            .ok_or(DriadError::Truncated("AMTRELAY domain label"))?;
+        labels.push(
+            std::str::from_utf8(label)
+                .map_err(|_| DriadError::InvalidRelayName)?
+                .to_string(),
+        );
+        cursor = label_end;
+        if cursor >= 255 {
+            return Err(DriadError::InvalidRelayName);
+        }
+    }
+    Err(DriadError::InvalidRelayName)
 }
 
 fn require_relay_len(relay_type: u8, relay: &[u8], expected: usize) -> Result<(), DriadError> {
@@ -770,7 +987,7 @@ fn validate_dns_response(
     }
 
     let flags = read_u16(response, 2)?;
-    if flags & 0x8000 == 0 || flags & 0x7800 != 0 || flags & 0x0200 != 0 {
+    if flags & 0x8000 == 0 || flags & 0x7800 != 0 || flags & 0x0200 != 0 || flags & 0x0040 != 0 {
         return Err(DriadError::InvalidDnsFlags(flags));
     }
     let rcode = (flags & 0x000f) as u8;
@@ -919,6 +1136,23 @@ fn randomized_duration(lower: Duration, upper: Duration) -> Duration {
 mod tests {
     use super::*;
 
+    fn selection(precedence: u8, relay: SocketAddr) -> DriadRelaySelection {
+        DriadRelaySelection {
+            source: "192.0.2.1".parse().unwrap(),
+            query_name: "1.2.0.192.in-addr.arpa".to_string(),
+            record: AmtRelayRecord {
+                precedence,
+                discovery_optional: false,
+                target: match relay.ip() {
+                    IpAddr::V4(address) => AmtRelayTarget::Ipv4(address),
+                    IpAddr::V6(address) => AmtRelayTarget::Ipv6(address),
+                },
+            },
+            relay,
+            ttl: Duration::from_secs(60),
+        }
+    }
+
     #[test]
     fn reverse_names_match_ipv4_and_ipv6_sources() {
         assert_eq!(
@@ -929,6 +1163,47 @@ mod tests {
             reverse_source_name(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
         );
+    }
+
+    #[test]
+    fn candidate_order_preserves_precedence_and_interleaves_families() {
+        let mut candidates = vec![
+            selection(20, "[2001:db8::2]:2268".parse().unwrap()),
+            selection(10, "192.0.2.1:2268".parse().unwrap()),
+            selection(10, "[2001:db8::1]:2268".parse().unwrap()),
+            selection(10, "192.0.2.2:2268".parse().unwrap()),
+            selection(10, "[2001:db8::3]:2268".parse().unwrap()),
+        ];
+
+        order_relay_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.record.precedence)
+                .collect::<Vec<_>>(),
+            vec![10, 10, 10, 10, 20]
+        );
+        assert!(
+            candidates[..4]
+                .windows(2)
+                .all(|pair| { pair[0].relay.is_ipv4() != pair[1].relay.is_ipv4() })
+        );
+    }
+
+    #[test]
+    fn dns_query_limiter_bounds_each_window() {
+        let start = Instant::now();
+        let mut limiter = DnsQueryLimiter::new(2, Duration::from_millis(100));
+
+        assert_eq!(limiter.reserve_at(start), None);
+        assert_eq!(limiter.reserve_at(start), None);
+        assert_eq!(limiter.reserve_at(start), Some(Duration::from_millis(100)));
+        assert_eq!(
+            limiter.reserve_at(start + Duration::from_millis(99)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(limiter.reserve_at(start + Duration::from_millis(100)), None);
     }
 
     #[test]
@@ -984,6 +1259,20 @@ mod tests {
             parse_amtrelay_rdata(&[10, 4]),
             Err(DriadError::InvalidRelayType(4))
         );
+        assert_eq!(
+            parse_amtrelay_rdata(&[10, 3, 0xc0, 0x00]),
+            Err(DriadError::InvalidRelayName)
+        );
+    }
+
+    #[test]
+    fn resolver_configuration_rejects_zero_limits() {
+        let mut config = DriadResolverConfig::new(vec!["127.0.0.1:53".parse().unwrap()]);
+        config.max_candidates = 0;
+        assert!(matches!(
+            DriadResolver::new(config).validate(),
+            Err(DriadError::InvalidConfig(_))
+        ));
     }
 
     #[test]

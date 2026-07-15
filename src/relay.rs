@@ -202,9 +202,6 @@ impl Relay {
                 protocol,
                 ecn_capable,
             } => {
-                if request_nonce == 0 {
-                    return Err(RelayError::ZeroNonce);
-                }
                 self.remember_gateway_ecn_capability(peer, ecn_capable);
                 let response_mac = self.response_mac(peer.ip(), peer.port(), request_nonce);
                 let general_query = build_general_query(protocol, &self.config.general_query);
@@ -225,9 +222,6 @@ impl Relay {
                 request_nonce,
                 membership_update,
             } => {
-                if request_nonce == 0 {
-                    return Err(RelayError::ZeroNonce);
-                }
                 if self.valid_response_mac(response_mac, peer.ip(), peer.port(), request_nonce) {
                     if !self.state.contains_endpoint(peer) && self.refusing_new_endpoint(peer.ip())
                     {
@@ -283,9 +277,6 @@ impl Relay {
                 request_nonce,
                 gateway,
             } => {
-                if request_nonce == 0 {
-                    return Err(RelayError::ZeroNonce);
-                }
                 let gateway_ip = gateway
                     .address
                     .as_ipv4_compatible()
@@ -459,7 +450,7 @@ impl fmt::Display for RelayError {
             Self::Decode(error) => write!(f, "{error}"),
             Self::Membership(error) => write!(f, "{error}"),
             Self::ResourceLimit(error) => write!(f, "{error}"),
-            Self::ZeroNonce => f.write_str("AMT nonce must not be zero"),
+            Self::ZeroNonce => f.write_str("AMT Discovery Nonce must not be zero"),
         }
     }
 }
@@ -516,6 +507,17 @@ mod tests {
                 discovery_nonce: 0x1122_3344,
                 relay_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             })
+        );
+    }
+
+    #[test]
+    fn zero_discovery_nonce_is_rejected() {
+        let mut relay = relay();
+        let discovery = encode(&Message::RelayDiscovery { discovery_nonce: 0 });
+
+        assert_eq!(
+            relay.handle_datagram(SocketAddr::from(([198, 51, 100, 8], 40_000)), &discovery),
+            Err(RelayError::ZeroNonce)
         );
     }
 
@@ -658,6 +660,28 @@ mod tests {
     }
 
     #[test]
+    fn membership_update_ignores_padding_after_the_ip_datagram() {
+        let mut relay = relay();
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
+        let nonce = 0xaabb_ccdd;
+        let response_mac = relay.response_mac(peer.ip(), peer.port(), nonce);
+        let mut packet =
+            igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
+        packet.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let update = encode(&Message::MembershipUpdate {
+            response_mac,
+            request_nonce: nonce,
+            membership_update: &packet,
+        });
+
+        assert!(matches!(
+            relay.handle_datagram(peer, &update),
+            Ok(RelayAction::AcceptedMembershipUpdate { .. })
+        ));
+        assert_eq!(relay.state().endpoint_count(), 1);
+    }
+
+    #[test]
     fn bad_membership_update_mac_is_rejected() {
         let mut relay = relay();
         let packet = igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
@@ -676,18 +700,50 @@ mod tests {
     }
 
     #[test]
-    fn zero_nonce_request_is_rejected_without_reflection() {
+    fn zero_request_nonce_is_accepted() {
         let mut relay = relay();
+        let peer = SocketAddr::from(([198, 51, 100, 8], 40_000));
         let request = encode(&Message::Request {
             request_nonce: 0,
             protocol: MembershipProtocol::Igmpv3,
             ecn_capable: false,
         });
 
-        assert_eq!(
-            relay.handle_datagram(SocketAddr::from(([198, 51, 100, 8], 40_000)), &request),
-            Err(RelayError::ZeroNonce)
-        );
+        let RelayAction::Send(response) = relay.handle_datagram(peer, &request).unwrap() else {
+            panic!("expected membership query");
+        };
+        let Message::MembershipQuery {
+            response_mac,
+            request_nonce,
+            ..
+        } = decode(&response).unwrap()
+        else {
+            panic!("expected membership query");
+        };
+
+        assert_eq!(request_nonce, 0);
+        assert_eq!(response_mac, relay.response_mac(peer.ip(), peer.port(), 0));
+
+        let packet = igmpv3_join_packet(Ipv4Addr::new(232, 1, 2, 3), Ipv4Addr::new(192, 0, 2, 1));
+        let update = encode(&Message::MembershipUpdate {
+            response_mac,
+            request_nonce: 0,
+            membership_update: &packet,
+        });
+        assert!(matches!(
+            relay.handle_datagram(peer, &update),
+            Ok(RelayAction::AcceptedMembershipUpdate { .. })
+        ));
+
+        let teardown = encode(&Message::Teardown {
+            response_mac,
+            request_nonce: 0,
+            gateway: GatewayEndpoint::new(peer.port(), peer.ip()),
+        });
+        assert!(matches!(
+            relay.handle_datagram(peer, &teardown),
+            Ok(RelayAction::AcceptedTeardown { removed: true, .. })
+        ));
     }
 
     #[test]

@@ -1,13 +1,16 @@
 use crate::checksum::{checksum as internet_checksum, checksum_parts};
 use crate::protocol::Message;
 use crate::state::UpstreamSubscription;
-use mcrx_core::{
-    McrxError, RawContext, RawPacket, RawSubscriptionConfig, SourceFilter, SubscriptionId,
-};
+#[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+use mcrx_core::RawContext;
+use mcrx_core::{McrxError, RawPacket, RawSubscriptionConfig, SourceFilter, SubscriptionId};
+#[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+use mcrx_core::{SharedRawContext, SharedRawContextLimits};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const MAX_INVALID_PACKET_SKIP: usize = 16;
+const DEFAULT_SHARED_SUBSCRIPTION_LIMIT: usize = 4_096;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpstreamConfig {
@@ -32,17 +35,122 @@ impl UpstreamReconcile {
 #[derive(Debug)]
 pub struct UpstreamManager {
     config: UpstreamConfig,
-    context: RawContext,
+    context: RawReceiveContext,
     active: BTreeMap<UpstreamSubscription, SubscriptionId>,
+}
+
+#[derive(Debug)]
+enum RawReceiveContext {
+    #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+    PerSubscription(RawContext),
+    #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+    Shared(SharedRawContext),
+}
+
+impl RawReceiveContext {
+    #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+    fn new(max_subscriptions: usize) -> Result<Self, McrxError> {
+        SharedRawContext::with_limits(SharedRawContextLimits {
+            max_subscriptions,
+            ..SharedRawContextLimits::default()
+        })
+        .map(Self::Shared)
+    }
+
+    #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+    fn new(max_subscriptions: usize) -> Result<Self, McrxError> {
+        let _ = max_subscriptions;
+        Ok(Self::PerSubscription(RawContext::new()))
+    }
+
+    fn add_subscription(
+        &mut self,
+        config: RawSubscriptionConfig,
+    ) -> Result<SubscriptionId, McrxError> {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => context.add_subscription(config),
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => context.add_subscription(config),
+        }
+    }
+
+    fn join_subscription(&mut self, id: SubscriptionId) -> Result<(), McrxError> {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => context.join_subscription(id),
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => context.join_subscription(id),
+        }
+    }
+
+    fn leave_subscription(&mut self, id: SubscriptionId) -> Result<(), McrxError> {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => context.leave_subscription(id),
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => context.leave_subscription(id),
+        }
+    }
+
+    fn remove_subscription(&mut self, id: SubscriptionId) {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => {
+                context.remove_subscription(id);
+            }
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => {
+                let _ = context.remove_subscription(id);
+            }
+        }
+    }
+
+    fn try_recv_any(&mut self) -> Result<Option<RawPacket>, McrxError> {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => context.try_recv_any(),
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => context
+                .try_recv_any()
+                .map(|packet| packet.map(|packet| packet.packet)),
+        }
+    }
+
+    const fn is_shared(&self) -> bool {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(_) => false,
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(_) => true,
+        }
+    }
+
+    fn capture_socket_count(&self) -> usize {
+        match self {
+            #[cfg(not(all(feature = "shared-upstream", target_os = "linux")))]
+            Self::PerSubscription(context) => context.subscription_count(),
+            #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+            Self::Shared(context) => context.capture_socket_count(),
+        }
+    }
 }
 
 impl UpstreamManager {
     pub fn new(config: UpstreamConfig) -> Self {
-        Self {
+        Self::with_subscription_limit(config, DEFAULT_SHARED_SUBSCRIPTION_LIMIT)
+            .expect("default upstream subscription limit is valid")
+    }
+
+    pub fn with_subscription_limit(
+        config: UpstreamConfig,
+        max_subscriptions: usize,
+    ) -> Result<Self, McrxError> {
+        Ok(Self {
             config,
-            context: RawContext::new(),
+            context: RawReceiveContext::new(max_subscriptions)?,
             active: BTreeMap::new(),
-        }
+        })
     }
 
     pub const fn config(&self) -> &UpstreamConfig {
@@ -55,6 +163,14 @@ impl UpstreamManager {
 
     pub fn active_subscription_count(&self) -> usize {
         self.active.len()
+    }
+
+    pub const fn uses_shared_capture(&self) -> bool {
+        self.context.is_shared()
+    }
+
+    pub fn capture_socket_count(&self) -> usize {
+        self.context.capture_socket_count()
     }
 
     pub fn reconcile(
@@ -420,6 +536,29 @@ fn udp_checksum_parts(parts: &[&[u8]]) -> u16 {
 mod tests {
     use super::*;
     use crate::checksum::ones_complement_sum;
+
+    #[test]
+    fn selects_the_expected_capture_backend() {
+        let manager = UpstreamManager::new(UpstreamConfig::default());
+
+        assert_eq!(
+            manager.uses_shared_capture(),
+            cfg!(all(feature = "shared-upstream", target_os = "linux"))
+        );
+        assert_eq!(manager.capture_socket_count(), 0);
+    }
+
+    #[cfg(all(feature = "shared-upstream", target_os = "linux"))]
+    #[test]
+    fn shared_capture_uses_the_relay_subscription_bound() {
+        assert!(UpstreamManager::with_subscription_limit(UpstreamConfig::default(), 0).is_err());
+        let manager =
+            UpstreamManager::with_subscription_limit(UpstreamConfig::default(), 1_000).unwrap();
+        let RawReceiveContext::Shared(context) = &manager.context else {
+            panic!("expected shared capture backend");
+        };
+        assert_eq!(context.limits().max_subscriptions, 1_000);
+    }
 
     #[test]
     fn parses_ipv4_datagram_addresses() {

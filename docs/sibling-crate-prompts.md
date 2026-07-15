@@ -1,9 +1,9 @@
 # Sibling Crate Feature Prompts
 
-These requests are follow-up optimizations for `mcrx-core` and `mctx-core`.
-They do not block AMT DRIAD or ECN support. AMT must continue to own AMT, DNS,
-IGMP/MLD, ICMP construction, and RFC policy; the sibling crates should expose
-portable packet-I/O mechanisms only.
+These requests are retained as the design record for the capabilities delivered
+in `mcrx-core 0.3.0` and `mctx-core 0.3.0`. AMT continues to own AMT, DNS,
+IGMP/MLD, ICMP construction, and RFC policy; the sibling crates expose only
+packet-I/O mechanisms.
 
 ## Prompt For mcrx-core
 

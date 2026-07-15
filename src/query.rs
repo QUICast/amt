@@ -63,13 +63,32 @@ impl std::error::Error for QueryValidationError {}
 
 impl Default for GeneralQueryConfig {
     fn default() -> Self {
+        Self::for_amt()
+    }
+}
+
+impl GeneralQueryConfig {
+    /// Query values recommended for an AMT relay pseudo-interface.
+    pub const fn for_amt() -> Self {
         Self {
             // RFC 7450 allows 0.0.0.0 and :: as AMT pseudo-interface query
             // sources when no native interface address is available.
             igmp_source: Ipv4Addr::UNSPECIFIED,
             mld_source: Ipv6Addr::UNSPECIFIED,
-            // IGMP encodes values below 128 in tenths of a second; MLD uses
-            // milliseconds. Both defaults therefore describe 10 seconds.
+            // RFC 7450 recommends 1 so gateways answer immediately.
+            igmp_max_response_code: 1,
+            mld_max_response_code: 1,
+            robustness_variable: 2,
+            query_interval_code: 125,
+        }
+    }
+
+    /// Conventional query values for a shared local multicast network.
+    pub const fn for_local_network() -> Self {
+        Self {
+            igmp_source: Ipv4Addr::UNSPECIFIED,
+            mld_source: Ipv6Addr::UNSPECIFIED,
+            // IGMP encodes tenths of a second and MLD encodes milliseconds.
             igmp_max_response_code: 100,
             mld_max_response_code: 10_000,
             robustness_variable: 2,
@@ -96,11 +115,18 @@ pub fn general_query_interval(
     protocol: MembershipProtocol,
     packet: &[u8],
 ) -> Result<Duration, QueryValidationError> {
-    match protocol {
+    validated_general_query(protocol, packet).map(|(interval, _)| interval)
+}
+
+pub(crate) fn validated_general_query(
+    protocol: MembershipProtocol,
+    packet: &[u8],
+) -> Result<(Duration, &[u8]), QueryValidationError> {
+    let (interval_code, datagram_len) = match protocol {
         MembershipProtocol::Igmpv3 => validate_igmpv3_general_query(packet),
         MembershipProtocol::Mldv2 => validate_mldv2_general_query(packet),
-    }
-    .map(query_interval)
+    }?;
+    Ok((query_interval(interval_code), &packet[..datagram_len]))
 }
 
 pub fn query_interval(code: u8) -> Duration {
@@ -130,7 +156,7 @@ pub fn encode_query_interval(interval: Duration) -> u8 {
     u8::MAX
 }
 
-fn validate_igmpv3_general_query(packet: &[u8]) -> Result<u8, QueryValidationError> {
+fn validate_igmpv3_general_query(packet: &[u8]) -> Result<(u8, usize), QueryValidationError> {
     if packet.first().ok_or(QueryValidationError::Truncated)? >> 4 != 4 {
         return Err(QueryValidationError::WrongAddressFamily);
     }
@@ -142,7 +168,7 @@ fn validate_igmpv3_general_query(packet: &[u8]) -> Result<u8, QueryValidationErr
         return Err(QueryValidationError::InvalidHeader);
     }
     let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if total_len != packet.len() || total_len != ihl + IGMPV3_QUERY_LEN {
+    if total_len > packet.len() || total_len != ihl + IGMPV3_QUERY_LEN {
         return Err(QueryValidationError::InvalidLength);
     }
     if packet[8] != 1
@@ -161,7 +187,7 @@ fn validate_igmpv3_general_query(packet: &[u8]) -> Result<u8, QueryValidationErr
         return Err(QueryValidationError::InvalidChecksum);
     }
 
-    let igmp = &packet[ihl..];
+    let igmp = &packet[ihl..total_len];
     if igmp[0] != IGMP_MEMBERSHIP_QUERY
         || igmp[4..8] != [0; 4]
         || u16::from_be_bytes([igmp[10], igmp[11]]) != 0
@@ -171,10 +197,10 @@ fn validate_igmpv3_general_query(packet: &[u8]) -> Result<u8, QueryValidationErr
     if ones_complement_sum(igmp) != 0xffff {
         return Err(QueryValidationError::InvalidChecksum);
     }
-    Ok(igmp[9])
+    Ok((igmp[9], total_len))
 }
 
-fn validate_mldv2_general_query(packet: &[u8]) -> Result<u8, QueryValidationError> {
+fn validate_mldv2_general_query(packet: &[u8]) -> Result<(u8, usize), QueryValidationError> {
     if packet.first().ok_or(QueryValidationError::Truncated)? >> 4 != 6 {
         return Err(QueryValidationError::WrongAddressFamily);
     }
@@ -182,9 +208,8 @@ fn validate_mldv2_general_query(packet: &[u8]) -> Result<u8, QueryValidationErro
         return Err(QueryValidationError::Truncated);
     }
     let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-    if IPV6_HEADER_LEN + payload_len != packet.len()
-        || payload_len != IPV6_HOP_BY_HOP_LEN + MLDV2_QUERY_LEN
-    {
+    let total_len = IPV6_HEADER_LEN + payload_len;
+    if total_len > packet.len() || payload_len != IPV6_HOP_BY_HOP_LEN + MLDV2_QUERY_LEN {
         return Err(QueryValidationError::InvalidLength);
     }
     if packet[6] != HOP_BY_HOP_NEXT_HEADER
@@ -202,7 +227,7 @@ fn validate_mldv2_general_query(packet: &[u8]) -> Result<u8, QueryValidationErro
         return Err(QueryValidationError::InvalidSource);
     }
 
-    let mld = &packet[IPV6_HEADER_LEN + IPV6_HOP_BY_HOP_LEN..];
+    let mld = &packet[IPV6_HEADER_LEN + IPV6_HOP_BY_HOP_LEN..total_len];
     if mld[0] != MLD_LISTENER_QUERY
         || mld[1] != 0
         || mld[8..24] != [0; 16]
@@ -214,7 +239,7 @@ fn validate_mldv2_general_query(packet: &[u8]) -> Result<u8, QueryValidationErro
     if icmpv6_checksum(&source.octets(), &destination, ICMPV6_NEXT_HEADER, mld) != 0 {
         return Err(QueryValidationError::InvalidChecksum);
     }
-    Ok(mld[25])
+    Ok((mld[25], total_len))
 }
 
 pub fn build_igmpv3_general_query(config: &GeneralQueryConfig) -> Vec<u8> {
@@ -296,7 +321,7 @@ mod tests {
 
         let igmp = &packet[IPV4_HEADER_LEN..];
         assert_eq!(igmp[0], IGMP_MEMBERSHIP_QUERY);
-        assert_eq!(igmp[1], 100);
+        assert_eq!(igmp[1], 1);
         assert_eq!(&igmp[4..8], &[0, 0, 0, 0]);
         assert_eq!(u16::from_be_bytes([igmp[10], igmp[11]]), 0);
         assert_eq!(ones_complement_sum(igmp), 0xffff);
@@ -316,7 +341,7 @@ mod tests {
 
         let mld = &packet[48..];
         assert_eq!(mld[0], MLD_LISTENER_QUERY);
-        assert_eq!(u16::from_be_bytes([mld[4], mld[5]]), 10_000);
+        assert_eq!(u16::from_be_bytes([mld[4], mld[5]]), 1);
         assert_eq!(&mld[8..24], &[0; 16]);
         assert_eq!(u16::from_be_bytes([mld[26], mld[27]]), 0);
 
@@ -346,6 +371,29 @@ mod tests {
             validate_general_query(MembershipProtocol::Mldv2, &igmp),
             Err(QueryValidationError::WrongAddressFamily)
         );
+    }
+
+    #[test]
+    fn accepts_and_trims_padding_after_general_queries() {
+        for protocol in [MembershipProtocol::Igmpv3, MembershipProtocol::Mldv2] {
+            let query = build_general_query(protocol, &GeneralQueryConfig::default());
+            let expected_len = query.len();
+            let mut padded = query;
+            padded.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+            let (_, validated) = validated_general_query(protocol, &padded).unwrap();
+
+            assert_eq!(validated.len(), expected_len);
+            assert_eq!(validated, &padded[..expected_len]);
+        }
+    }
+
+    #[test]
+    fn local_network_query_defaults_keep_standard_response_intervals() {
+        let config = GeneralQueryConfig::for_local_network();
+
+        assert_eq!(config.igmp_max_response_code, 100);
+        assert_eq!(config.mld_max_response_code, 10_000);
     }
 
     #[test]
