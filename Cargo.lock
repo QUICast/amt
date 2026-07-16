@@ -195,6 +195,8 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "mcrx-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4ca2c99db9135f88c5c10c1ba9065e8443425e0088d761e4159a3e1ac2c95f5"
 dependencies = [
  "bytes",
  "fs2",
@@ -208,6 +210,8 @@ dependencies = [
 [[package]]
 name = "mctx-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "108d8f9bd836eacf4be55cd21a5ab1e837df554c7b91c53f277a9a4bea4c1ee7"
 dependencies = [
  "libc",
  "socket2",
