@@ -4,6 +4,13 @@ Lightweight Rust building blocks for [Automatic Multicast Tunneling][rfc7450]
 (AMT, RFC 7450). The crates.io package is `quicast-amt`; the library crate and
 installed CLI binary are both named `amt`.
 
+This repository is now a Cargo workspace. The existing package remains
+`quicast-amt`; the experimental `crates/quicast-amtq` package contains the
+runtime-agnostic core plus optional quiche and tokio-quiche Datagram Mode
+transport and managed TLS endpoint layer for the in-progress AMT over QUIC
+draft. It is not yet a runnable AMTQ daemon. See
+[`docs/amtq.md`](docs/amtq.md).
+
 The crate currently includes:
 
 - RFC 7450 message encoding and decoding.
@@ -128,6 +135,8 @@ cargo build --features driad
 cargo build --features metrics
 cargo build --features driad,metrics,shared-upstream,pmtu-feedback
 cargo test
+cargo test -p quicast-amtq
+cargo test -p quicast-amtq --features runtime-tokio-quiche
 cargo run -- --help
 cargo install quicast-amt
 ```

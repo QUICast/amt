@@ -64,7 +64,8 @@ pub use protocol::{
 };
 pub use relay::{Relay, RelayAction, RelayConfig, RelayError, RelaySecret};
 pub use state::{
-    FilterMode, GroupInterest, RelayLimits, RelayState, StateLimitError, UpstreamSubscription,
+    FilterMode, GroupInterest, MembershipEndpoint, MembershipTable, RelayLimits, RelayState,
+    StateLimitError, UpstreamSubscription,
 };
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
 pub use upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager, UpstreamReconcile};

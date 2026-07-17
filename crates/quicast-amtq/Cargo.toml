@@ -1,0 +1,47 @@
+[package]
+name = "quicast-amtq"
+version = "0.0.1"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Experimental AMT over QUIC protocol core and optional quiche transport."
+readme = "README.md"
+repository = "https://github.com/QUICast/amt"
+keywords = ["amt", "multicast", "quic", "tunnel", "networking"]
+categories = ["network-programming"]
+publish = false
+
+[lib]
+name = "amtq"
+path = "src/lib.rs"
+
+[features]
+default = []
+transport-quiche = ["dep:quiche"]
+runtime-tokio-quiche = [
+    "transport-quiche",
+    "dep:boring",
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:tokio-quiche",
+]
+
+[dependencies]
+quicast-amt = { version = "0.2.0", path = "../..", default-features = false }
+boring = { version = "4.22", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+quiche = { version = "0.28.0", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+tokio = { version = "1.44", features = ["net", "rt", "sync", "time"], optional = true }
+tokio-quiche = { version = "0.18.0", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "quiche_loopback"
+path = "tests/quiche_loopback.rs"
+required-features = ["runtime-tokio-quiche"]
+
+[[test]]
+name = "endpoint_loopback"
+path = "tests/endpoint_loopback.rs"
+required-features = ["runtime-tokio-quiche"]

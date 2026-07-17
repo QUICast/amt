@@ -9,6 +9,10 @@ repository = "https://github.com/QUICast/amt"
 keywords = ["amt", "multicast", "tunnel", "udp", "networking"]
 categories = ["network-programming"]
 
+[workspace]
+members = ["crates/quicast-amtq"]
+resolver = "3"
+
 [lib]
 name = "amt"
 path = "src/lib.rs"

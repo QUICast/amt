@@ -3,6 +3,11 @@
 This crate is split into runtime-agnostic protocol/state components and small
 blocking role runners.
 
+The repository also contains the experimental `quicast-amtq` workspace package.
+It reuses the RFC 7450 codec and membership machinery but owns AMTQ framing,
+connection-bound state, Delivery Contexts, and data-mode processing. See
+[`amtq.md`](amtq.md) for that package boundary and rollout.
+
 ## Roles
 
 AMT has two active roles:
@@ -30,7 +35,9 @@ Gateway                           Relay
 The relay code is organized as follows:
 
 - `relay::Relay` handles RFC 7450 control messages and authentication.
-- `state::RelayState` tracks gateway interest by endpoint and group/source.
+- `state::RelayState` tracks gateway interest by endpoint and group/source. It
+  is an alias of the generic `state::MembershipTable<SocketAddr>`; transports
+  with stable connection identity can supply another key type.
 - `state::UpstreamSubscription` summarizes the native multicast joins needed
   for the current gateway set.
 - `upstream::UpstreamManager` reconciles those subscriptions into

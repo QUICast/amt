@@ -3,6 +3,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
+/// Stable identity used to bind multicast reception state to one tunnel.
+///
+/// Classic AMT uses the gateway's UDP endpoint. Transports with their own
+/// connection identity, such as AMTQ, can use a connection-local newtype and
+/// return `None` from [`MembershipEndpoint::source_ip`].
+pub trait MembershipEndpoint: Copy + Ord {
+    fn source_ip(self) -> Option<IpAddr>;
+}
+
+impl MembershipEndpoint for SocketAddr {
+    fn source_ip(self) -> Option<IpAddr> {
+        Some(self.ip())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FilterMode {
     Include,
@@ -106,22 +121,34 @@ impl fmt::Display for StateLimitError {
 
 impl std::error::Error for StateLimitError {}
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RelayState {
-    endpoints: BTreeMap<SocketAddr, EndpointState>,
-    forwarding: BTreeMap<IpAddr, BTreeSet<SocketAddr>>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipTable<K: MembershipEndpoint> {
+    endpoints: BTreeMap<K, EndpointState>,
+    forwarding: BTreeMap<IpAddr, BTreeSet<K>>,
     aggregate: BTreeMap<IpAddr, GroupInterest>,
     subscriptions: BTreeSet<UpstreamSubscription>,
     total_endpoint_groups: usize,
     total_sources: usize,
 }
 
-impl RelayState {
-    pub(crate) fn preview_report(
-        &self,
-        endpoint: SocketAddr,
-        report: &MembershipReport,
-    ) -> (usize, bool) {
+impl<K: MembershipEndpoint> Default for MembershipTable<K> {
+    fn default() -> Self {
+        Self {
+            endpoints: BTreeMap::new(),
+            forwarding: BTreeMap::new(),
+            aggregate: BTreeMap::new(),
+            subscriptions: BTreeSet::new(),
+            total_endpoint_groups: 0,
+            total_sources: 0,
+        }
+    }
+}
+
+/// RFC 7450 relay state keyed by a gateway's UDP endpoint.
+pub type RelayState = MembershipTable<SocketAddr>;
+
+impl<K: MembershipEndpoint> MembershipTable<K> {
+    pub(crate) fn preview_report(&self, endpoint: K, report: &MembershipReport) -> (usize, bool) {
         if report.records.is_empty() {
             return (0, false);
         }
@@ -141,7 +168,7 @@ impl RelayState {
         (applied, changed)
     }
 
-    pub fn apply_report(&mut self, endpoint: SocketAddr, report: &MembershipReport) -> usize {
+    pub fn apply_report(&mut self, endpoint: K, report: &MembershipReport) -> usize {
         if report.records.is_empty() {
             return 0;
         }
@@ -165,7 +192,7 @@ impl RelayState {
 
     pub fn apply_report_limited(
         &mut self,
-        endpoint: SocketAddr,
+        endpoint: K,
         report: &MembershipReport,
         limits: &RelayLimits,
     ) -> Result<usize, StateLimitError> {
@@ -186,7 +213,9 @@ impl RelayState {
         let applied = self.apply_report(endpoint, report);
         let endpoint_state = self.endpoints.get(&endpoint);
         let endpoint_count = self.endpoints.len();
-        let endpoint_ip_count = self.endpoint_count_for_ip(endpoint.ip());
+        let endpoint_ip_count = endpoint
+            .source_ip()
+            .map_or(0, |address| self.endpoint_count_for_ip(address));
         let endpoint_group_count = endpoint_state.map_or(0, |state| state.groups.len());
         let endpoint_group_source_count = endpoint_state
             .into_iter()
@@ -251,7 +280,7 @@ impl RelayState {
         Ok(applied)
     }
 
-    pub fn remove_endpoint(&mut self, endpoint: SocketAddr) -> bool {
+    pub fn remove_endpoint(&mut self, endpoint: K) -> bool {
         let removed = self.endpoints.remove(&endpoint).is_some();
         if removed {
             self.rebuild_indexes();
@@ -259,7 +288,7 @@ impl RelayState {
         removed
     }
 
-    pub fn contains_endpoint(&self, endpoint: SocketAddr) -> bool {
+    pub fn contains_endpoint(&self, endpoint: K) -> bool {
         self.endpoints.contains_key(&endpoint)
     }
 
@@ -270,7 +299,7 @@ impl RelayState {
     pub fn endpoint_count_for_ip(&self, address: IpAddr) -> usize {
         self.endpoints
             .keys()
-            .filter(|endpoint| endpoint.ip() == address)
+            .filter(|endpoint| endpoint.source_ip() == Some(address))
             .count()
     }
 
@@ -278,19 +307,19 @@ impl RelayState {
         near_limit(self.endpoint_count_for_ip(address), limit)
     }
 
-    pub fn endpoint_interest(&self, endpoint: SocketAddr, group: IpAddr) -> Option<&GroupInterest> {
+    pub fn endpoint_interest(&self, endpoint: K, group: IpAddr) -> Option<&GroupInterest> {
         self.endpoints
             .get(&endpoint)
             .and_then(|state| state.groups.get(&group))
     }
 
-    pub fn endpoint_has_interests(&self, endpoint: SocketAddr) -> bool {
+    pub fn endpoint_has_interests(&self, endpoint: K) -> bool {
         self.endpoints
             .get(&endpoint)
             .is_some_and(|state| !state.groups.is_empty())
     }
 
-    pub fn endpoints_for_packet(&self, source: IpAddr, group: IpAddr) -> Vec<SocketAddr> {
+    pub fn endpoints_for_packet(&self, source: IpAddr, group: IpAddr) -> Vec<K> {
         self.matching_endpoints(source, group).collect()
     }
 
@@ -298,7 +327,7 @@ impl RelayState {
         &self,
         source: IpAddr,
         group: IpAddr,
-    ) -> impl Iterator<Item = SocketAddr> + '_ {
+    ) -> impl Iterator<Item = K> + '_ {
         self.forwarding
             .get(&group)
             .into_iter()
