@@ -352,6 +352,11 @@ impl ConnectionId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) const fn from_test_value(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 impl fmt::Display for ConnectionId {

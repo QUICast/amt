@@ -12,8 +12,9 @@ use amt::protocol::encode;
 use amt::query::validate_general_query;
 use amt::{
     FilterMode, GroupInterest, MembershipEndpoint, MembershipParseLimits, MembershipProtocol,
-    MembershipReport, MembershipTable, Message, RelayLimits, ResponseMac, UpstreamSubscription,
-    is_amt_forwardable_group, parse_multicast_packet,
+    MembershipRecord, MembershipRecordKind, MembershipReport, MembershipTable, Message,
+    RelayLimits, ResponseMac, UpstreamSubscription, is_amt_forwardable_group,
+    parse_multicast_packet,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -162,6 +163,90 @@ impl ReceptionState {
                 .is_some_and(|requested| interest_is_subset(authorized, requested))
         })
     }
+
+    /// Returns the packet-set intersection of two reception states.
+    ///
+    /// Authorization policy can use this to retain previously authorized
+    /// interest that is still requested while denying newly requested state.
+    pub fn intersection(&self, other: &Self) -> Self {
+        let mut ipv4_records = Vec::new();
+        let mut ipv6_records = Vec::new();
+        for (group, left) in self.interests() {
+            let Some(right) = other.interest(group) else {
+                continue;
+            };
+            let Some(interest) = intersection_interest(left, right) else {
+                continue;
+            };
+            let record = MembershipRecord {
+                kind: match interest.mode {
+                    FilterMode::Include => MembershipRecordKind::ModeIsInclude,
+                    FilterMode::Exclude => MembershipRecordKind::ModeIsExclude,
+                },
+                group,
+                sources: interest.sources.into_iter().collect(),
+            };
+            match group {
+                IpAddr::V4(_) => ipv4_records.push(record),
+                IpAddr::V6(_) => ipv6_records.push(record),
+            }
+        }
+
+        let mut result = Self::default();
+        if !ipv4_records.is_empty() {
+            result.apply_report(&MembershipReport {
+                protocol: MembershipProtocol::Igmpv3,
+                records: ipv4_records,
+            });
+        }
+        if !ipv6_records.is_empty() {
+            result.apply_report(&MembershipReport {
+                protocol: MembershipProtocol::Mldv2,
+                records: ipv6_records,
+            });
+        }
+        result
+    }
+
+    pub fn current_report(&self, protocol: MembershipProtocol) -> MembershipReport {
+        let records = self
+            .interests()
+            .filter(|(group, _)| {
+                matches!(
+                    (protocol, group),
+                    (MembershipProtocol::Igmpv3, IpAddr::V4(_))
+                        | (MembershipProtocol::Mldv2, IpAddr::V6(_))
+                )
+            })
+            .map(|(group, interest)| MembershipRecord {
+                kind: match interest.mode {
+                    FilterMode::Include => MembershipRecordKind::ModeIsInclude,
+                    FilterMode::Exclude => MembershipRecordKind::ModeIsExclude,
+                },
+                group,
+                sources: interest.sources.iter().copied().collect(),
+            })
+            .collect();
+        MembershipReport { protocol, records }
+    }
+}
+
+fn intersection_interest(left: &GroupInterest, right: &GroupInterest) -> Option<GroupInterest> {
+    let interest = match (left.mode, right.mode) {
+        (FilterMode::Include, FilterMode::Include) => {
+            GroupInterest::include(left.sources.intersection(&right.sources).copied())
+        }
+        (FilterMode::Include, FilterMode::Exclude) => {
+            GroupInterest::include(left.sources.difference(&right.sources).copied())
+        }
+        (FilterMode::Exclude, FilterMode::Include) => {
+            GroupInterest::include(right.sources.difference(&left.sources).copied())
+        }
+        (FilterMode::Exclude, FilterMode::Exclude) => {
+            GroupInterest::exclude(left.sources.union(&right.sources).copied())
+        }
+    };
+    (interest.mode == FilterMode::Exclude || !interest.sources.is_empty()).then_some(interest)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1483,6 +1568,45 @@ mod tests {
         }
         packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
         encode(&Message::MulticastData { packet: &packet })
+    }
+
+    #[test]
+    fn reception_state_intersection_preserves_only_still_requested_packets() {
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let source_a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let source_b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let source_c = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+        let state = |kind, sources| {
+            let mut state = ReceptionState::default();
+            state.apply_report(&MembershipReport {
+                protocol: MembershipProtocol::Igmpv3,
+                records: vec![MembershipRecord {
+                    kind,
+                    group,
+                    sources,
+                }],
+            });
+            state
+        };
+
+        let authorized = state(MembershipRecordKind::ModeIsExclude, vec![source_c]);
+        let requested = state(
+            MembershipRecordKind::ModeIsInclude,
+            vec![source_a, source_c],
+        );
+        let retained = authorized.intersection(&requested);
+
+        assert!(retained.wants(source_a, group));
+        assert!(!retained.wants(source_b, group));
+        assert!(!retained.wants(source_c, group));
+        assert!(retained.is_subset_of(&requested));
+
+        let left = state(MembershipRecordKind::ModeIsExclude, vec![source_a]);
+        let right = state(MembershipRecordKind::ModeIsExclude, vec![source_b]);
+        let intersection = left.intersection(&right);
+        assert!(!intersection.wants(source_a, group));
+        assert!(!intersection.wants(source_b, group));
+        assert!(intersection.wants(source_c, group));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use amt::MembershipProtocol;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant as TokioInstant;
@@ -227,7 +228,7 @@ pub enum RelayCommand {
     },
     SendDatagram {
         context_id: u64,
-        message: Vec<u8>,
+        message: Arc<[u8]>,
     },
     Close,
 }
@@ -426,7 +427,7 @@ impl ControlOutput {
 #[derive(Debug)]
 struct PendingDatagram {
     context_id: u64,
-    message: Vec<u8>,
+    message: Arc<[u8]>,
     fragments: VecDeque<Vec<u8>>,
     refragment_attempts: u8,
 }
@@ -447,13 +448,18 @@ impl DatagramOutput {
         }
     }
 
-    fn push(&mut self, context_id: u64, message: Vec<u8>) -> Result<(), ProtocolError> {
+    /// Queues best-effort multicast data.
+    ///
+    /// A full byte budget drops this message instead of closing the QUIC
+    /// connection. Datagram Mode already permits loss, while disconnecting a
+    /// healthy Gateway would also discard its control and membership state.
+    fn push(&mut self, context_id: u64, message: Arc<[u8]>) -> Result<bool, ProtocolError> {
         let pending = self
             .pending_bytes
             .checked_add(message.len())
             .ok_or_else(|| excessive_load("AMTQ pending data-byte accounting overflow"))?;
         if pending > self.limit {
-            return Err(excessive_load("AMTQ pending data-byte limit exceeded"));
+            return Ok(false);
         }
         self.pending_bytes = pending;
         self.queue.push_back(PendingDatagram {
@@ -462,7 +468,7 @@ impl DatagramOutput {
             fragments: VecDeque::new(),
             refragment_attempts: 0,
         });
-        Ok(())
+        Ok(true)
     }
 
     fn flush(
@@ -980,7 +986,7 @@ impl RelayDriver {
                     context_id,
                     message,
                 } => {
-                    self.datagram_output.push(context_id, message)?;
+                    let _ = self.datagram_output.push(context_id, message)?;
                 }
                 RelayCommand::Close => {
                     let _ = connection.close(true, 0, b"AMTQ Relay shutdown");
@@ -1286,11 +1292,8 @@ mod tests {
     #[test]
     fn pending_output_is_bounded() {
         let mut output = DatagramOutput::new(4);
-        output.push(0, vec![1, 2, 3, 4]).unwrap();
-        assert_eq!(
-            output.push(0, vec![5]).unwrap_err().code,
-            ApplicationError::ExcessiveLoad
-        );
+        assert!(output.push(0, vec![1, 2, 3, 4].into()).unwrap());
+        assert!(!output.push(0, vec![5].into()).unwrap());
     }
 
     #[test]

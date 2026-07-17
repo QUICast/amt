@@ -5,8 +5,9 @@ blocking role runners.
 
 The repository also contains the experimental `quicast-amtq` workspace package.
 It reuses the RFC 7450 codec and membership machinery but owns AMTQ framing,
-connection-bound state, Delivery Contexts, and data-mode processing. See
-[`amtq.md`](amtq.md) for that package boundary and rollout.
+connection-bound state, Delivery Contexts, data-mode processing, managed
+quiche endpoints, and its opt-in native data plane. See [`amtq.md`](amtq.md)
+for that package boundary and rollout.
 
 ## Roles
 
@@ -65,6 +66,13 @@ committed only when required additions succeed. A bad or unsupported join can
 therefore reject one update but cannot terminate the daemon or replace working
 state. Configurable endpoint/group/source limits and per-source/global token
 buckets bound public control-plane work.
+
+AMTQ uses the same transactional ordering across stable QUIC `ConnectionId`
+keys. Its native Relay service aggregates all connection states before
+reconciling `mcrx-core`, opens Delivery Context 0 only after authorization, and
+fans packets out only to matching, context-ready Gateways. Raw receive and
+publication operations run on bounded dedicated workers rather than Tokio's
+QUIC tasks.
 
 The blocking relay daemon also keeps lightweight gateway activity bookkeeping.
 Accepted Membership Updates mark a gateway as active, Teardown removes it

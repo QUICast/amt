@@ -137,6 +137,7 @@ cargo build --features driad,metrics,shared-upstream,pmtu-feedback
 cargo test
 cargo test -p quicast-amtq
 cargo test -p quicast-amtq --features runtime-tokio-quiche
+cargo build -p quicast-amtq --features daemon
 cargo run -- --help
 cargo install quicast-amt
 ```
@@ -144,6 +145,11 @@ cargo install quicast-amt
 The default `runtime` feature builds the daemon and raw mcrx/mctx integration.
 `--no-default-features` builds only the portable protocol, query, membership,
 gateway, relay, and state-machine core.
+
+The experimental AMTQ package remains opt-in. Its `daemon` feature builds the
+`amtq` binary with quiche/tokio-quiche, TLS, and native multicast integration;
+its default build remains a runtime-independent protocol core. See
+[`docs/amtq.md`](docs/amtq.md) for AMTQ commands and current limitations.
 
 The supported daemon targets are Linux, macOS, and Windows. iOS is deliberately
 rejected at compile time, including core-only builds, because this project does

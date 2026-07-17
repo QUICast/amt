@@ -29,11 +29,14 @@ required-features = ["runtime"]
 
 [features]
 default = ["runtime"]
+native-multicast = [
+    "dep:mcrx-core",
+    "dep:mctx-core",
+]
 runtime = [
     "dep:ctrlc",
     "dep:libc",
-    "dep:mcrx-core",
-    "dep:mctx-core",
+    "native-multicast",
     "dep:quinn-udp",
     "dep:serde",
     "dep:socket2",
@@ -43,7 +46,7 @@ runtime = [
 driad = []
 metrics = ["runtime", "dep:serde_json", "mcrx-core/metrics"]
 pmtu-feedback = ["runtime", "mctx-core/raw-ip"]
-shared-upstream = ["runtime", "mcrx-core/raw-shared-capture"]
+shared-upstream = ["native-multicast", "mcrx-core/raw-shared-capture"]
 
 [dependencies]
 ctrlc = { version = "3.5.2", features = ["termination"], optional = true }

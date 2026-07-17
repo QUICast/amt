@@ -202,7 +202,7 @@ async fn certificate_verified_datagram_session_delivers_complete_and_fragmented_
         relay
             .send(RelayCommand::SendDatagram {
                 context_id: CONTEXT_ID,
-                message: message.clone(),
+                message: message.clone().into(),
             })
             .await
             .unwrap();

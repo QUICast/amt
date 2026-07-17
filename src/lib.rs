@@ -14,14 +14,14 @@ mod checksum;
 pub mod config;
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
 pub mod daemon;
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub mod downstream;
 #[cfg(feature = "driad")]
 pub mod driad;
 pub mod ecn;
 pub mod gateway;
 pub mod ip;
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub mod local_membership;
 pub mod membership;
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
@@ -35,10 +35,10 @@ pub mod relay;
 pub mod state;
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
 mod udp;
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub mod upstream;
 
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub use downstream::{DownstreamConfig, DownstreamForward, DownstreamPublisher};
 #[cfg(feature = "driad")]
 pub use driad::{
@@ -48,7 +48,7 @@ pub use driad::{
 pub use ecn::{EcnCodepoint, EcnDecapsulation, EcnError, decapsulate_ecn, ip_ecn};
 pub use gateway::{Gateway, GatewayAction, GatewayConfig, GatewayError, GatewayPhase, GatewaySend};
 pub use ip::{IpPacketError, MulticastPacket, is_amt_forwardable_group, parse_multicast_packet};
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub use local_membership::{
     LocalMembershipConfig, LocalMembershipError, LocalMembershipEvent, LocalMembershipManager,
 };
@@ -67,5 +67,5 @@ pub use state::{
     FilterMode, GroupInterest, MembershipEndpoint, MembershipTable, RelayLimits, RelayState,
     StateLimitError, UpstreamSubscription,
 };
-#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "native-multicast", not(target_os = "ios")))]
 pub use upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager, UpstreamReconcile};

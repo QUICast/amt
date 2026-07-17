@@ -92,15 +92,109 @@ The integration suite verifies idle survival beyond the negotiated timeout,
 capacity rejection, wrong-hostname rejection, optional mutual TLS, and active
 connection cleanup.
 
+## Native Data Plane
+
+The optional `native-multicast` feature connects the managed endpoints to the
+same raw multicast primitives used by classic AMT:
+
+- The Relay applies each pending Membership Update to a cloned aggregate
+  `MembershipTable<ConnectionId>`. It reconciles all required native
+  subscriptions before authorizing the update and commits the candidate only
+  after required joins succeed.
+- Aggregate-limit or native-join denial does not close the connection.
+  Requested state still commits, while the intersection of prior Authorized
+  state and current Requested state remains authorized, as required by the
+  draft's no-failure-signal authorization model.
+- Aggregate state collapses overlapping Gateway requests. One ASM request
+  supersedes SSM subscriptions for the same group, while pure SSM interest
+  retains the exact union of requested sources.
+- Upstream capture runs on a named native thread. It uses a bounded packet
+  channel and a nonzero idle poll interval, so raw socket work cannot block the
+  Tokio QUIC runtime or regress into a busy loop.
+- The Relay opens Datagram Context 0 after the first non-empty authorized
+  state and forwards only after the Gateway acknowledges that context.
+- One normalized AMT Multicast Data message is held in `Arc<[u8]>` across
+  Gateway fan-out. Each connection performs its own path-sized framing without
+  first copying the complete multicast packet.
+- A slow Gateway fills bounded queues and loses best-effort multicast data
+  rather than forcing a protocol close. Control-plane limit violations remain
+  fail-closed.
+- The Gateway automatically performs SETTINGS, Request, Membership Query, and
+  periodic full-state Membership Update processing. Accepted multicast IP
+  datagrams are published through a dedicated `mctx-core` worker.
+
+The `shared-upstream` feature selects `mcrx-core` shared raw capture on Linux.
+Other supported systems retain per-subscription capture. Native socket and
+platform limitations are inherited from `mcrx-core` and `mctx-core`.
+
+## First Daemon
+
+The `daemon` feature builds a deliberately small `amtq` executable. AMTQ does
+not require a dedicated UDP port; the examples use 2268 only as a convenient
+provisioned test port.
+
+Relay:
+
+```bash
+cargo build -p quicast-amtq --release --features daemon,shared-upstream
+
+sudo ./target/release/amtq relay \
+  --bind 0.0.0.0:2268 \
+  --cert /etc/quicast/amtq/fullchain.pem \
+  --key /etc/quicast/amtq/private-key.pem \
+  --upstream-interface 192.0.2.10 \
+  --max-subscriptions 4096
+```
+
+Static IPv4 ASM Gateway:
+
+```bash
+sudo ./target/release/amtq gateway \
+  --relay 203.0.113.10:2268 \
+  --server-name relay.example \
+  --protocol igmpv3 \
+  --join 239.1.2.3 \
+  --downstream-interface 192.168.1.10
+```
+
+Static IPv4 SSM Gateway:
+
+```bash
+sudo ./target/release/amtq gateway \
+  --relay 203.0.113.10:2268 \
+  --server-name relay.example \
+  --protocol igmpv3 \
+  --join 192.0.2.20@232.1.2.3 \
+  --downstream-interface 192.168.1.10
+```
+
+Use `--ca FILE` for a private Relay CA. Without it, the Gateway verifies
+against system roots. There is no insecure verification mode. A Relay can add
+`--client-ca FILE`; Gateways then provide both `--client-cert` and
+`--client-key`.
+
+The first daemon intentionally accepts static memberships only. Transparent
+LAN membership capture and reconnect policy belong above this now-tested
+service boundary and do not require wire-format changes.
+
+## Testing
+
+The unprivileged native loopback test uses real TLS and QUIC, automatically
+completes a no-interest membership transaction, and verifies worker cleanup.
+The ignored Linux namespace test adds real `mcrx`/`mctx` packet forwarding:
+
+```bash
+sudo -E env PATH="$PATH" cargo test -p quicast-amtq \
+  --features daemon,shared-upstream \
+  --test native_system_linux -- --ignored --test-threads=1 --nocapture
+```
+
 ## Next Milestone
 
-The next implementation milestone is native multicast and a useful daemon:
-
-1. Connect Relay Authorized Reception State to shared native `mcrx-core`
-   subscriptions and Gateway delivery to `mctx-core`.
-2. Add an `amtq` executable only once it can join, tunnel, and publish real
-   multicast rather than merely maintain a QUIC handshake.
-3. Add connection migration/rebinding and remote quiche interoperability tests.
-4. Implement Reliable Block Mode stream FIN/RESET/STOP_SENDING semantics before
+1. Add automatic Gateway reconnect with bounded backoff and full membership
+   replay, then transparent local IGMPv3/MLDv2 membership capture.
+2. Run remote quiche interoperability and QUIC migration/rebinding tests.
+3. Implement Reliable Block Mode stream FIN/RESET/STOP_SENDING semantics before
    enabling that mode in the runtime.
-5. Add configuration and metrics after the lifecycle is stable.
+4. Add configuration files and Heimdall-style optional metrics.
+5. Track draft revisions without changing the stable RFC 7450 package.

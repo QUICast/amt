@@ -9,6 +9,8 @@
 pub mod control;
 pub mod datagram;
 pub mod error;
+#[cfg(feature = "native-multicast")]
+pub mod native;
 pub mod reassembly;
 pub mod reliable;
 pub mod session;
