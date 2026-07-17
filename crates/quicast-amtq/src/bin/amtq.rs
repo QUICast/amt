@@ -1,18 +1,20 @@
 use amt::{DownstreamConfig, MembershipProtocol, RelayLimits, UpstreamConfig};
 use amtq::native::{
-    NativeGateway, NativeGatewayConfig, NativeJoin, NativeRelay, NativeRelayConfig,
-    static_membership_report,
+    NativeGateway, NativeGatewayConfig, NativeGatewaySnapshot, NativeJoin, NativeRelay,
+    NativeRelayConfig, NativeRelaySnapshot, static_membership_report,
 };
 use amtq::transport::endpoint::{
-    GatewayEndpointConfig, GatewayTrust, RelayEndpointConfig, TlsIdentity,
+    GatewayEndpointConfig, GatewayTrust, RelayEndpointConfig, RelayEndpointSnapshot, TlsIdentity,
 };
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_BIND: &str = "0.0.0.0:2268";
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const TRAFFIC_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -51,15 +53,36 @@ async fn run_relay(config: NativeRelayConfig) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     println!("amtq relay listening on {}", relay.local_address());
+    println!("amtq relay ready; waiting for gateways and membership updates");
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.map_err(|error| format!("failed to listen for Ctrl-C: {error}"))?;
+    let endpoint_stats = relay.endpoint_stats();
+    let native_stats = relay.stats();
+    let mut reporter = RelayStatusReporter::default();
+    let mut status_tick = status_interval();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let signal_error = loop {
+        tokio::select! {
+            result = &mut ctrl_c => {
+                break result
+                    .err()
+                    .map(|error| format!("failed to listen for Ctrl-C: {error}"));
+            }
+            () = relay.wait_stopped() => break None,
+            _ = status_tick.tick() => {
+                print_status(reporter.observe(
+                    endpoint_stats.snapshot(),
+                    native_stats.snapshot(),
+                    Instant::now(),
+                ));
+            }
         }
-        () = relay.wait_stopped() => {}
-    }
+    };
 
     let stop = relay.shutdown().await.map_err(|error| error.to_string())?;
+    if let Some(error) = signal_error {
+        return Err(error);
+    }
     println!(
         "amtq relay stopped: graceful={} active_subscriptions={} forwarded={} queue_drops={}",
         stop.endpoint.graceful,
@@ -78,17 +101,32 @@ async fn run_gateway(config: NativeGatewayConfig) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     println!("amtq gateway connected to {relay_address} with {record_count} membership record(s)");
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.map_err(|error| format!("failed to listen for Ctrl-C: {error}"))?;
+    let stats = gateway.stats();
+    let mut reporter = GatewayStatusReporter::default();
+    let mut status_tick = status_interval();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let signal_error = loop {
+        tokio::select! {
+            result = &mut ctrl_c => {
+                break result
+                    .err()
+                    .map(|error| format!("failed to listen for Ctrl-C: {error}"));
+            }
+            () = gateway.wait_stopped() => break None,
+            _ = status_tick.tick() => {
+                print_status(reporter.observe(stats.snapshot(), Instant::now()));
+            }
         }
-        () = gateway.wait_stopped() => {}
-    }
+    };
 
     let stop = gateway
         .shutdown()
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(error) = signal_error {
+        return Err(error);
+    }
     println!(
         "amtq gateway stopped: graceful={} received={} queued={} queue_drops={}",
         stop.connection.graceful,
@@ -97,6 +135,140 @@ async fn run_gateway(config: NativeGatewayConfig) -> Result<(), String> {
         stop.snapshot.downstream_queue_drops,
     );
     Ok(())
+}
+
+fn status_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(STATUS_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+fn print_status(lines: Vec<String>) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+fn delta(current: u64, previous: u64) -> u64 {
+    current.saturating_sub(previous)
+}
+
+#[derive(Default)]
+struct RelayStatusReporter {
+    endpoint: RelayEndpointSnapshot,
+    native: NativeRelaySnapshot,
+    traffic: NativeRelaySnapshot,
+    last_traffic_report: Option<Instant>,
+}
+
+impl RelayStatusReporter {
+    fn observe(
+        &mut self,
+        endpoint: RelayEndpointSnapshot,
+        native: NativeRelaySnapshot,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        if endpoint.active_connections != self.endpoint.active_connections
+            || endpoint.established_connections != self.endpoint.established_connections
+            || endpoint.closed_connections != self.endpoint.closed_connections
+        {
+            lines.push(format!(
+                "amtq relay gateways: active={} established={} closed={}",
+                endpoint.active_connections,
+                endpoint.established_connections,
+                endpoint.closed_connections,
+            ));
+        }
+
+        if native.active_upstream_subscriptions != self.native.active_upstream_subscriptions {
+            lines.push(format!(
+                "amtq relay memberships: active_subscriptions={} updates={} rejected={}",
+                native.active_upstream_subscriptions,
+                native.membership_updates,
+                native.rejected_membership_updates,
+            ));
+        }
+
+        let traffic_changed = native.upstream_packets != self.traffic.upstream_packets
+            || native.forwarded_datagrams != self.traffic.forwarded_datagrams
+            || native.packet_queue_drops != self.traffic.packet_queue_drops;
+        let report_due = self
+            .last_traffic_report
+            .is_none_or(|last| now.duration_since(last) >= TRAFFIC_REPORT_INTERVAL);
+        if traffic_changed && report_due {
+            lines.push(format!(
+                "amtq relay traffic: upstream=+{} forwarded=+{} queue_drops=+{} total_forwarded={}",
+                delta(native.upstream_packets, self.traffic.upstream_packets),
+                delta(native.forwarded_datagrams, self.traffic.forwarded_datagrams,),
+                delta(native.packet_queue_drops, self.traffic.packet_queue_drops),
+                native.forwarded_datagrams,
+            ));
+            self.traffic = native;
+            self.last_traffic_report = Some(now);
+        }
+
+        self.endpoint = endpoint;
+        self.native = native;
+        lines
+    }
+}
+
+#[derive(Default)]
+struct GatewayStatusReporter {
+    membership_announced: bool,
+    traffic: NativeGatewaySnapshot,
+    last_traffic_report: Option<Instant>,
+}
+
+impl GatewayStatusReporter {
+    fn observe(&mut self, snapshot: NativeGatewaySnapshot, now: Instant) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        if !self.membership_announced && snapshot.membership_updates_sent != 0 {
+            lines.push(format!(
+                "amtq gateway membership update sent; waiting for multicast data (updates={})",
+                snapshot.membership_updates_sent,
+            ));
+            self.membership_announced = true;
+        }
+
+        let traffic_changed = snapshot.multicast_datagrams_received
+            != self.traffic.multicast_datagrams_received
+            || snapshot.multicast_bytes_received != self.traffic.multicast_bytes_received
+            || snapshot.downstream_datagrams_queued != self.traffic.downstream_datagrams_queued
+            || snapshot.downstream_queue_drops != self.traffic.downstream_queue_drops;
+        let report_due = self
+            .last_traffic_report
+            .is_none_or(|last| now.duration_since(last) >= TRAFFIC_REPORT_INTERVAL);
+        if traffic_changed && report_due {
+            lines.push(format!(
+                "amtq gateway traffic: received=+{} bytes=+{} queued_for_lan=+{} queue_drops=+{} total_received={}",
+                delta(
+                    snapshot.multicast_datagrams_received,
+                    self.traffic.multicast_datagrams_received,
+                ),
+                delta(
+                    snapshot.multicast_bytes_received,
+                    self.traffic.multicast_bytes_received,
+                ),
+                delta(
+                    snapshot.downstream_datagrams_queued,
+                    self.traffic.downstream_datagrams_queued,
+                ),
+                delta(
+                    snapshot.downstream_queue_drops,
+                    self.traffic.downstream_queue_drops,
+                ),
+                snapshot.multicast_datagrams_received,
+            ));
+            self.traffic = snapshot;
+            self.last_traffic_report = Some(now);
+        }
+
+        lines
+    }
 }
 
 fn parse_relay(args: impl IntoIterator<Item = String>) -> Result<NativeRelayConfig, String> {
@@ -438,5 +610,118 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("address family"));
+    }
+
+    #[test]
+    fn relay_status_reports_changes_without_idle_or_refresh_spam() {
+        let now = Instant::now();
+        let mut reporter = RelayStatusReporter::default();
+        assert!(
+            reporter
+                .observe(
+                    RelayEndpointSnapshot::default(),
+                    NativeRelaySnapshot::default(),
+                    now,
+                )
+                .is_empty()
+        );
+
+        let endpoint = RelayEndpointSnapshot {
+            established_connections: 1,
+            active_connections: 1,
+            ..RelayEndpointSnapshot::default()
+        };
+        let native = NativeRelaySnapshot {
+            membership_updates: 1,
+            active_upstream_subscriptions: 1,
+            ..NativeRelaySnapshot::default()
+        };
+        let lines = reporter.observe(endpoint, native, now + Duration::from_secs(1));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("active=1"));
+        assert!(lines[1].contains("active_subscriptions=1"));
+
+        let refresh = NativeRelaySnapshot {
+            membership_updates: 2,
+            ..native
+        };
+        assert!(
+            reporter
+                .observe(endpoint, refresh, now + Duration::from_secs(2))
+                .is_empty()
+        );
+
+        let traffic = NativeRelaySnapshot {
+            upstream_packets: 10,
+            forwarded_datagrams: 10,
+            ..refresh
+        };
+        let lines = reporter.observe(endpoint, traffic, now + Duration::from_secs(3));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("forwarded=+10"));
+
+        let more_traffic = NativeRelaySnapshot {
+            upstream_packets: 11,
+            forwarded_datagrams: 11,
+            ..traffic
+        };
+        assert!(
+            reporter
+                .observe(endpoint, more_traffic, now + Duration::from_secs(4))
+                .is_empty()
+        );
+        let lines = reporter.observe(
+            endpoint,
+            more_traffic,
+            now + TRAFFIC_REPORT_INTERVAL + Duration::from_secs(3),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("forwarded=+1"));
+    }
+
+    #[test]
+    fn gateway_status_reports_first_membership_and_rate_limits_traffic() {
+        let now = Instant::now();
+        let mut reporter = GatewayStatusReporter::default();
+
+        let membership = NativeGatewaySnapshot {
+            membership_updates_sent: 1,
+            ..NativeGatewaySnapshot::default()
+        };
+        let lines = reporter.observe(membership, now);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("membership update sent"));
+
+        let refresh = NativeGatewaySnapshot {
+            membership_updates_sent: 2,
+            ..membership
+        };
+        assert!(
+            reporter
+                .observe(refresh, now + Duration::from_secs(1))
+                .is_empty()
+        );
+
+        let traffic = NativeGatewaySnapshot {
+            multicast_datagrams_received: 4,
+            multicast_bytes_received: 4_096,
+            downstream_datagrams_queued: 4,
+            ..refresh
+        };
+        let lines = reporter.observe(traffic, now + Duration::from_secs(2));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("received=+4"));
+
+        let more_traffic = NativeGatewaySnapshot {
+            multicast_datagrams_received: 5,
+            multicast_bytes_received: 5_120,
+            downstream_datagrams_queued: 5,
+            ..traffic
+        };
+        assert!(
+            reporter
+                .observe(more_traffic, now + Duration::from_secs(3))
+                .is_empty()
+        );
     }
 }
