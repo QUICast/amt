@@ -2,7 +2,7 @@ use super::io::{DownstreamWorker, QueueSendError};
 use super::{NativeError, NativeIoConfig, random_request_nonce};
 use crate::session::{GatewayEvent, ReceptionState};
 use crate::transport::endpoint::{
-    GatewayConnection, GatewayEndpointConfig, ShutdownReport, connect_gateway,
+    GatewayConnection, GatewayEndpointConfig, GatewayPathStats, ShutdownReport, connect_gateway,
 };
 use crate::transport::tokio_quiche::{GatewayCommand, GatewayTransportEvent};
 use amt::membership::build_membership_report;
@@ -56,13 +56,33 @@ impl NativeGatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeGatewaySnapshot {
+    pub path_reachable: bool,
+    pub path_outages: u64,
+    pub path_recoveries: u64,
+    pub path_datagrams_dropped: u64,
     pub membership_updates_sent: u64,
     pub multicast_datagrams_received: u64,
     pub multicast_bytes_received: u64,
     pub downstream_datagrams_queued: u64,
     pub downstream_queue_drops: u64,
+}
+
+impl Default for NativeGatewaySnapshot {
+    fn default() -> Self {
+        Self {
+            path_reachable: true,
+            path_outages: 0,
+            path_recoveries: 0,
+            path_datagrams_dropped: 0,
+            membership_updates_sent: 0,
+            multicast_datagrams_received: 0,
+            multicast_bytes_received: 0,
+            downstream_datagrams_queued: 0,
+            downstream_queue_drops: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -74,14 +94,35 @@ struct NativeGatewayCounters {
     downstream_queue_drops: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NativeGatewayStats {
     counters: Arc<NativeGatewayCounters>,
+    path: GatewayPathStats,
+}
+
+impl Default for NativeGatewayStats {
+    fn default() -> Self {
+        Self::new(GatewayPathStats::default())
+    }
+}
+
+impl NativeGatewayStats {
+    fn new(path: GatewayPathStats) -> Self {
+        Self {
+            counters: Arc::new(NativeGatewayCounters::default()),
+            path,
+        }
+    }
 }
 
 impl NativeGatewayStats {
     pub fn snapshot(&self) -> NativeGatewaySnapshot {
+        let path = self.path.snapshot();
         NativeGatewaySnapshot {
+            path_reachable: path.reachable,
+            path_outages: path.outages,
+            path_recoveries: path.recoveries,
+            path_datagrams_dropped: path.locally_dropped_datagrams,
             membership_updates_sent: self
                 .counters
                 .membership_updates_sent
@@ -129,7 +170,7 @@ impl NativeGateway {
             }
         };
 
-        let stats = NativeGatewayStats::default();
+        let stats = NativeGatewayStats::new(connection.path_stats());
         let task_stats = stats.clone();
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);

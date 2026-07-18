@@ -1,5 +1,7 @@
 //! Production-oriented AMTQ socket, TLS, admission, and lifecycle boundary.
 
+use super::roaming::gateway_socket;
+pub use super::roaming::{GatewayPathSnapshot, GatewayPathStats};
 use super::tokio_quiche::{
     ConnectionStatus, GatewayCloseHandle, GatewayController, GatewayDriver, GatewayDriverConfig,
     RelayCloseHandle, RelayController, RelayDriver, RelayDriverConfig, quic_settings,
@@ -26,7 +28,6 @@ use tokio_quiche::ConnectionParams;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::ConnectionHook;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
-use tokio_quiche::socket::Socket;
 use tokio_quiche::{InitialQuicConnection, QuicConnection};
 
 const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -464,6 +465,7 @@ pub struct GatewayConnection {
     controller: GatewayController,
     close_handle: GatewayCloseHandle,
     status: watch::Receiver<ConnectionStatus>,
+    path_stats: GatewayPathStats,
     transport: QuicConnection,
     shutdown_timeout: Duration,
     closing: bool,
@@ -484,6 +486,10 @@ impl GatewayConnection {
 
     pub const fn transport(&self) -> &QuicConnection {
         &self.transport
+    }
+
+    pub fn path_stats(&self) -> GatewayPathStats {
+        self.path_stats.clone()
     }
 
     pub async fn shutdown(&mut self) -> ShutdownReport {
@@ -632,12 +638,8 @@ pub async fn connect_gateway(
     let socket = UdpSocket::bind(config.bind_address)
         .await
         .map_err(|source| io_error("bind the Gateway UDP socket", source))?;
-    socket
-        .connect(config.relay_address)
-        .await
-        .map_err(|source| io_error("connect the Gateway UDP socket", source))?;
-    let socket = Socket::try_from(socket)
-        .map_err(|source| io_error("create the Gateway QUIC socket", source))?;
+    let (socket, path_stats) = gateway_socket(socket, config.relay_address)
+        .map_err(|source| io_error("create the roaming Gateway QUIC socket", source))?;
     let mut settings = quic_settings(&config.driver.transport)?;
     apply_connection_policy(&mut settings, &config.connection);
 
@@ -660,6 +662,7 @@ pub async fn connect_gateway(
         controller,
         close_handle,
         status,
+        path_stats,
         transport,
         shutdown_timeout: config.connection.shutdown_timeout,
         closing: false,

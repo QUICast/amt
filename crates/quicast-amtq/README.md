@@ -33,7 +33,11 @@ dependencies outside the stable AMT package.
 - A production-oriented endpoint layer with TLS identities and trust stores,
   reference-identity verification, optional Gateway mTLS, stateless address
   validation, global/per-IP admission limits, keepalive, stable connection
-  IDs, lifecycle accounting, and bounded graceful shutdown.
+  IDs, lifecycle accounting, same-connection Gateway roaming, and bounded
+  graceful shutdown.
+- Wildcard-bound Gateway UDP sockets that allow kernel route/source reselection
+  after routing changes, preserve the QUIC connection across NAT rebinding and
+  local same-family address changes, and expose path outage/recovery counters.
 - Native Relay subscription aggregation through `mcrx-core`, including
   cross-connection ASM/SSM collapse and optional Linux shared capture.
 - Native Gateway publication through `mctx-core` while preserving complete
@@ -53,7 +57,6 @@ dependencies outside the stable AMT package.
   STOP_SENDING handling.
 - Transparent LAN IGMPv3/MLDv2 membership capture.
 - Automatic Gateway reconnect and AMTQ Relay discovery.
-- Connection migration interoperability tests.
 - Metrics, configuration files, and live interoperability tests.
 
 The tokio-quiche driver currently implements Datagram Mode only. It rejects a
@@ -96,10 +99,11 @@ cargo clippy -p quicast-amtq --all-targets \
 
 The endpoint integration tests require permission to bind local UDP sockets.
 They cover idle keepalive, admission rejection, hostname mismatch rejection,
-optional mTLS, and connection cleanup in addition to the complete AMTQ
-Datagram Mode exchange.
+optional mTLS, connection-ID routing across a peer-address change, and
+connection cleanup in addition to the complete AMTQ Datagram Mode exchange.
 
-On Linux, the ignored namespace test exercises the complete native path:
+On Linux, the ignored namespace tests exercise the complete native path and a
+real Gateway source-IP handover between two interfaces:
 
 ```bash
 sudo -E env PATH="$PATH" cargo test -p quicast-amtq \
@@ -109,3 +113,23 @@ sudo -E env PATH="$PATH" cargo test -p quicast-amtq \
 
 The package is intentionally `publish = false` while the draft and wire format
 are experimental.
+
+## Gateway Roaming
+
+Gateway roaming is enabled by the default wildcard bind. Do not pass
+`--bind` when the operating system should select a new interface and source
+address after a route change. A concrete `--bind IP:PORT` deliberately pins
+the socket and cannot roam after that address disappears.
+
+The UDP socket remains open and unconnected. Each send is therefore eligible
+for route and source-address reselection; operating systems retain their normal
+steady-state route caches and invalidate them when routing changes. The Relay
+uses the QUIC connection ID to associate packets arriving from the new public
+IP or NAT mapping, validates the replacement path, and retains the existing
+AMTQ control session and membership state. Transient route errors are treated
+as packet loss rather than fatal socket errors.
+
+Migration must complete within the configured QUIC idle timeout, which defaults
+to 90 seconds. The current socket is also family-specific, so an IPv4-to-IPv6
+handover requires a new connection; automatic fallback reconnect is not yet
+implemented.

@@ -128,11 +128,12 @@ async fn run_gateway(config: NativeGatewayConfig) -> Result<(), String> {
         return Err(error);
     }
     println!(
-        "amtq gateway stopped: graceful={} received={} queued={} queue_drops={}",
+        "amtq gateway stopped: graceful={} received={} queued={} queue_drops={} path_outages={}",
         stop.connection.graceful,
         stop.snapshot.multicast_datagrams_received,
         stop.snapshot.downstream_datagrams_queued,
         stop.snapshot.downstream_queue_drops,
+        stop.snapshot.path_outages,
     );
     Ok(())
 }
@@ -218,6 +219,7 @@ impl RelayStatusReporter {
 #[derive(Default)]
 struct GatewayStatusReporter {
     membership_announced: bool,
+    path: NativeGatewaySnapshot,
     traffic: NativeGatewaySnapshot,
     last_traffic_report: Option<Instant>,
 }
@@ -225,6 +227,27 @@ struct GatewayStatusReporter {
 impl GatewayStatusReporter {
     fn observe(&mut self, snapshot: NativeGatewaySnapshot, now: Instant) -> Vec<String> {
         let mut lines = Vec::new();
+
+        if snapshot.path_outages != self.path.path_outages
+            || snapshot.path_recoveries != self.path.path_recoveries
+            || snapshot.path_reachable != self.path.path_reachable
+        {
+            if snapshot.path_reachable {
+                lines.push(format!(
+                    "amtq gateway network path restored; QUIC connection retained (outages={} recoveries={} local_drops={})",
+                    snapshot.path_outages,
+                    snapshot.path_recoveries,
+                    snapshot.path_datagrams_dropped,
+                ));
+            } else {
+                lines.push(format!(
+                    "amtq gateway network path unavailable; retaining QUIC connection for migration (outages={} local_drops={})",
+                    snapshot.path_outages,
+                    snapshot.path_datagrams_dropped,
+                ));
+            }
+        }
+        self.path = snapshot;
 
         if !self.membership_announced && snapshot.membership_updates_sent != 0 {
             lines.push(format!(
@@ -559,7 +582,7 @@ fn gateway_usage() -> &'static str {
   --ca PATH                      PEM trust bundle (default: system roots)
   --client-cert PATH             Optional Gateway certificate chain
   --client-key PATH              Optional Gateway private key
-  --bind ADDR                    Local UDP/QUIC bind address
+  --bind ADDR                    Pin local UDP/QUIC path (omit for roaming)
   --protocol igmpv3|mldv2        Membership protocol (required)
   --join GROUP                   Static ASM membership (repeatable)
   --join SOURCE@GROUP            Static SSM membership (repeatable)
@@ -684,11 +707,32 @@ mod tests {
         let now = Instant::now();
         let mut reporter = GatewayStatusReporter::default();
 
-        let membership = NativeGatewaySnapshot {
-            membership_updates_sent: 1,
+        let unavailable = NativeGatewaySnapshot {
+            path_reachable: false,
+            path_outages: 1,
+            path_datagrams_dropped: 2,
             ..NativeGatewaySnapshot::default()
         };
-        let lines = reporter.observe(membership, now);
+        let lines = reporter.observe(unavailable, now);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("path unavailable"));
+
+        let recovered = NativeGatewaySnapshot {
+            path_reachable: true,
+            path_outages: 1,
+            path_recoveries: 1,
+            path_datagrams_dropped: 2,
+            ..NativeGatewaySnapshot::default()
+        };
+        let lines = reporter.observe(recovered, now + Duration::from_millis(1));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("path restored"));
+
+        let membership = NativeGatewaySnapshot {
+            membership_updates_sent: 1,
+            ..recovered
+        };
+        let lines = reporter.observe(membership, now + Duration::from_millis(2));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("membership update sent"));
 

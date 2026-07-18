@@ -81,6 +81,14 @@ The `runtime-tokio-quiche` feature also provides a managed endpoint boundary:
 - Process-local `ConnectionId` values remain stable across QUIC migration and
   implement the generic `MembershipEndpoint` key used by shared reception
   state.
+- A Gateway uses one unconnected, wildcard-bound UDP socket. Each send remains
+  eligible for kernel route and source-address reselection after a routing
+  change, allowing the same QUIC connection ID and AMTQ session to survive a
+  same-family local-address change or NAT rebinding. Steady-state kernel route
+  caching remains intact.
+- Transient route errors are reported to QUIC as packet loss instead of
+  terminating the I/O worker. A path is reported recovered only after a packet
+  returns from the Relay.
 - Keepalive PING scheduling is independent of application traffic. Shutdown
   uses a dedicated state signal that cannot be blocked by a saturated command
   queue.
@@ -89,8 +97,9 @@ The `runtime-tokio-quiche` feature also provides a managed endpoint boundary:
   consuming events intended for the application.
 
 The integration suite verifies idle survival beyond the negotiated timeout,
-capacity rejection, wrong-hostname rejection, optional mutual TLS, and active
-connection cleanup.
+capacity rejection, wrong-hostname rejection, optional mutual TLS,
+connection-ID routing after a peer-address change, and active connection
+cleanup.
 
 ## Native Data Plane
 
@@ -173,6 +182,14 @@ against system roots. There is no insecure verification mode. A Relay can add
 `--client-ca FILE`; Gateways then provide both `--client-cert` and
 `--client-key`.
 
+Omit `--bind` on the Gateway to retain roaming. Its default wildcard socket can
+follow a new route and source address while preserving the QUIC connection.
+Supplying a concrete `--bind IP:PORT` deliberately pins the outer path. The
+current socket remains within one address family, and migration must finish
+before the QUIC idle timeout (90 seconds by default). An IPv4-to-IPv6 handover
+or an expired connection still needs the not-yet-implemented fallback
+reconnect.
+
 The first daemon intentionally accepts static memberships only. Transparent
 LAN membership capture and reconnect policy belong above this now-tested
 service boundary and do not require wire-format changes.
@@ -181,7 +198,9 @@ service boundary and do not require wire-format changes.
 
 The unprivileged native loopback test uses real TLS and QUIC, automatically
 completes a no-interest membership transaction, and verifies worker cleanup.
-The ignored Linux namespace test adds real `mcrx`/`mctx` packet forwarding:
+The ignored Linux namespace tests add real `mcrx`/`mctx` packet forwarding and
+cut the Gateway's primary interface before moving the original QUIC connection
+to a second source IP:
 
 ```bash
 sudo -E env PATH="$PATH" cargo test -p quicast-amtq \
@@ -189,11 +208,17 @@ sudo -E env PATH="$PATH" cargo test -p quicast-amtq \
   --test native_system_linux -- --ignored --test-threads=1 --nocapture
 ```
 
+For a concurrent multi-hour comparison with classic AMT, including paired
+latency, loss bursts, reordering, and optional CPU/RSS sampling, see
+[AMT versus AMTQ Long-Run Test](amtq-long-run-test.md).
+
 ## Next Milestone
 
-1. Add automatic Gateway reconnect with bounded backoff and full membership
-   replay, then transparent local IGMPv3/MLDv2 membership capture.
-2. Run remote quiche interoperability and QUIC migration/rebinding tests.
+1. Add fallback Gateway reconnect with bounded backoff and full membership
+   replay for handovers that outlive the QUIC connection, then transparent
+   local IGMPv3/MLDv2 membership capture.
+2. Run remote quiche interoperability and long-duration migration/rebinding
+   tests.
 3. Implement Reliable Block Mode stream FIN/RESET/STOP_SENDING semantics before
    enabling that mode in the runtime.
 4. Add configuration files and Heimdall-style optional metrics.

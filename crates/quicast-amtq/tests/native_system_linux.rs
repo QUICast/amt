@@ -13,6 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RELAY_QUIC_IP: &str = "10.100.0.1";
 const GATEWAY_QUIC_IP: &str = "10.100.0.2";
+const RELAY_QUIC_ALT_IP: &str = "10.103.0.1";
+const GATEWAY_QUIC_ALT_IP: &str = "10.103.0.2";
 const RELAY_UPSTREAM_IP: &str = "10.101.0.1";
 const SOURCE_IP: &str = "10.101.0.2";
 const GATEWAY_DOWNSTREAM_IP: &str = "10.102.0.1";
@@ -51,6 +53,56 @@ fn linux_namespace_ssm_native_forwarding() {
     source.wait_success(Duration::from_secs(15)).unwrap();
     relay.assert_running();
     gateway.assert_running();
+}
+
+#[test]
+#[ignore = "requires Linux root privileges, network namespaces, and raw socket capability"]
+fn linux_namespace_gateway_roams_across_a_source_ip_change() {
+    let Some(fixture) = LinuxFixture::prepare() else {
+        return;
+    };
+    let payload = "amtq-native-roaming";
+    let mut relay = fixture.spawn_relay().unwrap();
+    relay
+        .wait_for_log(Duration::from_secs(10), "amtq relay listening")
+        .unwrap();
+
+    let mut gateway = fixture.spawn_gateway().unwrap();
+    gateway
+        .wait_for_log(Duration::from_secs(10), "amtq gateway connected")
+        .unwrap();
+    gateway
+        .wait_for_log(Duration::from_secs(10), "membership update sent")
+        .unwrap();
+
+    fixture.disconnect_primary_quic_path();
+    gateway
+        .wait_for_log(Duration::from_secs(10), "network path unavailable")
+        .unwrap();
+    fixture.activate_alternate_quic_path();
+    gateway
+        .wait_for_log(Duration::from_secs(15), "network path restored")
+        .unwrap();
+
+    let mut receiver = fixture
+        .spawn_receiver(payload, Duration::from_secs(20))
+        .unwrap();
+    receiver
+        .wait_for_log(Duration::from_secs(5), "receiver joined")
+        .unwrap();
+    let mut source = fixture
+        .spawn_source(payload, 100, Duration::from_millis(100))
+        .unwrap();
+
+    receiver.wait_success(Duration::from_secs(25)).unwrap();
+    source.wait_success(Duration::from_secs(15)).unwrap();
+    relay.assert_running();
+    gateway.assert_running();
+    assert!(
+        !relay.output().contains("established=2"),
+        "Relay established a replacement connection instead of migrating\n{}",
+        relay.output()
+    );
 }
 
 #[test]
@@ -123,6 +175,8 @@ struct LinuxFixture {
     receiver_ns: String,
     relay_quic_if: String,
     gateway_quic_if: String,
+    relay_quic_alt_if: String,
+    gateway_quic_alt_if: String,
     relay_upstream_if: String,
     source_if: String,
     gateway_downstream_if: String,
@@ -148,6 +202,8 @@ impl LinuxFixture {
             receiver_ns: format!("aq-x-{suffix}"),
             relay_quic_if: format!("qr{suffix}"),
             gateway_quic_if: format!("qg{suffix}"),
+            relay_quic_alt_if: format!("ar{suffix}"),
+            gateway_quic_alt_if: format!("ag{suffix}"),
             relay_upstream_if: format!("ur{suffix}"),
             source_if: format!("us{suffix}"),
             gateway_downstream_if: format!("gd{suffix}"),
@@ -174,6 +230,14 @@ impl LinuxFixture {
             &self.gateway_quic_if,
             &self.gateway_ns,
             GATEWAY_QUIC_IP,
+        );
+        self.veth_pair(
+            &self.relay_quic_alt_if,
+            &self.relay_ns,
+            RELAY_QUIC_ALT_IP,
+            &self.gateway_quic_alt_if,
+            &self.gateway_ns,
+            GATEWAY_QUIC_ALT_IP,
         );
         self.veth_pair(
             &self.relay_upstream_if,
@@ -312,6 +376,32 @@ impl LinuxFixture {
                 receive_timeout.as_millis().to_string(),
             );
         LoggedChild::spawn(command)
+    }
+
+    fn disconnect_primary_quic_path(&self) {
+        ip_netns(
+            &self.gateway_ns,
+            ["link", "set", &self.gateway_quic_if, "down"],
+        )
+        .unwrap();
+    }
+
+    fn activate_alternate_quic_path(&self) {
+        ip_netns(
+            &self.gateway_ns,
+            [
+                "route",
+                "replace",
+                &format!("{RELAY_QUIC_IP}/32"),
+                "via",
+                RELAY_QUIC_ALT_IP,
+                "dev",
+                &self.gateway_quic_alt_if,
+                "src",
+                GATEWAY_QUIC_ALT_IP,
+            ],
+        )
+        .unwrap();
     }
 }
 
