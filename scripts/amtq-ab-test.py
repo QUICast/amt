@@ -13,6 +13,7 @@ import csv
 import ipaddress
 import json
 import math
+import os
 import re
 import selectors
 import signal
@@ -69,6 +70,7 @@ RESOURCE_FIELDS = [
     "pid",
     "alive",
     "cpu_percent",
+    "cpu_seconds",
     "rss_kib",
     "vsz_kib",
 ]
@@ -127,6 +129,15 @@ def udp_port(value: str) -> int:
     parsed = positive_int(value)
     if parsed > 65_535:
         raise argparse.ArgumentTypeError("UDP port must not exceed 65535")
+    return parsed
+
+
+def udp_payload_size(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > MAX_UDP_PAYLOAD:
+        raise argparse.ArgumentTypeError(
+            f"UDP payload must not exceed {MAX_UDP_PAYLOAD} bytes"
+        )
     return parsed
 
 
@@ -346,6 +357,80 @@ def run_send(args: argparse.Namespace) -> int:
     return 0 if failed["classic"] + failed["amtq"] == 0 else 1
 
 
+def run_blast(args: argparse.Namespace) -> int:
+    install_signal_handlers()
+    destinations = {
+        "classic": (args.classic_group, args.classic_port),
+        "amtq": (args.amtq_group, args.amtq_port),
+    }
+    sock = sender_socket(args.interface, args.ttl)
+    payload = bytes(args.size)
+    started = time.monotonic()
+    deadline = started + args.duration
+    next_report = started + args.progress_interval
+    sequence = 0
+    sent = defaultdict(int)
+    failed = defaultdict(int)
+
+    print(
+        json.dumps(
+            {
+                "role": "blast",
+                "duration_seconds": args.duration,
+                "pairs_per_second": args.pps,
+                "payload_bytes": args.size,
+                "interface": args.interface,
+                "destinations": destinations,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    try:
+        while not STOP:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            due = math.floor((now - started) * args.pps) + 1
+            if sequence >= due:
+                time.sleep(min((sequence - due + 1) / args.pps, 0.001))
+                continue
+
+            while sequence < due:
+                paths = ("classic", "amtq") if sequence % 2 == 0 else ("amtq", "classic")
+                for path in paths:
+                    try:
+                        sock.sendto(payload, destinations[path])
+                        sent[path] += 1
+                    except OSError:
+                        failed[path] += 1
+                sequence += 1
+
+            now = time.monotonic()
+            if now >= next_report:
+                elapsed = now - started
+                print(
+                    f"blast elapsed={elapsed:.0f}s pairs={sequence} "
+                    f"achieved_pps={sequence / elapsed:.1f} "
+                    f"failures={failed['classic'] + failed['amtq']}",
+                    flush=True,
+                )
+                next_report = now + args.progress_interval
+    finally:
+        sock.close()
+
+    elapsed = time.monotonic() - started
+    print(
+        f"blast stopped elapsed={elapsed:.1f}s pairs={sequence} "
+        f"achieved_pps={sequence / elapsed:.1f} "
+        f"classic_sent={sent['classic']} amtq_sent={sent['amtq']} "
+        f"failures={failed['classic'] + failed['amtq']}",
+        flush=True,
+    )
+    return 0 if failed["classic"] + failed["amtq"] == 0 else 1
+
+
 def receiver_socket(group: str, port: int, interface: str, receive_buffer: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -372,12 +457,15 @@ def run_receive(args: argparse.Namespace) -> int:
         selector.register(sock, selectors.EVENT_READ, path)
 
     handle, writer = output_file(args.output, RECEIVE_FIELDS)
-    started = time.monotonic()
-    deadline = started + args.duration
-    next_report = started + args.progress_interval
+    process_started = time.monotonic()
+    startup_deadline = process_started + args.startup_timeout
+    capture_started: float | None = None
+    capture_deadline: float | None = None
+    next_report = process_started + args.progress_interval
     received = defaultdict(int)
     invalid = 0
     foreign = 0
+    startup_timed_out = False
 
     print(
         json.dumps(
@@ -385,6 +473,7 @@ def run_receive(args: argparse.Namespace) -> int:
                 "role": "receive",
                 "run_id": expected_run or "any",
                 "duration_seconds": args.duration,
+                "startup_timeout_seconds": args.startup_timeout,
                 "interface": args.interface,
                 "endpoints": endpoints,
                 "output": args.output,
@@ -397,9 +486,11 @@ def run_receive(args: argparse.Namespace) -> int:
     try:
         while not STOP:
             now = time.monotonic()
-            if now >= deadline:
+            active_deadline = capture_deadline or startup_deadline
+            if now >= active_deadline:
+                startup_timed_out = capture_started is None
                 break
-            events = selector.select(min(1.0, deadline - now))
+            events = selector.select(min(1.0, active_deadline - now))
             for key, _mask in events:
                 sock = key.fileobj
                 expected_path = key.data
@@ -422,6 +513,14 @@ def run_receive(args: argparse.Namespace) -> int:
                     path_matches = decoded["path"] == expected_path
                     if not decoded["valid"] or not decoded["crc_ok"] or not path_matches:
                         invalid += 1
+                    elif capture_started is None:
+                        capture_started = time.monotonic()
+                        capture_deadline = capture_started + args.duration
+                        print(
+                            f"receiver capture started run_id={decoded['run_id']} "
+                            f"duration={args.duration:.1f}s",
+                            flush=True,
+                        )
                     received[expected_path] += 1
                     writer.writerow(
                         {
@@ -436,12 +535,19 @@ def run_receive(args: argparse.Namespace) -> int:
             now = time.monotonic()
             if now >= next_report:
                 handle.flush()
-                elapsed = now - started
-                print(
-                    f"receiver elapsed={elapsed:.0f}s classic={received['classic']} "
-                    f"amtq={received['amtq']} invalid={invalid} foreign={foreign}",
-                    flush=True,
-                )
+                if capture_started is None:
+                    print(
+                        f"receiver waiting elapsed={now - process_started:.0f}s "
+                        f"invalid={invalid} foreign={foreign}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"receiver elapsed={now - capture_started:.0f}s "
+                        f"classic={received['classic']} amtq={received['amtq']} "
+                        f"invalid={invalid} foreign={foreign}",
+                        flush=True,
+                    )
                 next_report = now + args.progress_interval
     finally:
         handle.flush()
@@ -451,13 +557,23 @@ def run_receive(args: argparse.Namespace) -> int:
             sock.close()
         selector.close()
 
-    elapsed = time.monotonic() - started
+    stopped = time.monotonic()
+    capture_elapsed = (
+        stopped - capture_started if capture_started is not None else 0.0
+    )
+    if startup_timed_out:
+        print(
+            f"receiver startup timed out after {args.startup_timeout:.1f}s "
+            "without a valid probe",
+            file=sys.stderr,
+            flush=True,
+        )
     print(
-        f"receiver stopped elapsed={elapsed:.1f}s classic={received['classic']} "
+        f"receiver stopped elapsed={capture_elapsed:.1f}s classic={received['classic']} "
         f"amtq={received['amtq']} invalid={invalid} foreign={foreign}",
         flush=True,
     )
-    return 0
+    return 2 if startup_timed_out else 0
 
 
 def process_spec(value: str) -> tuple[str, int]:
@@ -471,20 +587,76 @@ def process_spec(value: str) -> tuple[str, int]:
     return name, pid
 
 
-def read_process(pid: int) -> tuple[bool, float | None, int | None, int | None]:
+def parse_cpu_duration(value: str) -> float:
+    value = value.strip()
+    days = 0
+    if "-" in value:
+        raw_days, value = value.split("-", 1)
+        days = int(raw_days)
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ValueError("invalid process CPU duration")
+    total = (
+        days * 86_400
+        + int(hours) * 3_600
+        + int(minutes) * 60
+        + float(seconds)
+    )
+    if not math.isfinite(total) or total < 0:
+        raise ValueError("invalid process CPU duration")
+    return total
+
+
+def linux_process_cpu_seconds(pid: int) -> float | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        ticks = int(fields[11]) + int(fields[12])
+        return ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def read_process(
+    pid: int,
+) -> tuple[bool, float | None, float | None, int | None, int | None]:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "pid=", "-o", "%cpu=", "-o", "rss=", "-o", "vsz="],
+        [
+            "ps",
+            "-p",
+            str(pid),
+            "-o",
+            "pid=",
+            "-o",
+            "%cpu=",
+            "-o",
+            "rss=",
+            "-o",
+            "vsz=",
+            "-o",
+            "time=",
+        ],
         check=False,
         capture_output=True,
         text=True,
     )
     fields = result.stdout.split()
-    if result.returncode != 0 or len(fields) < 4:
-        return False, None, None, None
+    if result.returncode != 0 or len(fields) < 5:
+        return False, None, None, None, None
     try:
-        return True, float(fields[1]), int(fields[2]), int(fields[3])
+        cpu_seconds = linux_process_cpu_seconds(pid)
+        if cpu_seconds is None:
+            cpu_seconds = parse_cpu_duration(fields[4])
+        return True, float(fields[1]), cpu_seconds, int(fields[2]), int(fields[3])
     except ValueError:
-        return False, None, None, None
+        return False, None, None, None, None
 
 
 def run_sample(args: argparse.Namespace) -> int:
@@ -505,7 +677,7 @@ def run_sample(args: argparse.Namespace) -> int:
                 continue
             sample_ns = time.time_ns()
             for name, pid in args.process:
-                alive, cpu, rss, vsz = read_process(pid)
+                alive, cpu, cpu_seconds, rss, vsz = read_process(pid)
                 writer.writerow(
                     {
                         "sample_ns": sample_ns,
@@ -513,6 +685,7 @@ def run_sample(args: argparse.Namespace) -> int:
                         "pid": pid,
                         "alive": int(alive),
                         "cpu_percent": "" if cpu is None else cpu,
+                        "cpu_seconds": "" if cpu_seconds is None else cpu_seconds,
                         "rss_kib": "" if rss is None else rss,
                         "vsz_kib": "" if vsz is None else vsz,
                     }
@@ -584,24 +757,53 @@ def select_run_id(
 
 
 def summarize_resources(paths: list[str]) -> dict[str, dict[str, Any]]:
-    grouped: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: {"cpu": [], "rss": []}
+    grouped: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cpu": [],
+            "rss": [],
+            "samples": 0,
+            "cpu_seconds": 0.0,
+            "has_cpu_delta": False,
+        }
     )
+    previous_cpu: dict[tuple[str, str], tuple[int, float]] = {}
     for path in paths:
         for row in iter_csv(path):
             if as_bool(row["alive"]):
-                if row["cpu_percent"]:
-                    grouped[row["name"]]["cpu"].append(float(row["cpu_percent"]))
+                name = row["name"]
+                values = grouped[name]
+                values["samples"] += 1
                 if row["rss_kib"]:
-                    grouped[row["name"]]["rss"].append(float(row["rss_kib"]))
+                    values["rss"].append(float(row["rss_kib"]))
+                cpu_seconds = row.get("cpu_seconds", "")
+                if cpu_seconds:
+                    current = (int(row["sample_ns"]), float(cpu_seconds))
+                    key = (name, row["pid"])
+                    previous = previous_cpu.get(key)
+                    if (
+                        previous is not None
+                        and current[0] > previous[0]
+                        and current[1] >= previous[1]
+                    ):
+                        elapsed = (current[0] - previous[0]) / 1_000_000_000.0
+                        consumed = current[1] - previous[1]
+                        values["cpu"].append(100.0 * consumed / elapsed)
+                        values["cpu_seconds"] += consumed
+                        values["has_cpu_delta"] = True
+                    previous_cpu[key] = current
+                elif row["cpu_percent"]:
+                    values["cpu"].append(float(row["cpu_percent"]))
     summary: dict[str, dict[str, Any]] = {}
     for name, values in grouped.items():
         cpu = values["cpu"]
         rss = values["rss"]
         summary[name] = {
-            "samples": max(len(cpu), len(rss)),
+            "samples": values["samples"],
             "cpu_mean_percent": mean(cpu),
             "cpu_p95_percent": percentile(cpu, 0.95),
+            "cpu_seconds": (
+                values["cpu_seconds"] if values["has_cpu_delta"] else None
+            ),
             "rss_max_mib": max(rss) / 1024.0 if rss else None,
             "rss_growth_mib": (rss[-1] - rss[0]) / 1024.0 if len(rss) >= 2 else None,
         }
@@ -978,11 +1180,14 @@ def run_report(args: argparse.Namespace) -> int:
         print()
         print("## Resources")
         print()
-        print("| Process | Samples | Mean CPU | P95 CPU | Peak RSS | RSS change |")
-        print("|---|---:|---:|---:|---:|---:|")
+        print(
+            "| Process | Samples | CPU time | Mean CPU | P95 CPU | Peak RSS | RSS change |"
+        )
+        print("|---|---:|---:|---:|---:|---:|---:|")
         for name, item in sorted(resources.items()):
             print(
-                f"| {name} | {item['samples']} | {metric(item['cpu_mean_percent'])}% | "
+                f"| {name} | {item['samples']} | {metric(item['cpu_seconds'])} s | "
+                f"{metric(item['cpu_mean_percent'])}% | "
                 f"{metric(item['cpu_p95_percent'])}% | {metric(item['rss_max_mib'])} MiB | "
                 f"{metric(item['rss_growth_mib'])} MiB |"
             )
@@ -992,6 +1197,9 @@ def run_report(args: argparse.Namespace) -> int:
 def run_self_test(_args: argparse.Namespace) -> int:
     assert duration_seconds("1m") == 60.0
     assert probe_sizes("64,1200") == [64, 1200]
+    assert parse_cpu_duration("0:37.81") == 37.81
+    assert parse_cpu_duration("01:02:03") == 3_723.0
+    assert parse_cpu_duration("2-01:02:03") == 176_523.0
     run_id = uuid.uuid4()
     packet, send_ns = build_probe(run_id, 7, "amtq", 1200)
     decoded, error = decode_probe(packet)
@@ -1067,10 +1275,29 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--progress-interval", type=positive_float, default=30.0)
     send.set_defaults(handler=run_send)
 
+    blast = subcommands.add_parser(
+        "blast",
+        help="send paired multicast traffic without per-packet logging",
+    )
+    common_probe_options(blast)
+    blast.add_argument("--interface", type=ipv4_address, required=True)
+    blast.add_argument("--duration", type=duration_seconds, default=duration_seconds("30s"))
+    blast.add_argument("--pps", type=positive_float, default=1_000.0, help="pairs per second")
+    blast.add_argument("--size", type=udp_payload_size, default=1_200)
+    blast.add_argument("--ttl", type=multicast_ttl, default=16)
+    blast.add_argument("--progress-interval", type=positive_float, default=5.0)
+    blast.set_defaults(handler=run_blast)
+
     receive = subcommands.add_parser("receive", help="receive both multicast probe paths")
     common_probe_options(receive)
     receive.add_argument("--interface", type=ipv4_address, required=True)
     receive.add_argument("--duration", type=duration_seconds, default=duration_seconds("6h10m"))
+    receive.add_argument(
+        "--startup-timeout",
+        type=duration_seconds,
+        default=duration_seconds("10m"),
+        help="maximum wait for the first valid probe",
+    )
     receive.add_argument("--run-id", help="optional UUID filter")
     receive.add_argument("--output", default="amtq-ab-receiver.csv")
     receive.add_argument("--receive-buffer", type=positive_int, default=4 * 1024 * 1024)

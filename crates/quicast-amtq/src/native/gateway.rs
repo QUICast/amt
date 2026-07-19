@@ -19,7 +19,7 @@ const DEFAULT_MEMBERSHIP_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct NativeGatewayConfig {
     pub endpoint: GatewayEndpointConfig,
-    pub downstream: DownstreamConfig,
+    pub downstream: Option<DownstreamConfig>,
     pub io: NativeIoConfig,
     pub membership: MembershipReport,
     pub membership_limits: RelayLimits,
@@ -34,12 +34,18 @@ impl NativeGatewayConfig {
     ) -> Self {
         Self {
             endpoint,
-            downstream,
+            downstream: Some(downstream),
             io: NativeIoConfig::default(),
             membership,
             membership_limits: RelayLimits::default(),
             membership_refresh_interval: DEFAULT_MEMBERSHIP_REFRESH_INTERVAL,
         }
+    }
+
+    /// Disables publication of received multicast packets.
+    pub fn without_downstream(mut self) -> Self {
+        self.downstream = None;
+        self
     }
 
     fn validate(&self) -> Result<Vec<u8>, NativeError> {
@@ -161,11 +167,17 @@ impl NativeGateway {
     pub async fn connect(config: NativeGatewayConfig) -> Result<Self, NativeError> {
         let membership_packet = config.validate()?;
         let request_nonce = random_request_nonce()?;
-        let downstream = DownstreamWorker::spawn(config.downstream.clone(), &config.io)?;
+        let downstream = config
+            .downstream
+            .clone()
+            .map(|downstream| DownstreamWorker::spawn(downstream, &config.io))
+            .transpose()?;
         let connection = match connect_gateway(config.endpoint.clone()).await {
             Ok(connection) => connection,
             Err(error) => {
-                let _ = downstream.shutdown().await;
+                if let Some(downstream) = downstream {
+                    let _ = downstream.shutdown().await;
+                }
                 return Err(error.into());
             }
         };
@@ -226,7 +238,7 @@ impl Drop for NativeGateway {
 
 async fn run_native_gateway(
     mut connection: GatewayConnection,
-    downstream: DownstreamWorker,
+    downstream: Option<DownstreamWorker>,
     config: NativeGatewayConfig,
     membership_packet: Vec<u8>,
     request_nonce: u32,
@@ -235,7 +247,7 @@ async fn run_native_gateway(
 ) -> Result<NativeGatewayStop, NativeError> {
     let run_result = drive_native_gateway(
         &mut connection,
-        &downstream,
+        downstream.as_ref(),
         &config,
         &membership_packet,
         request_nonce,
@@ -244,7 +256,10 @@ async fn run_native_gateway(
     )
     .await;
     let connection_report = connection.shutdown().await;
-    let downstream_result = downstream.shutdown().await;
+    let downstream_result = match downstream {
+        Some(downstream) => downstream.shutdown().await.map(|_| ()),
+        None => Ok(()),
+    };
 
     run_result?;
     downstream_result?;
@@ -256,7 +271,7 @@ async fn run_native_gateway(
 
 async fn drive_native_gateway(
     connection: &mut GatewayConnection,
-    downstream: &DownstreamWorker,
+    downstream: Option<&DownstreamWorker>,
     config: &NativeGatewayConfig,
     membership_packet: &[u8],
     request_nonce: u32,
@@ -324,21 +339,23 @@ async fn drive_native_gateway(
                             .counters
                             .multicast_bytes_received
                             .fetch_add(packet.len() as u64, Ordering::Relaxed);
-                        match downstream.try_publish(packet.to_vec()) {
-                            Ok(()) => {
-                                stats
-                                    .counters
-                                    .downstream_datagrams_queued
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(QueueSendError::Full) => {
-                                stats
-                                    .counters
-                                    .downstream_queue_drops
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(QueueSendError::Closed) => {
-                                return Err(downstream.stopped_error());
+                        if let Some(downstream) = downstream {
+                            match downstream.try_publish(packet.to_vec()) {
+                                Ok(()) => {
+                                    stats
+                                        .counters
+                                        .downstream_datagrams_queued
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(QueueSendError::Full) => {
+                                    stats
+                                        .counters
+                                        .downstream_queue_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(QueueSendError::Closed) => {
+                                    return Err(downstream.stopped_error());
+                                }
                             }
                         }
                     }

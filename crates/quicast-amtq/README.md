@@ -46,7 +46,8 @@ dependencies outside the stable AMT package.
   immutable packet allocation shared across Relay fan-out targets.
 - A runnable `amtq relay` and `amtq gateway` with explicit TLS trust, optional
   Gateway client certificates, static ASM/SSM joins, membership refresh, and
-  graceful shutdown.
+  graceful shutdown. The Gateway can disable downstream publication for
+  headless relay and transport testing.
 - TLS reference-identity verification, SETTINGS, membership authorization,
   context acknowledgment, COMPLETE delivery, and fragmented delivery in a
   real localhost QUIC integration test.

@@ -212,6 +212,9 @@ For a concurrent multi-hour comparison with classic AMT, including paired
 latency, loss bursts, reordering, and optional CPU/RSS sampling, see
 [AMT versus AMTQ Long-Run Test](amtq-long-run-test.md).
 
+For short headless packet-rate and multi-Gateway fan-out measurements, see
+[AMT versus AMTQ Scale Test](amtq-scale-test.md).
+
 ## Next Milestone
 
 1. Add fallback Gateway reconnect with bounded backoff and full membership

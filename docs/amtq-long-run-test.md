@@ -132,12 +132,16 @@ mkdir -p /tmp/amtq-ab
 python3 scripts/amtq-ab-test.py receive \
   --interface "$RX_IP" \
   --duration 6h10m \
+  --startup-timeout 10m \
   --output /tmp/amtq-ab/receiver.csv \
   | tee /tmp/amtq-ab/receiver.log
 ```
 
-The receiver accepts any run ID by default. For an unattended repeat, pass the
-same explicit UUID to sender and receiver with `--run-id`.
+The receiver accepts any run ID by default. Its capture duration begins with
+the first valid probe, so relay and sender setup time is not counted as packet
+loss. It exits with an error if no valid probe arrives within
+`--startup-timeout`. For an unattended repeat, pass the same explicit UUID to
+sender and receiver with `--run-id`.
 
 ## Start The Source
 
@@ -180,8 +184,12 @@ python3 scripts/amtq-ab-test.py sample \
   --output /tmp/amtq-ab/gateway-resources.csv
 ```
 
-The `ps` CPU value is an operating-system estimate. Packet delivery and paired
-latency are the primary results; resource samples are supporting evidence.
+The sampler records cumulative process CPU time and derives utilization from
+successive deltas. On Linux it uses `/proc` clock ticks; other systems use the
+process CPU duration reported by `ps`. The report includes observed CPU
+seconds, mean and P95 utilization, peak RSS, and RSS change. Packet delivery
+and paired latency remain the primary results; resource samples are supporting
+evidence.
 
 ## Produce The Report
 
@@ -216,9 +224,9 @@ relays, gateways, and receiver to expose any group-specific bias. Also run each
 path alone once: the simultaneous comparison removes time-of-day drift but
 makes the paths compete for the same access links.
 
-For a separate capacity test, use shorter rate steps such as 10 minutes each at
-50, 250, and 500 pairs per second. Do not mix those results into the primary
-six-hour latency baseline.
+Do not mix capacity results into the primary six-hour latency baseline. For
+headless packet-rate and multi-Gateway fan-out procedures, see
+[AMT versus AMTQ Scale Test](amtq-scale-test.md).
 
 ## Optional Wire Capture
 

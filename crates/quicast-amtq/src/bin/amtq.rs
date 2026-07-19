@@ -392,6 +392,7 @@ fn parse_gateway(args: impl IntoIterator<Item = String>) -> Result<NativeGateway
     let mut downstream_interface_index = None;
     let mut ttl = Some(1u8);
     let mut loopback = true;
+    let mut downstream_enabled = true;
     let mut refresh = Duration::from_secs(30);
     let mut args = args.into_iter();
 
@@ -431,6 +432,7 @@ fn parse_gateway(args: impl IntoIterator<Item = String>) -> Result<NativeGateway
                 ttl = Some(parse_nonzero(&next_value(&mut args, "--ttl")?, "--ttl")?);
             }
             "--no-loopback" => loopback = false,
+            "--no-downstream" => downstream_enabled = false,
             "--refresh" => {
                 let seconds: u64 =
                     parse_nonzero(&next_value(&mut args, "--refresh")?, "--refresh")?;
@@ -487,6 +489,9 @@ fn parse_gateway(args: impl IntoIterator<Item = String>) -> Result<NativeGateway
         loopback,
     };
     let mut config = NativeGatewayConfig::new(endpoint, downstream, membership);
+    if !downstream_enabled {
+        config = config.without_downstream();
+    }
     config.membership_limits = limits;
     config.membership_refresh_interval = refresh;
     Ok(config)
@@ -590,7 +595,8 @@ fn gateway_usage() -> &'static str {
   --downstream-ifindex INDEX     IPv6 publication interface index
   --ttl HOPS                     Published multicast hop limit (default 1)
   --refresh SECONDS              Membership refresh interval (default 30)
-  --no-loopback                  Disable local multicast loopback"
+  --no-loopback                  Disable local multicast loopback
+  --no-downstream                Receive and discard tunneled multicast"
 }
 
 #[cfg(test)]
@@ -633,6 +639,28 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("address family"));
+    }
+
+    #[test]
+    fn gateway_can_disable_downstream_publication() {
+        let config = parse_gateway(
+            [
+                "--relay",
+                "127.0.0.1:2268",
+                "--server-name",
+                "localhost",
+                "--protocol",
+                "igmpv3",
+                "--join",
+                "239.1.2.3",
+                "--no-downstream",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert!(config.downstream.is_none());
     }
 
     #[test]
