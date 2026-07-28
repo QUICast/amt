@@ -1,12 +1,16 @@
 use crate::ecn::EcnCodepoint;
+use polling::{Event, Poller};
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::io::{self, ErrorKind, IoSliceMut};
 use std::net::{SocketAddr, UdpSocket};
+
+const RELAY_TUNNEL_SOCKET_BUFFER_TARGET: usize = 4 * 1024 * 1024;
 
 /// Blocking-daemon UDP socket with per-datagram ECN metadata.
 pub(crate) struct AmtUdpSocket {
     socket: UdpSocket,
     backend: SocketBackend,
+    buffers: SocketBufferSizes,
 }
 
 enum SocketBackend {
@@ -14,9 +18,50 @@ enum SocketBackend {
     Ecn(UdpSocketState),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketBufferSizes {
+    pub receive: usize,
+    pub send: usize,
+}
+
+pub(crate) struct AmtUdpRegistration<'a> {
+    socket: &'a UdpSocket,
+    poller: &'a Poller,
+    key: usize,
+}
+
+impl AmtUdpRegistration<'_> {
+    pub(crate) fn rearm(&self) -> io::Result<()> {
+        self.poller.modify(self.socket, Event::readable(self.key))
+    }
+}
+
+impl Drop for AmtUdpRegistration<'_> {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(self.socket);
+    }
+}
+
 impl AmtUdpSocket {
     pub(crate) fn bind(address: SocketAddr, require_ecn: bool) -> io::Result<Self> {
+        Self::bind_inner(address, require_ecn, None)
+    }
+
+    pub(crate) fn bind_relay(address: SocketAddr, require_ecn: bool) -> io::Result<Self> {
+        Self::bind_inner(
+            address,
+            require_ecn,
+            Some(RELAY_TUNNEL_SOCKET_BUFFER_TARGET),
+        )
+    }
+
+    fn bind_inner(
+        address: SocketAddr,
+        require_ecn: bool,
+        buffer_target: Option<usize>,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind(address)?;
+        let buffers = configure_socket_buffers(&socket, buffer_target)?;
         let state = configure_tunnel_socket(&socket)?;
         let backend = if require_ecn {
             verify_ecn_receive(&socket)?;
@@ -24,11 +69,36 @@ impl AmtUdpSocket {
         } else {
             SocketBackend::Standard
         };
-        Ok(Self { socket, backend })
+        Ok(Self {
+            socket,
+            backend,
+            buffers,
+        })
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub(crate) const fn buffer_sizes(&self) -> SocketBufferSizes {
+        self.buffers
+    }
+
+    pub(crate) fn register_readable<'a>(
+        &'a self,
+        poller: &'a Poller,
+        key: usize,
+    ) -> io::Result<AmtUdpRegistration<'a>> {
+        // SAFETY: the returned guard borrows both the socket and poller and
+        // unregisters the socket before either can be dropped.
+        unsafe {
+            poller.add(&self.socket, Event::readable(key))?;
+        }
+        Ok(AmtUdpRegistration {
+            socket: &self.socket,
+            poller,
+            key,
+        })
     }
 
     pub(crate) fn recv_from(
@@ -91,6 +161,25 @@ impl AmtUdpSocket {
             }
         }
     }
+}
+
+fn configure_socket_buffers(
+    socket: &UdpSocket,
+    target: Option<usize>,
+) -> io::Result<SocketBufferSizes> {
+    let socket = socket2::SockRef::from(socket);
+    if let Some(target) = target {
+        if socket.recv_buffer_size()? < target {
+            let _ = socket.set_recv_buffer_size(target);
+        }
+        if socket.send_buffer_size()? < target {
+            let _ = socket.set_send_buffer_size(target);
+        }
+    }
+    Ok(SocketBufferSizes {
+        receive: socket.recv_buffer_size()?,
+        send: socket.send_buffer_size()?,
+    })
 }
 
 fn configure_tunnel_socket(socket: &UdpSocket) -> io::Result<UdpSocketState> {
@@ -273,6 +362,44 @@ mod tests {
         let state = configure_tunnel_socket(&socket).unwrap();
 
         assert!(!state.may_fragment());
+    }
+
+    #[test]
+    fn readable_registration_wakes_and_rearms() {
+        let receiver = AmtUdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false).unwrap();
+        let sender = AmtUdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false).unwrap();
+        let poller = Poller::new().unwrap();
+        let registration = receiver.register_readable(&poller, 7).unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let mut events = polling::Events::new();
+        let mut buffer = [0u8; 16];
+
+        // The relay rearms before its first wait and after every bounded drain.
+        registration.rearm().unwrap();
+
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            sender
+                .send_to(payload, destination, EcnCodepoint::NotEct)
+                .unwrap();
+            events.clear();
+            poller
+                .wait(&mut events, Some(Duration::from_secs(1)))
+                .unwrap();
+            assert!(events.iter().any(|event| event.key == 7 && event.readable));
+            let (len, _, _) = receiver.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..len], payload);
+            registration.rearm().unwrap();
+        }
+    }
+
+    #[test]
+    fn relay_tunnel_socket_reports_nonzero_buffers() {
+        let socket =
+            AmtUdpSocket::bind_relay(SocketAddr::from(([127, 0, 0, 1], 0)), false).unwrap();
+        let buffers = socket.buffer_sizes();
+
+        assert_ne!(buffers.receive, 0);
+        assert_ne!(buffers.send, 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

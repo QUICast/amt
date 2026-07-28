@@ -554,9 +554,7 @@ mod tests {
         assert!(UpstreamManager::with_subscription_limit(UpstreamConfig::default(), 0).is_err());
         let manager =
             UpstreamManager::with_subscription_limit(UpstreamConfig::default(), 1_000).unwrap();
-        let RawReceiveContext::Shared(context) = &manager.context else {
-            panic!("expected shared capture backend");
-        };
+        let RawReceiveContext::Shared(context) = &manager.context;
         assert_eq!(context.limits().max_subscriptions, 1_000);
     }
 

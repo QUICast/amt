@@ -82,6 +82,8 @@ pub struct AmtMetricsCounters {
     pub upstream_subscription_adds_total: u64,
     pub upstream_subscription_removes_total: u64,
     pub upstream_reconcile_failures_total: u64,
+    pub upstream_worker_queue_drops_total: u64,
+    pub upstream_worker_failures_total: u64,
     pub upstream_packets_received_total: u64,
     pub upstream_bytes_received_total: u64,
     pub upstream_packets_forwarded_total: u64,
@@ -181,6 +183,12 @@ impl AmtMetricsCounters {
             upstream_reconcile_failures_total: self
                 .upstream_reconcile_failures_total
                 .saturating_sub(earlier.upstream_reconcile_failures_total),
+            upstream_worker_queue_drops_total: self
+                .upstream_worker_queue_drops_total
+                .saturating_sub(earlier.upstream_worker_queue_drops_total),
+            upstream_worker_failures_total: self
+                .upstream_worker_failures_total
+                .saturating_sub(earlier.upstream_worker_failures_total),
             upstream_packets_received_total: self
                 .upstream_packets_received_total
                 .saturating_sub(earlier.upstream_packets_received_total),
@@ -325,6 +333,8 @@ pub struct RelayMetricsGauges {
     pub active_gateways: u64,
     pub active_upstream_subscriptions: u64,
     pub upstream_capture_sockets: u64,
+    pub upstream_queue_depth: u64,
+    pub upstream_queue_high_water: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +474,20 @@ impl MetricsRecorder {
     }
 
     #[cfg(feature = "metrics")]
+    pub(crate) fn next_emit_in(&self) -> Option<Duration> {
+        self.writer.as_ref().map(|writer| {
+            writer
+                .next_emit_at
+                .saturating_duration_since(Instant::now())
+        })
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub(crate) const fn next_emit_in(&self) -> Option<Duration> {
+        None
+    }
+
+    #[cfg(feature = "metrics")]
     pub fn maybe_emit_relay(&mut self, gauges: RelayMetricsGauges) -> io::Result<bool> {
         self.maybe_emit(MetricsGauges::Relay(gauges))
     }
@@ -599,6 +623,14 @@ fn extend_gauges(sample: &mut Map<String, Value>, gauges: MetricsGauges) {
             sample.insert(
                 "upstream_capture_sockets".to_string(),
                 gauges.upstream_capture_sockets.into(),
+            );
+            sample.insert(
+                "upstream_queue_depth".to_string(),
+                gauges.upstream_queue_depth.into(),
+            );
+            sample.insert(
+                "upstream_queue_high_water".to_string(),
+                gauges.upstream_queue_high_water.into(),
             );
         }
         MetricsGauges::Gateway(gauges) => {
@@ -755,6 +787,20 @@ fn extend_counters(
         "upstream_reconcile_failures",
         total.upstream_reconcile_failures_total,
         delta.upstream_reconcile_failures_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_worker_queue_drops",
+        total.upstream_worker_queue_drops_total,
+        delta.upstream_worker_queue_drops_total,
+        interval_secs,
+    );
+    counter(
+        sample,
+        "upstream_worker_failures",
+        total.upstream_worker_failures_total,
+        delta.upstream_worker_failures_total,
         interval_secs,
     );
     counter(
@@ -1112,6 +1158,7 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 10,
                 upstream_bytes_received_total: 1000,
+                upstream_worker_queue_drops_total: 1,
                 upstream_pmtu_feedback_sent_total: 1,
                 driad_refreshes_succeeded_total: 1,
                 gateway_ecn_ce_propagated_total: 2,
@@ -1121,6 +1168,8 @@ mod tests {
                 active_gateways: 1,
                 active_upstream_subscriptions: 1,
                 upstream_capture_sockets: 1,
+                upstream_queue_depth: 0,
+                upstream_queue_high_water: 0,
             }),
         };
         let current = MetricsSnapshot {
@@ -1128,6 +1177,8 @@ mod tests {
             counters: AmtMetricsCounters {
                 upstream_packets_received_total: 14,
                 upstream_bytes_received_total: 1400,
+                upstream_worker_queue_drops_total: 3,
+                upstream_worker_failures_total: 1,
                 upstream_pmtu_feedback_sent_total: 3,
                 driad_refreshes_succeeded_total: 3,
                 gateway_ecn_ce_propagated_total: 5,
@@ -1137,6 +1188,8 @@ mod tests {
                 active_gateways: 2,
                 active_upstream_subscriptions: 3,
                 upstream_capture_sockets: 1,
+                upstream_queue_depth: 4,
+                upstream_queue_high_water: 12,
             }),
         };
 
@@ -1145,10 +1198,15 @@ mod tests {
         assert_eq!(sample["active_gateways"], 2);
         assert_eq!(sample["active_upstream_subscriptions"], 3);
         assert_eq!(sample["upstream_capture_sockets"], 1);
+        assert_eq!(sample["upstream_queue_depth"], 4);
+        assert_eq!(sample["upstream_queue_high_water"], 12);
         assert_eq!(sample["upstream_packets_received_total"], 14);
         assert_eq!(sample["upstream_packets_received_delta"], 4);
         assert_eq!(sample["upstream_packets_received_per_sec"], 2.0);
         assert_eq!(sample["upstream_bytes_received_per_sec"], 200.0);
+        assert_eq!(sample["upstream_worker_queue_drops_total"], 3);
+        assert_eq!(sample["upstream_worker_queue_drops_delta"], 2);
+        assert_eq!(sample["upstream_worker_failures_total"], 1);
         assert_eq!(sample["upstream_pmtu_feedback_sent_delta"], 2);
         assert_eq!(sample["driad_refreshes_succeeded_delta"], 2);
         assert_eq!(sample["gateway_ecn_ce_propagated_delta"], 3);
@@ -1224,6 +1282,8 @@ mod tests {
                 active_gateways: 1,
                 active_upstream_subscriptions: 1,
                 upstream_capture_sockets: 1,
+                upstream_queue_depth: 0,
+                upstream_queue_high_water: 0,
             }),
         };
         let mut recorder = MetricsRecorder {
@@ -1247,6 +1307,8 @@ mod tests {
                     active_gateways: 1,
                     active_upstream_subscriptions: 1,
                     upstream_capture_sockets: 1,
+                    upstream_queue_depth: 0,
+                    upstream_queue_high_water: 0,
                 })
                 .is_err()
         );
@@ -1257,6 +1319,8 @@ mod tests {
                     active_gateways: 1,
                     active_upstream_subscriptions: 1,
                     upstream_capture_sockets: 1,
+                    upstream_queue_depth: 0,
+                    upstream_queue_high_water: 0,
                 })
                 .unwrap()
         );

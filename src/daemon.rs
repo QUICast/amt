@@ -15,12 +15,14 @@ use crate::metrics::{
 use crate::mtu::{Ipv4FragmentError, fragment_ipv4_for_tunnel};
 #[cfg(feature = "pmtu-feedback")]
 use crate::pmtu::{PmtuFeedbackOutcome, PmtuFeedbackSender};
-use crate::protocol::Message;
+use crate::protocol::{MembershipProtocol, Message};
 use crate::query::query_interval;
 use crate::relay::{Relay, RelayAction, RelayConfig, RelayError};
 use crate::state::{FilterMode, RelayState};
-use crate::udp::AmtUdpSocket;
-use crate::upstream::{UpstreamConfig, UpstreamDatagram, UpstreamManager};
+use crate::udp::{AmtUdpSocket, SocketBufferSizes};
+use crate::upstream::{UpstreamConfig, UpstreamDatagram};
+use crate::upstream_worker::{UpstreamWorker, UpstreamWorkerSnapshot};
+use polling::{Events, Poller};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
@@ -35,10 +37,13 @@ use std::time::{Duration, Instant};
 
 const MAX_UDP_DATAGRAM: usize = 65_535;
 const MAX_CONTROL_DRAIN: usize = 128;
-const MAX_UPSTREAM_DRAIN: usize = 64;
+const MAX_RELAY_DATA_DRAIN: usize = 512;
 const MAX_LOCAL_MEMBERSHIP_DRAIN: usize = 64;
 const MAX_RATE_LIMIT_SOURCES: usize = 65_536;
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
+const RELAY_DATA_FAIRNESS_BUDGET: Duration = Duration::from_millis(2);
+const RELAY_IDLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+const RELAY_TUNNEL_SOCKET_EVENT: usize = 1;
 const DATA_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const GATEWAY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const GATEWAY_RETRY_MAX: Duration = Duration::from_secs(120);
@@ -236,6 +241,57 @@ impl GatewayDaemonConfig {
             metrics: MetricsConfig::default(),
         }
     }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if let Some(local) = self.local_membership.as_ref() {
+            if local.protocol != self.gateway.protocol {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "local membership protocol must match the AMT gateway protocol",
+                ));
+            }
+
+            if let Some(downstream) = self.downstream.as_ref()
+                && local.query_interval.is_some()
+            {
+                let has_query_source = matches!(
+                    (local.protocol, local.interface),
+                    (MembershipProtocol::Igmpv3, Some(IpAddr::V4(address)))
+                        if !address.is_unspecified()
+                ) || matches!(
+                    (local.protocol, local.interface),
+                    (MembershipProtocol::Mldv2, Some(IpAddr::V6(address)))
+                        if !address.is_unspecified()
+                );
+                if !has_query_source {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "transparent local queries require an address-valued \
+                         --local-membership-interface (or --downstream-interface) matching the \
+                         protocol; use --local-query-interval 0 to disable active queries",
+                    ));
+                }
+
+                if local.protocol == MembershipProtocol::Mldv2
+                    && downstream.uses_route_selected_egress()
+                {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "MLDv2 General Queries target link-local ff02::1 and require an explicit \
+                         --downstream-interface or --downstream-ifindex; route-selected downstream \
+                         egress remains available when --local-query-interval is 0",
+                    ));
+                }
+            }
+        }
+
+        if let Some(downstream) = self.downstream.as_ref() {
+            downstream
+                .validate_for_protocol(self.gateway.protocol)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        }
+        Ok(())
+    }
 }
 
 /// Runs a small blocking AMT relay daemon.
@@ -243,7 +299,11 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
     let config = config.into();
     config.validate()?;
     let metrics_config = config.metrics.clone();
-    let socket = AmtUdpSocket::bind(config.relay.bind, config.relay.ecn)?;
+    let socket = AmtUdpSocket::bind_relay(config.relay.bind, config.relay.ecn)?;
+    let poller = Arc::new(Poller::new()?);
+    let socket_registration =
+        socket.register_readable(poller.as_ref(), RELAY_TUNNEL_SOCKET_EVENT)?;
+    let shutdown = ShutdownSignal::install_with_poller(Arc::clone(&poller))?;
 
     let rate_source_capacity = config
         .relay
@@ -253,11 +313,11 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
     let upstream_subscription_limit = config.relay.limits.max_upstream_subscriptions;
     let mut relay = Relay::new(config.relay);
     let mut pmtu_feedback = RelayPmtuFeedback::new(config.pmtu_feedback, &config.upstream)?;
-    let mut upstream =
-        UpstreamManager::with_subscription_limit(config.upstream, upstream_subscription_limit)
-            .map_err(|error| {
-                io::Error::other(format!("failed to initialize upstream receive: {error}"))
-            })?;
+    let upstream = UpstreamWorker::spawn(
+        config.upstream,
+        upstream_subscription_limit,
+        Arc::clone(&poller),
+    )?;
     let mut gateway_activity = GatewayActivity::default();
     let mut metrics = MetricsRecorder::relay(
         &metrics_config,
@@ -268,6 +328,7 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
             &upstream,
             config.path_mtu,
             config.pmtu_feedback,
+            socket.buffer_sizes(),
         ),
     )?;
     let mut last_gateway_prune = Instant::now();
@@ -286,91 +347,158 @@ pub fn run_relay(config: impl Into<RelayDaemonConfig>) -> io::Result<()> {
         relay.config().advertise_ipv4,
         relay.config().advertise_ipv6
     );
+    let socket_buffers = socket.buffer_sizes();
+    println!(
+        "relay tunnel socket buffers: receive={} bytes send={} bytes; upstream queue={} packets",
+        socket_buffers.receive,
+        socket_buffers.send,
+        crate::upstream_worker::UPSTREAM_PACKET_QUEUE_CAPACITY
+    );
     report_metrics_status(&metrics, &metrics_config);
 
     let mut buf = [0; MAX_UDP_DATAGRAM];
-    loop {
-        let mut made_progress = false;
+    let mut events = Events::new();
+    let mut accounted_worker = UpstreamWorkerSnapshot::default();
+    let run_result = (|| -> io::Result<()> {
+        loop {
+            if shutdown.requested() {
+                println!("shutdown requested; stopping AMT relay");
+                return Ok(());
+            }
 
-        for _ in 0..MAX_CONTROL_DRAIN {
-            match socket.recv_from(&mut buf) {
-                Ok((len, peer, _outer_ecn)) => {
-                    made_progress = true;
-                    if !rate_limiter.allow(peer.ip()) {
-                        metrics.counters_mut().control_datagrams_received_total += 1;
-                        metrics.counters_mut().control_datagrams_rate_limited_total += 1;
-                        continue;
+            let mut control_drained = 0;
+            for _ in 0..MAX_CONTROL_DRAIN {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, peer, _outer_ecn)) => {
+                        control_drained += 1;
+                        if !rate_limiter.allow(peer.ip()) {
+                            metrics.counters_mut().control_datagrams_received_total += 1;
+                            metrics.counters_mut().control_datagrams_rate_limited_total += 1;
+                            continue;
+                        }
+                        handle_amt_datagram(
+                            RelayControlPlane {
+                                socket: &socket,
+                                relay: &mut relay,
+                                upstream: &upstream,
+                                gateway_activity: &mut gateway_activity,
+                                metrics: &mut metrics,
+                                error_log: &mut error_log,
+                            },
+                            peer,
+                            &buf[..len],
+                        )?;
                     }
-                    handle_amt_datagram(
-                        RelayControlPlane {
-                            socket: &socket,
-                            relay: &mut relay,
-                            upstream: &mut upstream,
-                            gateway_activity: &mut gateway_activity,
-                            metrics: &mut metrics,
-                            error_log: &mut error_log,
-                        },
-                        peer,
-                        &buf[..len],
-                    )?;
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
             }
-        }
+            socket_registration.rearm()?;
 
-        if last_gateway_prune.elapsed() >= config.gateway_prune_interval {
-            let expired = config.gateway_idle_timeout.map_or(0, |timeout| {
-                prune_stale_gateways(&mut relay, &mut gateway_activity, timeout)
-            });
-            if expired != 0 {
-                metrics.counters_mut().gateways_expired_total += expired as u64;
-                println!(
-                    "expired {expired} idle gateway(s); active gateways={}",
-                    gateway_activity.len()
-                );
+            if last_gateway_prune.elapsed() >= config.gateway_prune_interval {
+                let expired = config.gateway_idle_timeout.map_or(0, |timeout| {
+                    prune_stale_gateways(&mut relay, &mut gateway_activity, timeout)
+                });
+                if expired != 0 {
+                    metrics.counters_mut().gateways_expired_total += expired as u64;
+                    println!(
+                        "expired {expired} idle gateway(s); active gateways={}",
+                        gateway_activity.len()
+                    );
+                }
+                if let Err(error) = sync_upstream(relay.state(), &upstream, &mut metrics) {
+                    error_log.record(error.to_string());
+                }
+                last_gateway_prune = Instant::now();
             }
-            if let Err(error) = sync_upstream(relay.state(), &mut upstream, &mut metrics) {
-                error_log.record(error.to_string());
+
+            let worker_snapshot = upstream.snapshot();
+            account_upstream_worker(
+                worker_snapshot,
+                &mut accounted_worker,
+                &mut metrics,
+                &mut data_log,
+            );
+            upstream.check_failure()?;
+
+            let drain = drain_upstream(
+                &socket,
+                &relay,
+                &upstream,
+                config.path_mtu,
+                &mut pmtu_feedback,
+                &mut metrics,
+                &mut data_log,
+            )?;
+            let worker_snapshot = upstream.snapshot();
+            account_upstream_worker(
+                worker_snapshot,
+                &mut accounted_worker,
+                &mut metrics,
+                &mut data_log,
+            );
+            upstream.check_failure()?;
+
+            if let Err(error) = metrics.maybe_emit_relay(RelayMetricsGauges {
+                active_gateways: gateway_activity.len() as u64,
+                active_upstream_subscriptions: worker_snapshot.active_subscriptions as u64,
+                upstream_capture_sockets: worker_snapshot.capture_sockets as u64,
+                upstream_queue_depth: worker_snapshot.queue_depth as u64,
+                upstream_queue_high_water: worker_snapshot.queue_high_water as u64,
+            }) {
+                eprintln!("failed to write relay metrics sample: {error}");
             }
-            last_gateway_prune = Instant::now();
-            made_progress = true;
-        }
+            data_log.maybe_emit();
+            error_log.maybe_emit();
 
-        let forwarded = drain_upstream(
-            &socket,
-            &relay,
-            &mut upstream,
-            config.path_mtu,
-            &mut pmtu_feedback,
-            &mut metrics,
-            &mut data_log,
-        )?;
-        made_progress |= forwarded != 0;
-        match metrics.maybe_emit_relay(RelayMetricsGauges {
-            active_gateways: gateway_activity.len() as u64,
-            active_upstream_subscriptions: upstream.active_subscription_count() as u64,
-            upstream_capture_sockets: upstream.capture_socket_count() as u64,
-        }) {
-            Ok(emitted) => made_progress |= emitted,
-            Err(error) => eprintln!("failed to write relay metrics sample: {error}"),
-        }
-        data_log.maybe_emit();
-        error_log.maybe_emit();
+            if control_drained == MAX_CONTROL_DRAIN
+                || drain.budget_exhausted
+                || worker_snapshot.queue_depth != 0
+            {
+                continue;
+            }
 
-        if !made_progress {
-            thread::sleep(IDLE_SLEEP);
+            events.clear();
+            poller.wait(
+                &mut events,
+                Some(relay_wait_timeout(
+                    last_gateway_prune,
+                    config.gateway_prune_interval,
+                    &metrics,
+                )),
+            )?;
         }
-    }
+    })();
+
+    drop(socket_registration);
+    let shutdown_result = upstream.shutdown();
+    run_result.and(shutdown_result)
 }
 
 /// Runs a small blocking AMT gateway daemon.
 pub fn run_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
+    config.validate()?;
+
     #[cfg(feature = "driad")]
     if config.driad.is_some() {
         return run_driad_gateway(config);
     }
     run_static_gateway(config)
+}
+
+fn initialize_downstream(
+    config: Option<DownstreamConfig>,
+    protocol: crate::protocol::MembershipProtocol,
+) -> io::Result<Option<DownstreamPublisher>> {
+    config
+        .map(|config| {
+            DownstreamPublisher::try_new(config, protocol).map_err(|error| {
+                io::Error::other(format!(
+                    "failed to initialize downstream forwarding: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(feature = "driad")]
@@ -386,8 +514,8 @@ fn run_driad_gateway(mut config: GatewayDaemonConfig) -> io::Result<()> {
     let configured_joins = config.joins.len() as u64;
     let transparent_enabled = config.local_membership.is_some();
     let downstream_enabled = config.downstream.is_some();
+    let mut downstream = initialize_downstream(config.downstream, protocol)?;
     let shutdown = ShutdownSignal::install()?;
-    let mut downstream = config.downstream.map(DownstreamPublisher::new);
     let mut local_membership = match config.local_membership {
         Some(local_config) => Some(LocalMembershipManager::new(local_config).map_err(|error| {
             io::Error::other(format!(
@@ -698,15 +826,16 @@ fn drain_local_membership_state(
 }
 
 fn run_static_gateway(config: GatewayDaemonConfig) -> io::Result<()> {
+    let protocol = config.gateway.protocol;
     let metrics_config = config.metrics.clone();
     let configured_joins = config.joins.len() as u64;
     let transparent_enabled = config.local_membership.is_some();
     let downstream_enabled = config.downstream.is_some();
+    let mut downstream = initialize_downstream(config.downstream, protocol)?;
     let socket = AmtUdpSocket::bind(config.bind, config.gateway.ecn)?;
     let shutdown = ShutdownSignal::install()?;
 
     let mut gateway = Gateway::new(config.gateway);
-    let mut downstream = config.downstream.map(DownstreamPublisher::new);
     let mut local_membership = match config.local_membership {
         Some(local_config) => {
             let manager = LocalMembershipManager::new(local_config).map_err(|error| {
@@ -2289,10 +2418,21 @@ struct ShutdownSignal {
 
 impl ShutdownSignal {
     fn install() -> io::Result<Self> {
+        Self::install_inner(None)
+    }
+
+    fn install_with_poller(poller: Arc<Poller>) -> io::Result<Self> {
+        Self::install_inner(Some(poller))
+    }
+
+    fn install_inner(poller: Option<Arc<Poller>>) -> io::Result<Self> {
         let requested = Arc::new(AtomicBool::new(false));
         let handler_requested = Arc::clone(&requested);
         ctrlc::set_handler(move || {
             handler_requested.store(true, Ordering::SeqCst);
+            if let Some(poller) = poller.as_ref() {
+                let _ = poller.notify();
+            }
         })
         .map_err(|error| io::Error::other(format!("failed to install signal handler: {error}")))?;
 
@@ -2640,7 +2780,7 @@ fn prune_stale_gateways(
 struct RelayControlPlane<'a> {
     socket: &'a AmtUdpSocket,
     relay: &'a mut Relay,
-    upstream: &'a mut UpstreamManager,
+    upstream: &'a UpstreamWorker,
     gateway_activity: &'a mut GatewayActivity,
     metrics: &'a mut MetricsRecorder,
     error_log: &'a mut ErrorSummary,
@@ -2735,13 +2875,11 @@ fn handle_amt_datagram(
 
 fn sync_upstream(
     state: &RelayState,
-    upstream: &mut UpstreamManager,
+    upstream: &UpstreamWorker,
     metrics: &mut MetricsRecorder,
 ) -> io::Result<()> {
     let subscriptions = state.upstream_subscriptions();
-    let changes = upstream
-        .reconcile(subscriptions)
-        .map_err(|error| io::Error::other(format!("failed to update upstream receive: {error}")))?;
+    let changes = upstream.reconcile(subscriptions)?;
     metrics.counters_mut().upstream_subscription_adds_total += changes.added as u64;
     metrics.counters_mut().upstream_subscription_removes_total += changes.removed as u64;
     metrics.counters_mut().upstream_reconcile_failures_total += changes.failed_removals as u64;
@@ -2756,31 +2894,101 @@ fn sync_upstream(
     Ok(())
 }
 
+fn account_upstream_worker(
+    current: UpstreamWorkerSnapshot,
+    accounted: &mut UpstreamWorkerSnapshot,
+    metrics: &mut MetricsRecorder,
+    data_log: &mut RelayDataLog,
+) {
+    let accepted_packets = current
+        .accepted_packets
+        .saturating_sub(accounted.accepted_packets);
+    let accepted_bytes = current
+        .accepted_bytes
+        .saturating_sub(accounted.accepted_bytes);
+    let queue_drops = current.queue_drops.saturating_sub(accounted.queue_drops);
+    let failures = current.failures.saturating_sub(accounted.failures);
+
+    metrics.counters_mut().upstream_packets_received_total += accepted_packets;
+    metrics.counters_mut().upstream_bytes_received_total += accepted_bytes;
+    metrics.counters_mut().upstream_worker_queue_drops_total += queue_drops;
+    metrics.counters_mut().upstream_worker_failures_total += failures;
+    data_log.record_worker_activity(accepted_packets, accepted_bytes, queue_drops);
+    *accounted = current;
+}
+
+fn relay_wait_timeout(
+    last_gateway_prune: Instant,
+    gateway_prune_interval: Duration,
+    metrics: &MetricsRecorder,
+) -> Duration {
+    let minimum = Duration::from_millis(1);
+    let prune_wait = gateway_prune_interval
+        .saturating_sub(last_gateway_prune.elapsed())
+        .max(minimum);
+    let metrics_wait = metrics
+        .next_emit_in()
+        .unwrap_or(RELAY_IDLE_MAINTENANCE_INTERVAL)
+        .max(minimum);
+    prune_wait
+        .min(metrics_wait)
+        .min(RELAY_IDLE_MAINTENANCE_INTERVAL)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UpstreamDrain {
+    budget_exhausted: bool,
+}
+
+#[derive(Debug)]
+struct RelayWorkBudget {
+    started: Instant,
+    packet_limit: usize,
+    time_limit: Duration,
+    packets: usize,
+}
+
+impl RelayWorkBudget {
+    fn new(packet_limit: usize, time_limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            packet_limit,
+            time_limit,
+            packets: 0,
+        }
+    }
+
+    fn can_take_packet(&self) -> bool {
+        self.packets < self.packet_limit
+            && (self.packets == 0 || self.started.elapsed() < self.time_limit)
+    }
+
+    fn record_packet(&mut self) {
+        self.packets += 1;
+    }
+
+    fn exhausted(&self) -> bool {
+        self.packets == self.packet_limit
+            || (self.packets != 0 && self.started.elapsed() >= self.time_limit)
+    }
+}
+
 fn drain_upstream(
     socket: &AmtUdpSocket,
     relay: &Relay,
-    upstream: &mut UpstreamManager,
+    upstream: &UpstreamWorker,
     path_mtu: usize,
     pmtu_feedback: &mut RelayPmtuFeedback,
     metrics: &mut MetricsRecorder,
     data_log: &mut RelayDataLog,
-) -> io::Result<usize> {
-    if upstream.active_subscription_count() == 0 {
-        return Ok(0);
-    }
+) -> io::Result<UpstreamDrain> {
+    let mut budget = RelayWorkBudget::new(MAX_RELAY_DATA_DRAIN, RELAY_DATA_FAIRNESS_BUDGET);
 
-    let mut forwarded_packets = 0;
-
-    for _ in 0..MAX_UPSTREAM_DRAIN {
-        let Some(datagram) = upstream.try_recv().map_err(|error| {
-            io::Error::other(format!("failed to receive upstream multicast: {error}"))
-        })?
-        else {
+    while budget.can_take_packet() {
+        let Some(datagram) = upstream.try_recv()? else {
             break;
         };
-        metrics.counters_mut().upstream_packets_received_total += 1;
-        metrics.counters_mut().upstream_bytes_received_total += datagram.datagram().len() as u64;
-        data_log.record_received(datagram.datagram().len());
+        budget.record_packet();
 
         let mut endpoints = relay
             .state()
@@ -2870,11 +3078,12 @@ fn drain_upstream(
 
         metrics.counters_mut().upstream_packets_forwarded_total += successful_endpoints;
         metrics.counters_mut().upstream_bytes_forwarded_total += successful_bytes;
-        forwarded_packets += 1;
         data_log.record_forwarded(forwarded_len, successful_endpoints);
     }
 
-    Ok(forwarded_packets)
+    Ok(UpstreamDrain {
+        budget_exhausted: budget.exhausted(),
+    })
 }
 
 #[derive(Debug)]
@@ -3049,6 +3258,7 @@ struct RelayDataLog {
     forwarded_gateway_sends: u64,
     unmatched_packets: u64,
     last_unmatched_protocol: Option<&'static str>,
+    worker_queue_drops: u64,
     send_errors: u64,
     last_send_error: Option<String>,
     mtu_drops: u64,
@@ -3066,6 +3276,7 @@ impl RelayDataLog {
             forwarded_gateway_sends: 0,
             unmatched_packets: 0,
             last_unmatched_protocol: None,
+            worker_queue_drops: 0,
             send_errors: 0,
             last_send_error: None,
             mtu_drops: 0,
@@ -3073,9 +3284,10 @@ impl RelayDataLog {
         }
     }
 
-    fn record_received(&mut self, bytes: usize) {
-        self.received_packets += 1;
-        self.received_bytes += bytes as u64;
+    fn record_worker_activity(&mut self, packets: u64, bytes: u64, queue_drops: u64) {
+        self.received_packets += packets;
+        self.received_bytes += bytes;
+        self.worker_queue_drops += queue_drops;
     }
 
     fn record_unmatched(&mut self, protocol: &'static str) {
@@ -3107,13 +3319,14 @@ impl RelayDataLog {
         }
 
         println!(
-            "relay data-plane summary: received={} packets/{} bytes, forwarded={} packets to {} gateway endpoint(s)/{} bytes, unmatched={}, mtu_drops={}, send_errors={}",
+            "relay data-plane summary: received={} packets/{} bytes, forwarded={} packets to {} gateway endpoint(s)/{} bytes, unmatched={}, worker_queue_drops={}, mtu_drops={}, send_errors={}",
             self.received_packets,
             self.received_bytes,
             self.forwarded_packets,
             self.forwarded_gateway_sends,
             self.forwarded_bytes,
             self.unmatched_packets,
+            self.worker_queue_drops,
             self.mtu_drops,
             self.send_errors
         );
@@ -3130,7 +3343,10 @@ impl RelayDataLog {
     }
 
     fn has_events(&self) -> bool {
-        self.received_packets != 0 || self.send_errors != 0 || self.mtu_drops != 0
+        self.received_packets != 0
+            || self.worker_queue_drops != 0
+            || self.send_errors != 0
+            || self.mtu_drops != 0
     }
 
     fn reset(&mut self) {
@@ -3142,6 +3358,7 @@ impl RelayDataLog {
         self.forwarded_gateway_sends = 0;
         self.unmatched_packets = 0;
         self.last_unmatched_protocol = None;
+        self.worker_queue_drops = 0;
         self.send_errors = 0;
         self.last_send_error = None;
         self.mtu_drops = 0;
@@ -3251,13 +3468,22 @@ fn relay_metrics_flags(
     config: &MetricsConfig,
     bind_addr: SocketAddr,
     relay: &Relay,
-    upstream: &UpstreamManager,
+    upstream: &UpstreamWorker,
     path_mtu: usize,
     pmtu_feedback: bool,
+    socket_buffers: SocketBufferSizes,
 ) -> MetricsFlags {
     #[cfg(not(feature = "metrics"))]
     {
-        let _ = (config, bind_addr, relay, upstream, path_mtu, pmtu_feedback);
+        let _ = (
+            config,
+            bind_addr,
+            relay,
+            upstream,
+            path_mtu,
+            pmtu_feedback,
+            socket_buffers,
+        );
         base_flags("relay", "")
     }
     #[cfg(feature = "metrics")]
@@ -3282,10 +3508,22 @@ fn relay_metrics_flags(
             flags.insert("upstream_ifindex".to_string(), index.into());
         }
         flags.insert("path_mtu".to_string(), path_mtu.into());
+        flags.insert(
+            "tunnel_receive_buffer_bytes".to_string(),
+            socket_buffers.receive.into(),
+        );
+        flags.insert(
+            "tunnel_send_buffer_bytes".to_string(),
+            socket_buffers.send.into(),
+        );
         flags.insert("pmtu_feedback_enabled".to_string(), pmtu_feedback.into());
         flags.insert(
             "shared_upstream_capture".to_string(),
             upstream.uses_shared_capture().into(),
+        );
+        flags.insert(
+            "upstream_packet_queue_capacity".to_string(),
+            crate::upstream_worker::UPSTREAM_PACKET_QUEUE_CAPACITY.into(),
         );
         flags.insert("ecn_enabled".to_string(), relay.config().ecn.into());
         flags
@@ -3338,6 +3576,123 @@ fn gateway_metrics_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_validation_requires_source_for_active_local_queries() {
+        let gateway = GatewayConfig::new(
+            "192.0.2.10:2268".parse().unwrap(),
+            MembershipProtocol::Igmpv3,
+        );
+        let mut config = GatewayDaemonConfig::new("0.0.0.0:0".parse().unwrap(), gateway);
+        config.downstream = Some(DownstreamConfig {
+            interface: Some("192.0.2.20".parse().unwrap()),
+            ..DownstreamConfig::default()
+        });
+        config.local_membership = Some(LocalMembershipConfig::new(MembershipProtocol::Igmpv3));
+
+        let error = config.validate().unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--local-membership-interface"));
+    }
+
+    #[test]
+    fn gateway_validation_rejects_route_selected_mld_queries() {
+        let gateway = GatewayConfig::new(
+            "[2001:db8::10]:2268".parse().unwrap(),
+            MembershipProtocol::Mldv2,
+        );
+        let mut config = GatewayDaemonConfig::new("[::]:0".parse().unwrap(), gateway);
+        config.downstream = Some(DownstreamConfig::default());
+        let mut local = LocalMembershipConfig::new(MembershipProtocol::Mldv2);
+        local.interface = Some("fe80::20".parse().unwrap());
+        config.local_membership = Some(local);
+
+        let error = config.validate().unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("ff02::1"));
+    }
+
+    #[test]
+    fn disabled_local_queries_allow_route_selected_downstream() {
+        let gateway = GatewayConfig::new(
+            "192.0.2.10:2268".parse().unwrap(),
+            MembershipProtocol::Igmpv3,
+        );
+        let mut config = GatewayDaemonConfig::new("0.0.0.0:0".parse().unwrap(), gateway);
+        config.downstream = Some(DownstreamConfig::default());
+        let mut local = LocalMembershipConfig::new(MembershipProtocol::Igmpv3);
+        local.query_interval = None;
+        config.local_membership = Some(local);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(config.validate().is_ok());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("route-selected")
+        );
+    }
+
+    #[test]
+    fn relay_data_budget_forwards_the_first_packet_without_batch_delay() {
+        let budget = RelayWorkBudget::new(512, Duration::from_millis(2));
+
+        assert!(budget.can_take_packet());
+    }
+
+    #[test]
+    fn relay_data_budget_yields_to_control_under_continuous_traffic() {
+        let mut budget = RelayWorkBudget::new(4, Duration::from_secs(1));
+        while budget.can_take_packet() {
+            budget.record_packet();
+        }
+
+        assert_eq!(budget.packets, 4);
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn relay_data_budget_enforces_its_time_slice() {
+        let mut budget = RelayWorkBudget::new(512, Duration::from_millis(1));
+        budget.record_packet();
+        thread::sleep(Duration::from_millis(2));
+
+        assert!(!budget.can_take_packet());
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn upstream_worker_accounting_applies_only_new_activity() {
+        let mut metrics = MetricsRecorder::relay(
+            &MetricsConfig::default(),
+            base_flags("relay", "worker-accounting-test"),
+        )
+        .unwrap();
+        let mut data_log = RelayDataLog::new();
+        let mut accounted = UpstreamWorkerSnapshot::default();
+        let snapshot = UpstreamWorkerSnapshot {
+            accepted_packets: 10,
+            accepted_bytes: 12_000,
+            queue_drops: 2,
+            failures: 1,
+            ..UpstreamWorkerSnapshot::default()
+        };
+
+        account_upstream_worker(snapshot, &mut accounted, &mut metrics, &mut data_log);
+        account_upstream_worker(snapshot, &mut accounted, &mut metrics, &mut data_log);
+
+        assert_eq!(metrics.counters().upstream_packets_received_total, 10);
+        assert_eq!(metrics.counters().upstream_bytes_received_total, 12_000);
+        assert_eq!(metrics.counters().upstream_worker_queue_drops_total, 2);
+        assert_eq!(metrics.counters().upstream_worker_failures_total, 1);
+        assert_eq!(data_log.received_packets, 10);
+        assert_eq!(data_log.worker_queue_drops, 2);
+    }
 
     #[test]
     fn gateway_activity_reports_only_stale_endpoints() {

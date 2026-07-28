@@ -106,6 +106,7 @@ pub struct DownstreamFileConfig {
     pub interface: Option<IpAddr>,
     #[serde(alias = "ifindex")]
     pub interface_index: Option<u32>,
+    /// Legacy key retained so the daemon can reject it with an actionable error.
     pub ttl: Option<u8>,
     pub loopback: Option<bool>,
 }

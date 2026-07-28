@@ -23,6 +23,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+const DOWNSTREAM_TTL_UNSUPPORTED: &str = "--downstream-ttl and gateway.downstream.ttl are \
+    unsupported because raw downstream forwarding preserves the complete inner IP header; \
+    set the IPv4 TTL or IPv6 Hop Limit at the multicast source";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayRelayDiscovery {
     Static,
@@ -391,14 +395,14 @@ fn parse_gateway_config(
         Some(DownstreamConfig::default())
     };
     if let Some(config) = gateway_file.and_then(|config| config.downstream.as_ref()) {
+        if config.ttl.is_some() {
+            return Err(DOWNSTREAM_TTL_UNSUPPORTED.to_string());
+        }
         let downstream = downstream.get_or_insert_with(DownstreamConfig::default);
         downstream.interface = config.interface;
         downstream.interface_index = config.interface_index;
-        if let Some(ttl) = config.ttl {
-            downstream.ttl = Some(ttl);
-        }
         if let Some(loopback) = config.loopback {
-            downstream.loopback = loopback;
+            downstream.loopback = Some(loopback);
         }
     }
     let mut transparent = gateway_file
@@ -659,18 +663,12 @@ fn parse_gateway_config(
                     .interface_index = Some(index);
             }
             "--downstream-ttl" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--downstream-ttl requires a TTL value".to_string())?;
-                let ttl = value
-                    .parse::<u8>()
-                    .map_err(|_| format!("invalid --downstream-ttl '{value}'"))?;
-                downstream.get_or_insert_with(DownstreamConfig::default).ttl = Some(ttl);
+                return Err(DOWNSTREAM_TTL_UNSUPPORTED.to_string());
             }
             "--no-downstream-loopback" => {
                 downstream
                     .get_or_insert_with(DownstreamConfig::default)
-                    .loopback = false;
+                    .loopback = Some(false);
             }
             "--no-downstream" => downstream = None,
             "--metrics-dir" => {
@@ -751,6 +749,11 @@ fn parse_gateway_config(
         && !protocol_matches_address(protocol, interface)
     {
         return Err("--downstream-interface address family must match --protocol".to_string());
+    }
+    if let Some(downstream) = downstream.as_ref() {
+        downstream
+            .validate_options_for_protocol(protocol)
+            .map_err(|error| error.to_string())?;
     }
     for join in &configured_joins {
         validate_gateway_join(join.group, join.source)?;
@@ -1292,7 +1295,7 @@ fn usage() -> &'static str {
         "[--driad-maximum-traffic-timeout SECONDS] [--driad-max-source-tunnels COUNT] ",
         "[--driad-max-concurrent-probes COUNT] [--driad-max-dns-workers COUNT] ",
         "[--ecn|--no-ecn] ",
-        "[--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] ",
+        "[--downstream-interface IP] [--downstream-ifindex INDEX] ",
         "[--local-membership-interface IP] [--local-membership-ifindex INDEX] ",
         "[--local-query-interval SECONDS] [--membership-refresh-interval SECONDS] ",
         "[--local-reporter-timeout SECONDS] ",
@@ -1308,6 +1311,7 @@ fn usage() -> &'static str {
         "Gateway refreshes memberships every 60 seconds by default; 0 retains the 60-second liveness probe.\n",
         "RFC 9601 ECN propagation is opt-in with --ecn; compatibility mode is the default.\n",
         "Use --transparent to learn local IGMPv3/MLDv2 receiver interest instead of requiring a configured --group.\n",
+        "Raw downstream forwarding preserves the original IPv4 TTL or IPv6 Hop Limit; downstream overrides are unsupported.\n",
         "Use --metrics-dir to write Heimdall JSONL metrics under DIR/node-id/.\n",
         "Raw relay upstream receive and gateway downstream transmit may require elevated privileges or explicit interface selection on some platforms.",
     )
@@ -1378,7 +1382,6 @@ mod tests {
 
             [gateway.downstream]
             interface = "192.168.1.20"
-            ttl = 16
 
             [[gateway.joins]]
             group = "239.1.2.3"
@@ -1401,8 +1404,8 @@ mod tests {
             config
                 .downstream
                 .as_ref()
-                .and_then(|downstream| downstream.ttl),
-            Some(16)
+                .and_then(|downstream| downstream.interface),
+            Some("192.168.1.20".parse().unwrap())
         );
     }
 
@@ -1489,6 +1492,71 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("downstream-interface address family"));
+    }
+
+    #[test]
+    fn gateway_rejects_downstream_ttl_for_ipv4() {
+        let error = parse_gateway_config([
+            "--relay".to_string(),
+            "203.0.113.10:2268".to_string(),
+            "--group".to_string(),
+            "239.1.2.3".to_string(),
+            "--downstream-ttl".to_string(),
+            "16".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("--downstream-ttl"));
+        assert!(error.contains("preserves the complete inner IP header"));
+    }
+
+    #[test]
+    fn gateway_toml_rejects_downstream_ttl() {
+        let path = write_temp_config(
+            "gateway_downstream_ttl",
+            r#"
+            [gateway]
+            relay = "203.0.113.10:2268"
+            protocol = "igmpv3"
+            group = "239.1.2.3"
+
+            [gateway.downstream]
+            interface = "192.0.2.20"
+            ttl = 16
+            "#,
+        );
+
+        let error =
+            parse_gateway_config(["--config".to_string(), path.display().to_string()]).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        assert!(error.contains("gateway.downstream.ttl"));
+        assert!(error.contains("set the IPv4 TTL or IPv6 Hop Limit at the multicast source"));
+    }
+
+    #[test]
+    fn gateway_toml_rejects_loopback_for_full_header_ipv6() {
+        let path = write_temp_config(
+            "gateway_ipv6_loopback",
+            r#"
+            [gateway]
+            relay = "203.0.113.10:2268"
+            protocol = "mldv2"
+            group = "ff3e::1234"
+            source = "2001:db8::20"
+
+            [gateway.downstream]
+            interface = "2001:db8::30"
+            loopback = true
+            "#,
+        );
+
+        let error =
+            parse_gateway_config(["--config".to_string(), path.display().to_string()]).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        assert!(error.contains("loopback=true"));
+        assert!(error.contains("full-header IPv6"));
     }
 
     #[test]

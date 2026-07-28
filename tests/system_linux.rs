@@ -1,13 +1,15 @@
 use std::env;
 use std::fs;
+use std::hint::spin_loop;
 use std::io::{BufRead, BufReader, Read};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use amt::{Gateway, GatewayAction, GatewayConfig, MembershipProtocol, Message};
 use mcrx_core::{Context as McrxContext, SourceFilter, SubscriptionConfig};
 use mctx_core::{Context as MctxContext, OutgoingInterface, PublicationConfig};
 
@@ -19,6 +21,76 @@ const SOURCE_IP: &str = "10.91.0.2";
 const GATEWAY_DOWNSTREAM_IP: &str = "10.92.0.1";
 const RECEIVER_IP: &str = "10.92.0.2";
 const PORT: u16 = 5000;
+const BURST_RATE: u64 = 8_000;
+const BURST_DURATION: Duration = Duration::from_secs(10);
+const BURST_PAYLOAD_BYTES: usize = 1_200;
+
+#[test]
+#[ignore = "requires Linux root privileges, network namespaces, and raw socket capability"]
+fn linux_namespace_relay_sustained_burst() {
+    let Some(fixture) = LinuxSystemFixture::prepare("burst") else {
+        return;
+    };
+
+    let group = "239.91.8.1";
+    let rate = env::var("AMT_SYSTEM_BURST_RATE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(BURST_RATE);
+    let duration = env::var("AMT_SYSTEM_BURST_DURATION_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BURST_DURATION);
+    let payload_bytes = env::var("AMT_SYSTEM_BURST_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(BURST_PAYLOAD_BYTES);
+    let expected = (u128::from(rate) * duration.as_nanos() / 1_000_000_000) as usize;
+    let minimum = expected * 999 / 1_000;
+    let mut relay = fixture.spawn_relay("relay-burst", 30).unwrap();
+    relay
+        .wait_for_log(Duration::from_secs(5), "amt relay listening")
+        .unwrap();
+
+    let mut sink = fixture
+        .spawn_amt_sink(group, expected, minimum, Duration::from_secs(20))
+        .unwrap();
+    sink.wait_for_log(Duration::from_secs(5), "AMT sink joined")
+        .unwrap();
+    relay
+        .wait_for_log(
+            Duration::from_secs(5),
+            "upstream subscriptions changed: +1 -0 active=1",
+        )
+        .unwrap();
+
+    let mut source = fixture
+        .spawn_burst_source(group, rate, duration, payload_bytes)
+        .unwrap();
+    source
+        .wait_success(duration + Duration::from_secs(5))
+        .unwrap();
+    sink.wait_success(Duration::from_secs(20)).unwrap();
+
+    #[cfg(feature = "metrics")]
+    {
+        thread::sleep(Duration::from_millis(500));
+        let sample = fixture.last_metrics_sample("relay-burst", "amt-relay.jsonl");
+        let captured = sample["upstream_packets_received_total"].as_u64().unwrap();
+        let forwarded = sample["upstream_packets_forwarded_total"].as_u64().unwrap();
+        let queue_drops = sample["upstream_worker_queue_drops_total"]
+            .as_u64()
+            .unwrap();
+        let queue_high_water = sample["upstream_queue_high_water"].as_u64().unwrap();
+        println!(
+            "relay burst metrics: offered={expected} captured={captured} forwarded={forwarded} queue_drops={queue_drops} queue_high_water={queue_high_water}"
+        );
+        assert!(captured >= minimum as u64, "Relay capture below 99.9%");
+        assert!(forwarded >= minimum as u64, "Relay forwarding below 99.9%");
+        assert_eq!(queue_drops, 0, "Relay worker queue overloaded");
+    }
+}
 
 #[test]
 #[ignore = "requires Linux root privileges, network namespaces, and raw socket capability"]
@@ -42,8 +114,6 @@ fn linux_namespace_transparent_asm_forwarding() {
                 "igmpv3",
                 "--downstream-interface",
                 GATEWAY_DOWNSTREAM_IP,
-                "--downstream-ttl",
-                "16",
                 "--local-query-interval",
                 "1",
                 "--membership-refresh-interval",
@@ -76,7 +146,7 @@ fn linux_namespace_transparent_asm_forwarding() {
 
 #[test]
 #[ignore = "requires Linux root privileges, network namespaces, and raw socket capability"]
-fn linux_namespace_configured_ssm_forwarding() {
+fn linux_namespace_route_selected_ssm_forwarding() {
     let Some(fixture) = LinuxSystemFixture::prepare("ssm") else {
         return;
     };
@@ -97,10 +167,6 @@ fn linux_namespace_configured_ssm_forwarding() {
                 SOURCE_IP,
                 "--protocol",
                 "igmpv3",
-                "--downstream-interface",
-                GATEWAY_DOWNSTREAM_IP,
-                "--downstream-ttl",
-                "16",
                 "--membership-refresh-interval",
                 "1",
             ],
@@ -256,6 +322,129 @@ fn __system_helper_send_multicast() {
         context.send(id, payload.as_bytes()).unwrap();
         thread::sleep(interval);
     }
+}
+
+#[test]
+#[ignore = "helper for linux namespace system tests"]
+fn __system_helper_blast_multicast() {
+    if env::var("AMT_SYSTEM_HELPER").as_deref() != Ok("blast") {
+        return;
+    }
+
+    let group = env_ip("AMT_SYSTEM_GROUP");
+    let interface = env_ip("AMT_SYSTEM_INTERFACE");
+    let source = env_ip("AMT_SYSTEM_SOURCE");
+    let rate = env_u64("AMT_SYSTEM_RATE");
+    let duration = Duration::from_millis(env_u64("AMT_SYSTEM_DURATION_MS"));
+    let payload = vec![0x5a; env_u64("AMT_SYSTEM_PAYLOAD_BYTES") as usize];
+    let count = (duration.as_nanos() * u128::from(rate) / 1_000_000_000) as usize;
+    let period = Duration::from_nanos(1_000_000_000 / rate);
+
+    let mut config = PublicationConfig::new(group, PORT)
+        .with_source_addr(source)
+        .with_ttl(16)
+        .with_loopback(false);
+    config = match interface {
+        IpAddr::V4(addr) => config.with_outgoing_interface(OutgoingInterface::Ipv4Addr(addr)),
+        IpAddr::V6(addr) => config.with_outgoing_interface(OutgoingInterface::Ipv6Addr(addr)),
+    };
+    let mut context = MctxContext::new();
+    let id = context.add_publication(config).unwrap();
+    let started = Instant::now();
+
+    for sequence in 0..count {
+        let deadline = started + period * sequence as u32;
+        while Instant::now() < deadline {
+            spin_loop();
+        }
+        context.send(id, &payload).unwrap();
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "source blast sent={count} elapsed={elapsed:.3}s achieved_rate={:.1} packets/s",
+        count as f64 / elapsed
+    );
+}
+
+#[test]
+#[ignore = "helper for linux namespace system tests"]
+fn __system_helper_amt_sink() {
+    if env::var("AMT_SYSTEM_HELPER").as_deref() != Ok("amt-sink") {
+        return;
+    }
+
+    let relay = SocketAddr::new(env_ip("AMT_SYSTEM_RELAY"), AMT_PORT);
+    let bind = SocketAddr::new(env_ip("AMT_SYSTEM_INTERFACE"), 0);
+    let group = env_ip("AMT_SYSTEM_GROUP");
+    let expected = env_u64("AMT_SYSTEM_EXPECTED") as usize;
+    let minimum = env_u64("AMT_SYSTEM_MINIMUM") as usize;
+    let timeout = Duration::from_millis(env_u64("AMT_SYSTEM_TIMEOUT_MS"));
+    let socket = UdpSocket::bind(bind).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let socket_ref = socket2::SockRef::from(&socket);
+    let _ = socket_ref.set_recv_buffer_size(8 * 1024 * 1024);
+    let mut gateway = Gateway::new(GatewayConfig::new(relay, MembershipProtocol::Igmpv3));
+
+    send_gateway_action(&socket, gateway.discovery());
+    let handshake_deadline = Instant::now() + Duration::from_secs(5);
+    let mut buffer = [0u8; 65_535];
+    loop {
+        assert!(
+            Instant::now() < handshake_deadline,
+            "timed out establishing AMT sink"
+        );
+        match socket.recv_from(&mut buffer) {
+            Ok((len, peer)) => match gateway.handle_datagram(peer, &buffer[..len]).unwrap() {
+                action @ GatewayAction::Send { .. } => send_gateway_action(&socket, action),
+                GatewayAction::MembershipQuery { .. } => {
+                    send_gateway_action(&socket, gateway.join_group(group, None).unwrap());
+                    println!("AMT sink joined {group}");
+                    break;
+                }
+                _ => {}
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("AMT sink handshake receive failed: {error}"),
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut received = 0usize;
+    while received < expected && Instant::now() < deadline {
+        match socket.recv_from(&mut buffer) {
+            Ok((len, peer)) => match Message::decode(&buffer[..len]) {
+                Ok(Message::MulticastData { .. }) if peer == relay => received += 1,
+                Ok(_) => {}
+                Err(error) => panic!("invalid AMT sink datagram: {error}"),
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("AMT sink receive failed: {error}"),
+        }
+    }
+
+    println!("AMT sink received={received} expected={expected} minimum={minimum}");
+    assert!(
+        received >= minimum,
+        "AMT Relay tunnel egress fell below the required delivery ratio"
+    );
+}
+
+fn send_gateway_action(socket: &UdpSocket, action: GatewayAction) {
+    let (destination, datagram) = action
+        .into_send()
+        .expect("gateway action must contain a datagram");
+    socket.send_to(&datagram, destination).unwrap();
 }
 
 #[test]
@@ -500,6 +689,44 @@ impl LinuxSystemFixture {
         LoggedChild::spawn(command)
     }
 
+    fn spawn_burst_source(
+        &self,
+        group: &str,
+        rate: u64,
+        duration: Duration,
+        payload_bytes: usize,
+    ) -> std::io::Result<LoggedChild> {
+        let mut command = helper_command(&self.source_ns, "__system_helper_blast_multicast");
+        command
+            .env("AMT_SYSTEM_HELPER", "blast")
+            .env("AMT_SYSTEM_GROUP", group)
+            .env("AMT_SYSTEM_INTERFACE", SOURCE_IP)
+            .env("AMT_SYSTEM_SOURCE", SOURCE_IP)
+            .env("AMT_SYSTEM_RATE", rate.to_string())
+            .env("AMT_SYSTEM_DURATION_MS", duration.as_millis().to_string())
+            .env("AMT_SYSTEM_PAYLOAD_BYTES", payload_bytes.to_string());
+        LoggedChild::spawn(command)
+    }
+
+    fn spawn_amt_sink(
+        &self,
+        group: &str,
+        expected: usize,
+        minimum: usize,
+        timeout: Duration,
+    ) -> std::io::Result<LoggedChild> {
+        let mut command = helper_command(&self.gateway_ns, "__system_helper_amt_sink");
+        command
+            .env("AMT_SYSTEM_HELPER", "amt-sink")
+            .env("AMT_SYSTEM_RELAY", RELAY_AMT_IP)
+            .env("AMT_SYSTEM_INTERFACE", GATEWAY_AMT_IP)
+            .env("AMT_SYSTEM_GROUP", group)
+            .env("AMT_SYSTEM_EXPECTED", expected.to_string())
+            .env("AMT_SYSTEM_MINIMUM", minimum.to_string())
+            .env("AMT_SYSTEM_TIMEOUT_MS", timeout.as_millis().to_string());
+        LoggedChild::spawn(command)
+    }
+
     fn spawn_receiver(
         &self,
         node_id: &str,
@@ -553,6 +780,18 @@ impl LinuxSystemFixture {
         let sample: serde_json::Value = serde_json::from_str(sample).unwrap();
         assert!(sample["ts"].is_number());
         assert!(sample["interval_secs"].is_number());
+    }
+
+    #[cfg(feature = "metrics")]
+    fn last_metrics_sample(&self, node_id: &str, file_name: &str) -> serde_json::Value {
+        let path = self.metrics_dir.join(node_id).join(file_name);
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let sample = contents
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .unwrap_or_else(|| panic!("{} is missing a metrics sample", path.display()));
+        serde_json::from_str(sample).unwrap()
     }
 }
 

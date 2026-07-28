@@ -37,9 +37,13 @@ pub mod state;
 mod udp;
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
 pub mod upstream;
+#[cfg(all(feature = "runtime", not(target_os = "ios")))]
+mod upstream_worker;
 
 #[cfg(all(feature = "runtime", not(target_os = "ios")))]
-pub use downstream::{DownstreamConfig, DownstreamForward, DownstreamPublisher};
+pub use downstream::{
+    DownstreamConfig, DownstreamConfigError, DownstreamForward, DownstreamPublisher,
+};
 #[cfg(feature = "driad")]
 pub use driad::{
     AMT_ANYCAST_IPV4, AMT_ANYCAST_IPV6, AMTRELAY_RRTYPE, AmtRelayRecord, AmtRelayTarget,

@@ -40,8 +40,55 @@ The relay code is organized as follows:
   sources when built with `pmtu-feedback`.
 - `daemon::run_relay` connects the UDP AMT socket to the relay state machine and
   forwards raw upstream datagrams as AMT Multicast Data.
+- `upstream_worker` owns `UpstreamManager` on a dedicated capture thread and
+  transfers complete datagrams through a bounded queue.
 - `udp::AmtUdpSocket` supplies per-datagram outer ECN metadata and transmit
   markings through `quinn-udp`.
+
+The classic Relay data path is deliberately split at capture:
+
+```text
+                    bounded commands
+Relay control plane --------------------> upstream capture worker
+      ^                                          |
+      | poller notification                      | mcrx raw receive
+      |                                          v
+      +---------------- bounded packet queue <---+
+      |
+      +--> encode once --> matching Gateway UDP sends
+```
+
+The worker is the sole owner of native multicast subscriptions. Candidate
+membership reconciliation is sent to it synchronously, so joins, leaves, and
+capture cannot race. It checks commands after at most 256 packets or one
+millisecond of capture work. Shutdown reconciles to an empty subscription set
+before the worker is joined; no capture thread is detached.
+
+The packet queue holds at most 4,096 complete datagrams. The first transition
+from an empty queue wakes the Relay immediately; there is no batching timer.
+If forwarding falls behind and the queue is full, the newly captured packet is
+dropped, the drop is counted, and capture continues draining the kernel socket.
+Packets already queued retain capture order. This policy keeps memory bounded
+and avoids allowing an old backlog to grow without limit.
+
+The Relay waits on UDP readability and worker notifications through the small
+`polling` crate. Each pass services AMT control first, performs due pruning and
+reconciliation, and then forwards at most 512 packets or two milliseconds of
+data. A continuously active source therefore cannot indefinitely starve
+control messages, metrics, expiry, or shutdown.
+
+`mcrx-core 0.3.0` does not expose raw-socket readiness. While subscriptions are
+active, the capture worker consequently uses an adaptive 250 microsecond to 2
+millisecond nonblocking poll. It blocks completely on its command channel when
+there are no subscriptions. A future mcrx readiness API can remove this last
+poll without changing the bounded worker/Relay boundary.
+
+The Relay AMT UDP socket requests four MiB receive and send buffers.
+Gateway/DRIAD sockets retain platform defaults so a deployment with many source
+tunnels does not multiply that request. Operating-system caps still apply; the
+Relay's actual values are logged at startup and recorded in metrics flags. This
+is best-effort portable tuning rather than a promise that the kernel granted the
+full request.
 
 The relay currently uses HMAC-SHA256 for the Response MAC derivation and takes
 the first six bytes as the RFC 7450 Response MAC field. Secrets rotate
@@ -78,7 +125,8 @@ The gateway code is organized as follows:
   receiver reports in transparent mode and converts aggregate LAN interest into
   AMT Membership Updates.
 - `downstream::DownstreamPublisher` forwards complete multicast IP datagrams
-  through `mctx_core::RawContext`.
+  through `mctx_core::RawContext`. It pins explicit selectors or delegates
+  unpinned egress and route-change handling to mctx.
 - `daemon::run_gateway` runs either one static relay session or independent
   source-owned DRIAD sessions.
 
@@ -175,17 +223,35 @@ local downstream receivers can use SSM.
 - The gateway can request SSM from the relay.
 - The gateway can forward the original `(S,G)` downstream through `mctx-core`.
 
-Raw downstream transmit may require elevated privileges and explicit interface
-selection. `mctx-core` currently does not support raw IPv6 transmit on Windows.
+With no downstream selector, Linux follows route changes for IPv4 and IPv6;
+macOS follows routes for IPv4. Explicit selectors remain pinned. macOS requires
+an explicit interface for full-header IPv6, Windows requires one for IPv4, and
+Windows does not support full-header IPv6. Capability checks and publication
+creation occur before the gateway tunnel socket is bound. Linux
+route-selected IPv6 defers destination-dependent route and AF_PACKET socket
+setup until send so transient route changes can recover.
+
+Full-header IPv6 uses AF_PACKET on Linux and BPF on macOS. It preserves the
+complete IPv6 datagram but does not re-enter the sender's local IP stack, so
+same-host IPv6 multicast loopback is unavailable. AMT and mctx preserve the
+complete inner header for both families; neither IPv4 TTL nor IPv6 Hop Limit is
+rewritten.
+
+Transparent General Queries use the same downstream publisher. Their generated
+IP header requires an explicit local source address. MLDv2 queries target
+link-local `ff02::1`, which also requires explicit downstream egress rather
+than route selection; passive report capture can disable query transmission.
 
 ## Runtime Model
 
 The protocol and state types are runtime-agnostic. Build with
 `--no-default-features` for this portable core. The default `runtime` feature
-adds config, daemon, mcrx, and mctx modules. Runtime receive loops use bounded
-drains and short polling sleeps for simplicity. `shared-upstream` selects the
-Linux shared mcrx capture backend; `pmtu-feedback` adds mctx raw-IP control
-transmit. Both are opt-in and imply `runtime`.
+adds config, daemon, mcrx, mctx, and lightweight readiness polling. The classic
+Relay uses a dedicated capture worker and a wakeable control/forwarding loop;
+Gateway and DRIAD runners retain their small bounded polling loops.
+`shared-upstream` selects the Linux shared mcrx capture backend;
+`pmtu-feedback` adds mctx raw-IP control transmit. Both are opt-in and imply
+`runtime`.
 
 The crate deliberately rejects iOS targets at compile time. Supported daemon
 targets are Linux, macOS, and Windows; compiling the core without runtime does
@@ -219,8 +285,13 @@ The daemon edge also owns AMT metrics behind the `metrics` Cargo feature.
 periodically emits Heimdall-style single-header JSONL samples when the feature
 is enabled and an output directory is configured.
 
-The relay emits `amt-relay` samples with gateway and upstream subscription
-gauges plus AMT control/upstream forwarding counters. The gateway emits
+The relay emits `amt-relay` samples with gateway, upstream subscription,
+capture-socket, queue-depth, and lifetime queue-high-water gauges. Worker queue
+drops and failures are counters; `upstream_packets_received` counts packets
+accepted from mcrx before the userspace queue, while
+`upstream_packets_forwarded` counts successful per-Gateway tunnel sends.
+`upstream_forward_errors` is the corresponding per-Gateway send-error counter.
+The gateway emits
 `amt-gateway` samples with relay/downstream/transparent-mode gauges, DRIAD
 source/active/probe/hold-down gauges, and AMT control, discovery, downstream,
 and local-membership counters.
@@ -236,7 +307,14 @@ Membership parse/build errors stay in `membership`.
 
 Native multicast receive errors from `mcrx-core` are contained at the
 daemon/upstream boundary. Failed additions roll back; failed removals remain
-active and are retried periodically.
+active and are retried periodically. Capture-worker failures wake and terminate
+the Relay instead of leaving a live control plane with a dead data plane.
+
+The current mcrx API does not expose raw receive-buffer sizing, readiness
+handles, or kernel overflow/drop counters. AMT can therefore report userspace
+queue overload exactly, but it cannot distinguish a kernel raw-socket overflow
+from loss before capture. Those limitations are recorded in the performance
+documentation and sibling-crate request.
 
 The portable mcrx backend creates one capture socket per raw subscription and
 polls subscriptions linearly. The relay therefore keeps a conservative default

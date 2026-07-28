@@ -48,6 +48,8 @@ Implemented:
 - AMT Multicast Data encoding/decoding.
 - AMT Teardown.
 - Relay upstream subscription reconciliation for ASM/SSM interests.
+- Event-driven Relay scheduling with a dedicated bounded upstream capture
+  worker and explicit overload accounting.
 - Gateway joins for a configured group and optional source.
 - Gateway DRIAD relay discovery with an independent tunnel per SSM source.
 - Asynchronous DRIAD DNS TTL refresh, multi-relay probing, L-flag handling,
@@ -73,8 +75,10 @@ Implemented:
 
 Current limitations:
 
-- The simple role runners use blocking loops and polling. They are intentionally
-  small and easy to inspect, not yet optimized.
+- Gateway and DRIAD role runners retain small bounded polling loops. The Relay
+  control/forwarding loop is event-driven, while its capture worker uses a short
+  adaptive poll only because `mcrx-core` does not yet expose raw-socket
+  readiness.
 - Relay raw upstream receive may require root, `CAP_NET_RAW`, or explicit
   interface selection depending on platform.
 - The relay retains a conservative default of 256 unique upstream
@@ -144,12 +148,12 @@ unsupported unless documented explicitly.
 The registry manifest targets these sibling-crate releases:
 
 - `mcrx-core = 0.3.0` with `raw-packets` and optional `raw-shared-capture`
-- `mctx-core = 0.3.0` with `raw-packets` and optional `raw-ip`
+- `mctx-core = 0.3.1` with `raw-packets`, `raw-route-egress`, and optional
+  `raw-ip`
 
-The `0.3.0` sibling versions must be published before a registry-only build or
-package verification can succeed. Local development can use Cargo's
-`[patch.crates-io]` mechanism without introducing path dependencies into this
-manifest.
+Both dependencies resolve from crates.io. Local sibling development can still
+use Cargo's `[patch.crates-io]` mechanism without introducing path dependencies
+into this manifest.
 
 The completed sibling-crate implementation requests are retained in
 [`docs/sibling-crate-prompts.md`](docs/sibling-crate-prompts.md) for design
@@ -159,11 +163,16 @@ history and acceptance criteria.
 
 ```text
 amt relay [--config FILE] [--bind ADDRESS:PORT] [--relay-address IP] [--upstream-interface IP] [--upstream-ifindex INDEX] [--gateway-idle-timeout SECONDS] [--gateway-prune-interval SECONDS] [--path-mtu BYTES] [--pmtu-feedback|--no-pmtu-feedback] [--ecn|--no-ecn] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
-amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [DRIAD OPTIONS] [--ecn|--no-ecn] [--downstream-interface IP] [--downstream-ifindex INDEX] [--downstream-ttl TTL] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--local-reporter-timeout SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
+amt gateway [--config FILE] [--relay ADDRESS:PORT] [--relay-discovery static|driad|auto] [--group GROUP] [--source SOURCE] [--transparent] [--bind ADDRESS:PORT] [--protocol igmpv3|mldv2] [DRIAD OPTIONS] [--ecn|--no-ecn] [--downstream-interface IP] [--downstream-ifindex INDEX] [--local-membership-interface IP] [--local-membership-ifindex INDEX] [--local-query-interval SECONDS] [--local-reporter-timeout SECONDS] [--membership-refresh-interval SECONDS] [--no-downstream-loopback] [--no-downstream] [--metrics-dir DIR] [--node-id ID] [--metrics-interval-ms MS]
 ```
 
 Run `amt gateway --help` for the complete DRIAD timer, DNS-rate, candidate,
 source-tunnel, probe, and resolver-worker controls.
+
+Raw downstream forwarding preserves the complete inner IPv4 or IPv6 datagram,
+including its TTL or Hop Limit. The removed `--downstream-ttl` option and legacy
+`gateway.downstream.ttl` key are rejected explicitly; configure that value at
+the multicast source instead.
 
 ### Relay
 
@@ -192,6 +201,14 @@ for expired gateways every 5 seconds. Use `--gateway-idle-timeout 0` to disable
 pruning, or tune `--gateway-idle-timeout` and `--gateway-prune-interval` for
 test setups. A non-zero idle timeout must be greater than the advertised query
 interval, which is 125 seconds by default.
+
+Native capture runs on a dedicated worker and crosses a bounded 4,096-packet
+queue. AMT control is serviced before each forwarding slice, and the first
+available packet wakes the Relay without a batching delay. The Relay requests
+four MiB tunnel send/receive buffers, reports the values actually granted at
+startup, and records queue overload in metrics and rate-limited summaries. See
+[Classic Relay performance](docs/performance.md) for exact semantics and the
+repeatable Linux burst test.
 
 The fixed relay path MTU defaults to 1500 bytes and can be changed with
 `--path-mtu` or `relay.path_mtu`; use 1280 when a conservative Internet-path
@@ -247,7 +264,20 @@ IPv4 AMT tunnel, and the reverse, are both supported.
 
 The gateway uses raw downstream transmit, so local SSM receivers can join the
 original `(S,G)` carried inside AMT Multicast Data. Raw transmit may require
-elevated privileges.
+elevated privileges. When neither `--downstream-interface` nor
+`--downstream-ifindex` is supplied, mctx selects egress from the routing table:
+Linux supports route-selected IPv4 and IPv6, while macOS supports
+route-selected IPv4. Supplying either selector pins the publication instead.
+macOS IPv6 therefore requires an explicit selector; Windows requires one for
+IPv4 and does not support full-header IPv6.
+
+Downstream capability validation and publication creation happen before the
+AMT gateway binds its tunnel socket. Unsupported modes, invalid combinations,
+and most raw-socket privilege failures therefore fail at startup. Linux
+route-selected IPv6 resolves the destination route and opens its
+destination-dependent AF_PACKET socket on first send; those transient failures
+remain retryable. Full-header IPv6 uses link-layer injection and cannot feed
+same-host receivers; `loopback=true` is rejected for MLDv2.
 
 Run a gateway that discovers the AMT relay for an SSM source through DRIAD
 ([RFC 8777][rfc8777]):
@@ -341,6 +371,13 @@ least twice the query interval plus 10 seconds. Disabling local queries also
 disables reporter aging, because the gateway can no longer verify continued
 receiver presence.
 
+Active local queries require an address-valued local membership interface so
+the generated IP header has a valid source. An MLDv2 General Query targets the
+link-local group `ff02::1`, so it additionally requires an explicit
+`--downstream-interface` or `--downstream-ifindex`; scoped multicast cannot use
+route-selected egress. These requirements do not apply when
+`--local-query-interval 0` disables query transmission.
+
 ## Configuration
 
 Both daemon roles accept `--config FILE`. Values from the config file are loaded
@@ -387,7 +424,6 @@ membership_refresh_interval_secs = 60
 
 [gateway.downstream]
 interface = "192.168.1.20"
-ttl = 16
 
 [gateway.local_membership]
 query_interval_secs = 30
@@ -497,8 +533,9 @@ test must be run with appropriate socket permissions.
 
 There is also an ignored Linux system test harness that creates relay, gateway,
 source, and receiver network namespaces, then runs real AMT ASM, SSM, teardown,
-pruning, and optional metrics checks end-to-end. It requires Linux, `iproute2`,
-and root privileges or equivalent `CAP_NET_ADMIN`/`CAP_NET_RAW` capability:
+pruning, sustained Relay ingress/egress, and optional metrics checks end-to-end.
+It requires Linux, `iproute2`, and root privileges or equivalent
+`CAP_NET_ADMIN`/`CAP_NET_RAW` capability:
 
 ```bash
 sudo -E cargo test --features metrics,shared-upstream --test system_linux -- --ignored --test-threads=1 --nocapture
@@ -511,6 +548,7 @@ default and skip themselves on non-Linux hosts or without sufficient privileges.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Classic Relay performance and burst test](docs/performance.md)
 - [Configuration and Heimdall metrics](docs/configuration.md)
 - [Linode to local network test](docs/linode-local-test.md)
 - [Raw `mctx-core` transmit integration](docs/mctx-raw-packets.md)
@@ -523,6 +561,8 @@ default and skip themselves on non-Linux hosts or without sufficient privileges.
 - `state`: relay-side gateway membership and upstream subscription state.
 - `relay`: runtime-agnostic relay state machine.
 - `upstream`: relay upstream raw multicast receive manager using `mcrx-core`.
+- `upstream_worker`: bounded, wakeable ownership boundary around native Relay
+  capture and membership reconciliation.
 - `gateway`: runtime-agnostic gateway state machine.
 - `local_membership`: local IGMPv3/MLDv2 report listener and membership delta
   tracker for transparent gateway mode.

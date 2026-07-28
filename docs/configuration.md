@@ -86,7 +86,7 @@ Packet Too Big for IPv6, advertising the smallest affected tunnel MTU. An
 explicit `upstream_interface` address is mandatory because it supplies the
 local ICMP source and raw-IP egress selector. The address family must match the
 inner SSM source family; Windows raw IPv6 feedback is unsupported by
-`mctx-core 0.3.0`.
+`mctx-core 0.3.1`.
 
 `ecn = true` enables RFC 9601 support. The relay records the Request `E` bit
 per gateway and copies inner ECN into the outer AMT IP header only for capable
@@ -94,10 +94,35 @@ gateways. It uses safe Not-ECT compatibility mode for every other gateway.
 The equivalent CLI switches are `--ecn` and `--no-ecn`; compatibility mode is
 the default.
 
-The downstream interface belongs to the inner multicast family, not the AMT
-tunnel family. An IGMPv3 gateway therefore requires an IPv4 downstream
-interface and an MLDv2 gateway requires an IPv6 downstream interface, even when
-the relay connection uses the other IP family.
+An explicitly configured downstream interface belongs to the inner multicast
+family, not the AMT tunnel family. An IGMPv3 gateway therefore accepts an IPv4
+selector and an MLDv2 gateway accepts an IPv6 selector, even when the relay
+connection uses the other IP family.
+
+Without `gateway.downstream.interface` or `interface_index`, AMT requests
+route-selected egress from `mctx-core 0.3.1`. Linux supports route-selected
+IPv4 and IPv6; macOS supports route-selected IPv4 but requires an explicit
+interface for IPv6; Windows requires an explicit IPv4 interface and does not
+support full-header IPv6. Route changes are followed by mctx on supported
+route-selected paths. Explicit selectors remain pinned.
+
+Raw downstream forwarding preserves the complete inner datagram, including the
+IPv4 TTL or IPv6 Hop Limit. The removed `--downstream-ttl` option and legacy
+`gateway.downstream.ttl` key are rejected before the daemon starts. Set the
+desired value at the multicast source.
+
+Omitting `loopback` leaves the platform preference unspecified.
+`loopback = true` is rejected for MLDv2 because full-header IPv6 uses
+link-layer injection and cannot deliver into the sending host's IP receive
+path. Use another interface or host for IPv6 receivers.
+
+Transparent mode sends local General Queries unless
+`gateway.local_membership.query_interval_secs = 0`. Active queries require an
+address-valued local membership interface, supplied directly or inherited from
+`gateway.downstream.interface`, so their IP source is valid. MLDv2 queries
+target link-local `ff02::1` and also require an explicit downstream interface
+or index; they cannot use route-selected egress. Passive report capture with a
+zero query interval does not impose these transmit requirements.
 
 ## Gateway Config
 
@@ -114,7 +139,6 @@ membership_refresh_interval_secs = 60
 
 [gateway.downstream]
 interface = "192.168.1.20"
-ttl = 16
 loopback = true
 
 [gateway.local_membership]
@@ -263,6 +287,9 @@ The header uses Heimdall's canonical JSONL schema:
 {"schema":"heimdall-jsonl-v1","artifact_type":"amt-relay","node_id":"linode-amt-relay","producer":"amt","created_at":0.0,"flags":{"role":"relay","node_id":"linode-amt-relay"}}
 ```
 
+Relay headers also record the bounded packet-queue capacity and the actual AMT
+tunnel receive/send buffer sizes granted by the operating system.
+
 Sample rows use the same shape as the existing Heimdall producers: `ts`,
 `interval_secs`, gauges, and cumulative counters with matching deltas and rates.
 
@@ -271,6 +298,8 @@ Relay gauges:
 - `active_gateways`
 - `active_upstream_subscriptions`
 - `upstream_capture_sockets`
+- `upstream_queue_depth`
+- `upstream_queue_high_water`
 
 Gateway gauges:
 
@@ -286,11 +315,12 @@ Gateway gauges:
 Counter families include:
 
 - AMT control datagrams, invalid/ignored/rate-limited datagrams, responses, and send errors.
-- Relay resource-limit rejections, upstream reconciliation failures, tunnel
-  MTU drops, generated IPv4 fragments, SSM PMTU feedback outcomes, and RFC
-  6040 normal-mode sends.
+- Relay resource-limit rejections, upstream reconciliation failures, capture
+  worker failures, bounded-queue drops, tunnel MTU drops, generated IPv4
+  fragments, SSM PMTU feedback outcomes, and RFC 6040 normal-mode sends.
 - Relay membership updates, applied records, teardowns, authentication rejections, and gateway expiry.
-- Relay upstream subscription changes, native multicast receive, unmatched packets, forwarded packets, and forward errors.
+- Relay upstream subscription changes, native multicast receive, unmatched
+  packets, successful per-Gateway forwards, and per-Gateway forward errors.
 - Gateway discovery, membership queries, membership updates, refreshes, and teardown.
 - Gateway AMT Multicast Data receive, downstream forwarding, non-multicast packets, and forwarding errors.
 - DRIAD refreshes, NoRelay withdrawals, candidate changes, probe starts,

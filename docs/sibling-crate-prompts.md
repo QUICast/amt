@@ -1,7 +1,7 @@
 # Sibling Crate Feature Prompts
 
 These requests are retained as the design record for the capabilities delivered
-in `mcrx-core 0.3.0` and `mctx-core 0.3.0`. AMT continues to own AMT, DNS,
+in `mcrx-core 0.3.0` and `mctx-core 0.3.1`. AMT continues to own AMT, DNS,
 IGMP/MLD, ICMP construction, and RFC policy; the sibling crates expose only
 packet-I/O mechanisms.
 
@@ -50,6 +50,56 @@ Acceptance criteria for quicast-amt: 1,000 logical subscriptions on one
 interface should use O(1) raw capture sockets per family/interface and packet
 receive work should not perform an O(1,000) socket poll or subscription scan.
 Do not change normal mcrx-core users unless they opt into the new feature.
+```
+
+## Follow-Up Prompt For mcrx-core Relay Readiness
+
+```text
+Please add an additive, portable readiness/blocking receive facility for the
+raw-packets and raw-shared-capture backends in mcrx-core. Keep all existing
+nonblocking APIs and behavior source-compatible.
+
+Motivation: quicast-amt now isolates native multicast capture in a bounded
+worker, but mcrx-core 0.3.0 exposes only try_recv_any(). The worker must poll
+every 250 microseconds to 2 milliseconds while subscriptions are active. AMT
+also cannot request a larger kernel raw receive buffer or determine whether a
+kernel capture socket overflowed before userspace accepted a packet.
+
+Provide a transport-level API which can wait until any joined raw capture
+socket is readable and can be interrupted from another thread when membership
+commands or shutdown arrive. One possible shape is a context-owned
+RawReceiveWaiter plus a cheap cloneable RawReceiveWaker, followed by
+recv_batch_into/try_recv_batch_into. Do not require Tokio or another runtime.
+Do not make callers assemble their own unsafe raw-descriptor list whose
+lifetime can diverge from context membership changes.
+
+Required behavior:
+- work with RawContext and SharedRawContext;
+- support Linux, macOS, and Windows wherever the existing backend is supported;
+- block without polling when there is no traffic;
+- wake promptly for a packet or an explicit cross-thread wake request;
+- remain correct when reconciliation adds or removes capture sockets;
+- receive a bounded caller-selected batch without an intentional batching
+  delay (return the first available packet immediately, then drain available
+  packets up to the limit);
+- preserve packet order per capture socket and existing round-robin fairness;
+- allow a requested kernel receive-buffer size and report the actual granted
+  size per capture socket;
+- expose cumulative kernel overflow/drop information where the OS provides it,
+  such as Linux SO_RXQ_OVFL/PACKET_STATISTICS, and explicitly report
+  unavailable rather than synthesizing zero on other platforms;
+- preserve complete datagrams and existing ASM/SSM demultiplex semantics;
+- return typed interrupted, timeout, unsupported, and receive errors.
+
+The wait/wake path must use bounded resources, must not create a helper thread
+per subscription, and must not busy-spin. Platform-specific poll/epoll/kqueue
+or Windows event code should remain encapsulated inside mcrx-core.
+
+Add unit tests for wake-before-wait, wake-during-wait, timeout, socket-set
+changes, bounded batch drain, and clean destruction. Add a privileged Linux
+namespace stress test which changes memberships while a high-rate source is
+active and verifies kernel/user drop accounting. Include strict Linux, macOS,
+and Windows compile checks, API documentation, and a changelog entry.
 ```
 
 ## Prompt For mctx-core
